@@ -2462,6 +2462,7 @@ class AIAgent:
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "api_key": getattr(self, "api_key", ""),
+            "credential_pool": self._credential_pool,
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             "use_native_cache_layout": self._use_native_cache_layout,
@@ -2745,6 +2746,7 @@ class AIAgent:
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "api_key": getattr(self, "api_key", ""),
+            "credential_pool": self._credential_pool,
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             "use_native_cache_layout": self._use_native_cache_layout,
@@ -7358,6 +7360,74 @@ class AIAgent:
             return False
         return pool.has_available()
 
+    @staticmethod
+    def _load_runtime_credential_pool(
+        provider: Optional[str],
+        *,
+        base_url: Optional[str] = None,
+        runtime_api_key: Optional[str] = None,
+        current_provider: Optional[str] = None,
+        current_base_url: Optional[str] = None,
+        current_pool=None,
+    ):
+        """Best-effort provider-scoped credential pool for the active runtime.
+
+        Preserves the existing pool object when the runtime stays on the same
+        backend so in-memory selection state (current entry, active leases) is
+        not discarded during same-provider fallback transitions.
+
+        When switching to a different backend, best-effort realign the loaded
+        pool's ``current`` entry to the credential that actually built the
+        runtime client. This avoids later pool recovery rotating/refreshing the
+        wrong entry after the initial fallback request.
+        """
+        provider_norm = (provider or "").strip().lower()
+        if not provider_norm:
+            return None
+
+        base_norm = str(base_url or "").strip().rstrip("/").lower()
+        current_provider_norm = (current_provider or "").strip().lower()
+        current_base_norm = str(current_base_url or "").strip().rstrip("/").lower()
+        if (
+            current_pool is not None
+            and provider_norm == current_provider_norm
+            and base_norm == current_base_norm
+        ):
+            return current_pool
+
+        try:
+            from agent.credential_pool import get_custom_provider_pool_key, load_pool
+
+            pool_key = provider_norm
+            if provider_norm == "custom" or provider_norm.startswith("custom:"):
+                provider_name = provider_norm.split(":", 1)[1] if provider_norm.startswith("custom:") else None
+                custom_key = get_custom_provider_pool_key(base_url or "", provider_name=provider_name)
+                pool_key = custom_key or provider_norm
+            pool = load_pool(pool_key)
+        except Exception as exc:
+            logger.debug(
+                "Could not load credential pool for provider %s (base_url=%s): %s",
+                provider_norm,
+                base_url or "",
+                exc,
+            )
+            return None
+        if not pool.has_credentials():
+            return None
+
+        runtime_key = str(runtime_api_key or "").strip()
+        if runtime_key:
+            try:
+                pool.align_current_to_runtime(runtime_key, base_url=base_url)
+            except Exception as exc:
+                logger.debug(
+                    "Could not align runtime credential pool for provider %s (base_url=%s): %s",
+                    provider_norm,
+                    base_url or "",
+                    exc,
+                )
+        return pool
+
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
@@ -8723,15 +8793,27 @@ class AIAgent:
                 fb_api_mode = "bedrock_converse"
 
             old_model = self.model
+            previous_provider = self.provider
+            previous_base_url = self.base_url
+            previous_pool = self._credential_pool
 
             # Clear the per-config context_length override so the fallback
             # model's actual context window is resolved instead of inheriting
             # the stale value from the previous model.  See #22387.
             self._config_context_length = None
+
             self.model = fb_model
             self.provider = fb_provider
             self.base_url = fb_base_url
             self.api_mode = fb_api_mode
+            self._credential_pool = self._load_runtime_credential_pool(
+                fb_provider,
+                base_url=fb_base_url,
+                runtime_api_key=getattr(fb_client, "api_key", None),
+                current_provider=previous_provider,
+                current_base_url=previous_base_url,
+                current_pool=previous_pool,
+            )
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
             self._fallback_activated = True
@@ -8855,6 +8937,7 @@ class AIAgent:
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]           # setter updates _base_url_lower
             self.api_mode = rt["api_mode"]
+            self._credential_pool = rt.get("credential_pool")
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
             self.api_key = rt["api_key"]
@@ -8963,6 +9046,7 @@ class AIAgent:
             self.provider = rt["provider"]
             self.base_url = rt["base_url"]
             self.api_mode = rt["api_mode"]
+            self._credential_pool = rt.get("credential_pool")
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
             self.api_key = rt["api_key"]

@@ -1122,6 +1122,52 @@ def test_release_lease_decrements_counter(tmp_path, monkeypatch):
     assert pool._active_leases.get("cred-1", 0) == 0
 
 
+def test_align_current_to_runtime_sets_current_without_touching_leases(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "key-1",
+                        "base_url": "https://openrouter.ai/api/v1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "key-2",
+                        "base_url": "https://openrouter.ai/api/v1",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    assert pool.current() is None
+    assert pool._active_leases == {}
+
+    aligned = pool.align_current_to_runtime("key-2", base_url="https://openrouter.ai/api/v1")
+
+    assert aligned is True
+    current = pool.current()
+    assert current is not None
+    assert current.id == "cred-2"
+    assert pool._active_leases == {}
+
+
 def test_load_pool_does_not_seed_claude_code_when_anthropic_not_configured(tmp_path, monkeypatch):
     """Claude Code credentials must not be auto-seeded when the user never selected anthropic."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
