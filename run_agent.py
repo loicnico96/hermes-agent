@@ -2472,32 +2472,38 @@ class AIAgent:
         # activates during a turn, the next turn restores these values so the
         # preferred model gets a fresh attempt each time.  Uses a single dict
         # so new state fields are easy to add without N individual attributes.
-        _cc = self.context_compressor
-        self._primary_runtime = {
+        self._primary_runtime = self._capture_primary_runtime_snapshot()
+
+    def _capture_primary_runtime_snapshot(self) -> dict[str, Any]:
+        """Capture the current primary runtime state for later restoration."""
+        _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
+        snapshot = {
             "model": self.model,
             "provider": self.provider,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
             "api_key": getattr(self, "api_key", ""),
+            "credential_pool": getattr(self, "_credential_pool", None),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
             "use_native_cache_layout": self._use_native_cache_layout,
             # Context engine state that _try_activate_fallback() overwrites.
             # Use getattr for model/base_url/api_key/provider since plugin
             # engines may not have these (they're ContextCompressor-specific).
-            "compressor_model": getattr(_cc, "model", self.model),
-            "compressor_base_url": getattr(_cc, "base_url", self.base_url),
-            "compressor_api_key": getattr(_cc, "api_key", ""),
-            "compressor_provider": getattr(_cc, "provider", self.provider),
-            "compressor_context_length": _cc.context_length,
-            "compressor_threshold_tokens": _cc.threshold_tokens,
+            "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
+            "compressor_base_url": getattr(_cc, "base_url", self.base_url) if _cc else self.base_url,
+            "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
+            "compressor_provider": getattr(_cc, "provider", self.provider) if _cc else self.provider,
+            "compressor_context_length": _cc.context_length if _cc else 0,
+            "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
         }
         if self.api_mode == "anthropic_messages":
-            self._primary_runtime.update({
+            snapshot.update({
                 "anthropic_api_key": self._anthropic_api_key,
                 "anthropic_base_url": self._anthropic_base_url,
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
+        return snapshot
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
@@ -2755,29 +2761,7 @@ class AIAgent:
         self._cached_system_prompt = None
 
         # ── Update _primary_runtime so the change persists across turns ──
-        _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
-        self._primary_runtime = {
-            "model": self.model,
-            "provider": self.provider,
-            "base_url": self.base_url,
-            "api_mode": self.api_mode,
-            "api_key": getattr(self, "api_key", ""),
-            "client_kwargs": dict(self._client_kwargs),
-            "use_prompt_caching": self._use_prompt_caching,
-            "use_native_cache_layout": self._use_native_cache_layout,
-            "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
-            "compressor_base_url": getattr(_cc, "base_url", self.base_url) if _cc else self.base_url,
-            "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
-            "compressor_provider": getattr(_cc, "provider", self.provider) if _cc else self.provider,
-            "compressor_context_length": _cc.context_length if _cc else 0,
-            "compressor_threshold_tokens": _cc.threshold_tokens if _cc else 0,
-        }
-        if api_mode == "anthropic_messages":
-            self._primary_runtime.update({
-                "anthropic_api_key": self._anthropic_api_key,
-                "anthropic_base_url": self._anthropic_base_url,
-                "is_anthropic_oauth": self._is_anthropic_oauth,
-            })
+        self._primary_runtime = self._capture_primary_runtime_snapshot()
 
         # ── Reset fallback state ──
         self._fallback_activated = False
@@ -7344,6 +7328,8 @@ class AIAgent:
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
             self.base_url = runtime_base
+            if not self._fallback_activated:
+                self._primary_runtime = self._capture_primary_runtime_snapshot()
             return
 
         self.api_key = runtime_key
@@ -7352,6 +7338,8 @@ class AIAgent:
         self._client_kwargs["base_url"] = self.base_url
         self._apply_client_headers_for_base_url(self.base_url)
         self._replace_primary_openai_client(reason="credential_rotation")
+        if not self._fallback_activated:
+            self._primary_runtime = self._capture_primary_runtime_snapshot()
 
     def _recover_with_credential_pool(
         self,
@@ -7451,6 +7439,101 @@ class AIAgent:
             # Retry-After while a pooled OAuth credential may still appear usable.
             return False
         return pool.has_available()
+
+    @staticmethod
+    def _align_pool_to_runtime_credentials(
+        pool,
+        *,
+        runtime_api_key: Optional[str],
+        runtime_base_url: Optional[str],
+    ):
+        """Align a pool's current entry to the credential that built the runtime."""
+        if pool is None:
+            return None
+
+        runtime_key = str(runtime_api_key or "").strip()
+        if not runtime_key:
+            return pool
+
+        try:
+            align_fn = getattr(pool, "align_current_to_runtime", None)
+            if callable(align_fn):
+                align_fn(
+                    runtime_api_key=runtime_key,
+                    runtime_base_url=runtime_base_url,
+                )
+            else:
+                logger.debug(
+                    "Credential pool does not support runtime alignment (base_url=%s)",
+                    runtime_base_url or "",
+                )
+        except Exception as exc:
+            logger.debug(
+                "Could not align runtime credential pool (base_url=%s): %s",
+                runtime_base_url or "",
+                exc,
+            )
+        return pool
+
+    @staticmethod
+    def _load_runtime_credential_pool(
+        provider: Optional[str],
+        *,
+        base_url: Optional[str] = None,
+        runtime_api_key: Optional[str] = None,
+        current_provider: Optional[str] = None,
+        current_base_url: Optional[str] = None,
+        current_pool=None,
+    ):
+        """Best-effort provider-scoped credential pool for the active runtime.
+
+        Preserves the existing pool object when the runtime stays on the same
+        backend so in-memory selection state (current entry, active leases) is
+        not discarded during same-provider fallback transitions.
+
+        When switching to a different backend, best-effort realign the loaded
+        pool's ``current`` entry to the credential that actually built the
+        runtime client. This avoids later pool recovery rotating/refreshing the
+        wrong entry after the initial fallback request.
+        """
+        provider_norm = (provider or "").strip().lower()
+        if not provider_norm:
+            return None
+
+        base_norm = str(base_url or "").strip().rstrip("/").lower()
+        current_provider_norm = (current_provider or "").strip().lower()
+        current_base_norm = str(current_base_url or "").strip().rstrip("/").lower()
+        if (
+            current_pool is not None
+            and provider_norm == current_provider_norm
+            and base_norm == current_base_norm
+        ):
+            pool = current_pool
+        else:
+            try:
+                from agent.credential_pool import get_custom_provider_pool_key, load_pool
+
+                pool_key = provider_norm
+                if provider_norm == "custom" or provider_norm.startswith("custom:"):
+                    provider_name = provider_norm.split(":", 1)[1] if provider_norm.startswith("custom:") else None
+                    custom_key = get_custom_provider_pool_key(base_url or "", provider_name=provider_name)
+                    pool_key = custom_key or provider_norm
+                pool = load_pool(pool_key)
+            except Exception as exc:
+                logger.debug(
+                    "Could not load credential pool for provider %s (base_url=%s): %s",
+                    provider_norm,
+                    base_url or "",
+                    exc,
+                )
+                return None
+        if not pool.has_credentials():
+            return None
+        return AIAgent._align_pool_to_runtime_credentials(
+            pool,
+            runtime_api_key=runtime_api_key,
+            runtime_base_url=base_url,
+        )
 
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
@@ -8817,15 +8900,27 @@ class AIAgent:
                 fb_api_mode = "bedrock_converse"
 
             old_model = self.model
+            previous_provider = self.provider
+            previous_base_url = self.base_url
+            previous_pool = self._credential_pool
 
             # Clear the per-config context_length override so the fallback
             # model's actual context window is resolved instead of inheriting
             # the stale value from the previous model.  See #22387.
             self._config_context_length = None
+
             self.model = fb_model
             self.provider = fb_provider
             self.base_url = fb_base_url
             self.api_mode = fb_api_mode
+            self._credential_pool = self._load_runtime_credential_pool(
+                fb_provider,
+                base_url=fb_base_url,
+                runtime_api_key=getattr(fb_client, "api_key", None),
+                current_provider=previous_provider,
+                current_base_url=previous_base_url,
+                current_pool=previous_pool,
+            )
             if hasattr(self, "_transport_cache"):
                 self._transport_cache.clear()
             self._fallback_activated = True
@@ -8925,6 +9020,78 @@ class AIAgent:
 
     # ── Per-turn primary restoration ─────────────────────────────────────
 
+    def _apply_primary_runtime_snapshot(self, runtime_snapshot: dict[str, Any], *, reason: str) -> None:
+        """Restore runtime state and rebuild the client from the effective primary credential."""
+        rt = dict(runtime_snapshot)
+
+        self.model = rt["model"]
+        self.provider = rt["provider"]
+        self.base_url = rt["base_url"]
+        self.api_mode = rt["api_mode"]
+        self._use_prompt_caching = rt["use_prompt_caching"]
+        self._use_native_cache_layout = rt.get(
+            "use_native_cache_layout",
+            self.api_mode == "anthropic_messages" and self.provider == "anthropic",
+        )
+
+        if self.api_mode == "anthropic_messages":
+            alignment_key = rt.get("anthropic_api_key") or rt.get("api_key")
+            alignment_base = rt.get("anthropic_base_url") or rt.get("base_url")
+        else:
+            alignment_key = rt.get("api_key")
+            alignment_base = rt.get("base_url")
+
+        self._credential_pool = self._align_pool_to_runtime_credentials(
+            rt.get("credential_pool"),
+            runtime_api_key=alignment_key,
+            runtime_base_url=alignment_base,
+        )
+        if hasattr(self, "_transport_cache"):
+            self._transport_cache.clear()
+
+        current_entry = self._credential_pool.current() if self._credential_pool is not None else None
+
+        if self.api_mode == "anthropic_messages":
+            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+
+            effective_key = rt["anthropic_api_key"]
+            effective_base = rt["anthropic_base_url"]
+            if current_entry is not None:
+                effective_key = getattr(current_entry, "runtime_api_key", None) or getattr(current_entry, "access_token", "") or effective_key
+                effective_base = getattr(current_entry, "runtime_base_url", None) or getattr(current_entry, "base_url", None) or effective_base
+
+            self.api_key = effective_key
+            self.base_url = effective_base
+            self._client_kwargs = dict(rt["client_kwargs"])
+            self._anthropic_api_key = effective_key
+            self._anthropic_base_url = effective_base
+            self._anthropic_client = build_anthropic_client(
+                effective_key,
+                effective_base,
+                timeout=get_provider_request_timeout(self.provider, self.model),
+            )
+            self._is_anthropic_oauth = _is_oauth_token(effective_key) if self.provider == "anthropic" else rt["is_anthropic_oauth"]
+            self.client = None
+            return
+
+        effective_key = rt["api_key"]
+        effective_base = rt["base_url"]
+        if current_entry is not None:
+            effective_key = getattr(current_entry, "runtime_api_key", None) or getattr(current_entry, "access_token", "") or effective_key
+            effective_base = getattr(current_entry, "runtime_base_url", None) or getattr(current_entry, "base_url", None) or effective_base
+
+        self.api_key = effective_key
+        self.base_url = effective_base.rstrip("/") if isinstance(effective_base, str) else effective_base
+        self._client_kwargs = dict(rt["client_kwargs"])
+        self._client_kwargs["api_key"] = self.api_key
+        self._client_kwargs["base_url"] = self.base_url
+        self._apply_client_headers_for_base_url(self.base_url)
+        self.client = self._create_openai_client(
+            dict(self._client_kwargs),
+            reason=reason,
+            shared=True,
+        )
+
     def _restore_primary_runtime(self) -> bool:
         """Restore the primary runtime at the start of a new turn.
 
@@ -8945,39 +9112,7 @@ class AIAgent:
         rt = self._primary_runtime
         try:
             # ── Core runtime state ──
-            self.model = rt["model"]
-            self.provider = rt["provider"]
-            self.base_url = rt["base_url"]           # setter updates _base_url_lower
-            self.api_mode = rt["api_mode"]
-            if hasattr(self, "_transport_cache"):
-                self._transport_cache.clear()
-            self.api_key = rt["api_key"]
-            self._client_kwargs = dict(rt["client_kwargs"])
-            self._use_prompt_caching = rt["use_prompt_caching"]
-            # Default to native layout when the restored snapshot predates the
-            # native-vs-proxy split (older sessions saved before this PR).
-            self._use_native_cache_layout = rt.get(
-                "use_native_cache_layout",
-                self.api_mode == "anthropic_messages" and self.provider == "anthropic",
-            )
-
-            # ── Rebuild client for the primary provider ──
-            if self.api_mode == "anthropic_messages":
-                from agent.anthropic_adapter import build_anthropic_client
-                self._anthropic_api_key = rt["anthropic_api_key"]
-                self._anthropic_base_url = rt["anthropic_base_url"]
-                self._anthropic_client = build_anthropic_client(
-                    rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
-                )
-                self._is_anthropic_oauth = rt["is_anthropic_oauth"]
-                self.client = None
-            else:
-                self.client = self._create_openai_client(
-                    dict(rt["client_kwargs"]),
-                    reason="restore_primary",
-                    shared=True,
-                )
+            self._apply_primary_runtime_snapshot(rt, reason="restore_primary")
 
             # ── Restore context engine state ──
             cc = self.context_compressor
@@ -9052,31 +9187,7 @@ class AIAgent:
 
             # Rebuild from primary snapshot
             rt = self._primary_runtime
-            self._client_kwargs = dict(rt["client_kwargs"])
-            self.model = rt["model"]
-            self.provider = rt["provider"]
-            self.base_url = rt["base_url"]
-            self.api_mode = rt["api_mode"]
-            if hasattr(self, "_transport_cache"):
-                self._transport_cache.clear()
-            self.api_key = rt["api_key"]
-
-            if self.api_mode == "anthropic_messages":
-                from agent.anthropic_adapter import build_anthropic_client
-                self._anthropic_api_key = rt["anthropic_api_key"]
-                self._anthropic_base_url = rt["anthropic_base_url"]
-                self._anthropic_client = build_anthropic_client(
-                    rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
-                )
-                self._is_anthropic_oauth = rt["is_anthropic_oauth"]
-                self.client = None
-            else:
-                self.client = self._create_openai_client(
-                    dict(rt["client_kwargs"]),
-                    reason="primary_recovery",
-                    shared=True,
-                )
+            self._apply_primary_runtime_snapshot(rt, reason="primary_recovery")
 
             wait_time = min(3 + retry_count, 8)
             self._vprint(
