@@ -46,7 +46,31 @@ def test_init_creates_expected_tables(kanban_home):
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
     names = {r["name"] for r in rows}
-    assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+    assert {
+        "tasks",
+        "task_links",
+        "task_comments",
+        "task_events",
+        "task_approvals",
+        "task_approval_runs",
+    } <= names
+
+
+def test_init_creates_approval_indexes(kanban_home):
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+        ).fetchall()
+    names = {r["name"] for r in rows}
+    assert {
+        "idx_task_approvals_task_id",
+        "idx_task_approvals_status",
+        "idx_task_approvals_type_status",
+        "idx_task_approvals_claimable",
+        "idx_task_approval_runs_approval_id",
+        "idx_task_approval_runs_task_id",
+        "idx_task_approval_runs_status",
+    } <= names
 
 
 def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
@@ -71,19 +95,7 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
 
 
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
-    """Legacy DBs missing additive indexed columns must migrate cleanly.
-
-    SCHEMA_SQL runs in ``connect()`` before ``_migrate_add_optional_columns``.
-    Indexes over additive columns therefore must be created after the
-    migration adds those columns, or boards predating the column fail to
-    open before migration can run.
-
-    Covers all four indexes that sit on additive columns:
-    - ``tasks.session_id``       -> ``idx_tasks_session_id``    (#28447)
-    - ``tasks.tenant``           -> ``idx_tasks_tenant``        (#16081)
-    - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency``   (#17805)
-    - ``task_events.run_id``     -> ``idx_events_run``          (#17805)
-    """
+    """Legacy DBs gain additive task columns plus approval tables without backfill."""
     db_path = tmp_path / "legacy-kanban.db"
     conn = sqlite3.connect(str(db_path))
     # Pre-#16081 ``tasks`` shape: missing tenant, idempotency_key, session_id.
@@ -105,6 +117,15 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             claim_expires INTEGER
         )
     """)
+    conn.execute("""
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
     # Pre-#17805 ``task_events`` shape: missing run_id. Required because
     # ``_migrate_add_optional_columns`` unconditionally runs PRAGMA on
     # ``task_events`` for run_id back-fill.
@@ -119,7 +140,11 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """)
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
-        "VALUES ('legacy', 'old board task', 'ready', 1)"
+        "VALUES ('legacy', 'old board task', 'review', 1)"
+    )
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES ('legacy', 'user', 'review-required: old convention', 2)"
     )
     conn.commit()
     conn.close()
@@ -131,6 +156,12 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
         event_columns = {
             row["name"]
             for row in migrated.execute("PRAGMA table_info(task_events)")
+        }
+        tables = {
+            row["name"]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
         }
         indexes = {
             row["name"]
@@ -144,11 +175,25 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "run_id" in event_columns
-    # And their indexes — the regression scope of this test:
+    # Approval schema is created additively on legacy boards.
+    assert "task_approvals" in tables
+    assert "task_approval_runs" in tables
+    assert "idx_task_approvals_task_id" in indexes
+    assert "idx_task_approvals_status" in indexes
+    assert "idx_task_approvals_type_status" in indexes
+    assert "idx_task_approvals_claimable" in indexes
+    assert "idx_task_approval_runs_approval_id" in indexes
+    assert "idx_task_approval_runs_task_id" in indexes
+    assert "idx_task_approval_runs_status" in indexes
+    # Existing additive-column indexes still migrate.
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+    # No migration infers approval rows from legacy review/comment conventions.
+    with kb.connect(db_path) as migrated_again:
+        assert migrated_again.execute("SELECT COUNT(*) FROM task_approvals").fetchone()[0] == 0
+        assert migrated_again.execute("SELECT COUNT(*) FROM task_approval_runs").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +908,20 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         parent = kb.create_task(conn, title="parent")
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
+        approval_id = kb.create_task_approval(
+            conn,
+            task_id=tid,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        kb.create_task_approval_run(
+            conn,
+            approval_id=approval_id,
+            status="failed",
+            outcome="failed",
+            started_at=10,
+            ended_at=20,
+        )
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result="done")
         assert kb.archive_task(conn, tid)
@@ -879,6 +938,8 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
 
 
@@ -924,13 +985,31 @@ def test_list_tasks_order_by(kanban_home):
 def test_delete_task_removes_task_and_cascades(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")
-        kb.add_comment(conn, t, "user", "comment")
+        comment_id = kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
+        approval_id = kb.create_task_approval(
+            conn,
+            task_id=t,
+            approver_type="agent",
+            approver_profile="reviewer",
+            comment_id=comment_id,
+        )
+        kb.create_task_approval_run(
+            conn,
+            approval_id=approval_id,
+            comment_id=comment_id,
+            status="approved",
+            outcome="approved",
+            started_at=10,
+            ended_at=20,
+        )
         assert kb.delete_task(conn, t)
         assert kb.get_task(conn, t) is None
         assert len(kb.list_comments(conn, t)) == 0
         assert len(kb.list_events(conn, t)) == 0
         assert len(kb.list_runs(conn, t)) == 0
+        assert kb.list_task_approvals(conn, t) == []
+        assert kb.list_task_approval_runs(conn, task_id=t) == []
 
 
 def test_delete_task_returns_false_for_missing_task(kanban_home):
@@ -2564,6 +2643,215 @@ def test_approval_run_from_row_parses_optional_fields():
         comment_id=15,
         error=None,
     )
+
+
+def test_create_task_approval_and_run_round_trip(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="alice")
+        comment_id = kb.add_comment(conn, task_id, "user", "please review")
+
+        approval_id = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            approver_skill="github-code-review",
+            comment_id=comment_id,
+            claim_lock="lease-1",
+            claim_expires=101,
+            worker_pid=202,
+            last_heartbeat_at=303,
+        )
+        approval = kb.get_task_approval(conn, approval_id)
+        approvals = kb.list_task_approvals(conn, task_id)
+
+        approval_run_id = kb.create_task_approval_run(
+            conn,
+            approval_id=approval_id,
+            comment_id=comment_id,
+            status="approved",
+            outcome="approved",
+            started_at=1000,
+            ended_at=1010,
+        )
+        approval_run = kb.get_task_approval_run(conn, approval_run_id)
+        approval_runs = kb.list_task_approval_runs(conn, approval_id=approval_id)
+
+    assert approval is not None
+    assert approval.task_id == task_id
+    assert approval.approver_type == "agent"
+    assert approval.approver_profile == "reviewer"
+    assert approval.approver_skill == "github-code-review"
+    assert approval.comment_id == comment_id
+    assert [item.id for item in approvals] == [approval_id]
+
+    assert approval_run is not None
+    assert approval_run.approval_id == approval_id
+    assert approval_run.task_id == task_id
+    assert approval_run.profile == "reviewer"
+    assert approval_run.status == "approved"
+    assert approval_run.comment_id == comment_id
+    assert [item.id for item in approval_runs] == [approval_run_id]
+
+
+def test_create_task_approval_enforces_human_and_agent_uniqueness(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs reviewers")
+        kb.create_task_approval(conn, task_id=task_id, approver_type="human")
+        with pytest.raises(ValueError, match="already has a human approval"):
+            kb.create_task_approval(conn, task_id=task_id, approver_type="human")
+
+        kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        with pytest.raises(ValueError, match="already has an agent approval"):
+            kb.create_task_approval(
+                conn,
+                task_id=task_id,
+                approver_type="agent",
+                approver_profile="reviewer",
+            )
+
+        kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            approver_skill="security-review",
+        )
+        with pytest.raises(ValueError, match="already has an agent approval"):
+            kb.create_task_approval(
+                conn,
+                task_id=task_id,
+                approver_type="agent",
+                approver_profile="reviewer",
+                approver_skill="security-review",
+            )
+
+        other_skill_id = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            approver_skill="docs-review",
+        )
+
+    assert other_skill_id > 0
+
+
+def test_create_task_approval_validates_identity_status_and_comment_scope(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="task one")
+        other_task_id = kb.create_task(conn, title="task two")
+        other_comment_id = kb.add_comment(conn, other_task_id, "user", "wrong task")
+
+        with pytest.raises(ValueError, match="human approvals cannot set approver_profile"):
+            kb.create_task_approval(
+                conn,
+                task_id=task_id,
+                approver_type="human",
+                approver_profile="reviewer",
+            )
+        with pytest.raises(ValueError, match="human approvals cannot set approver_skill"):
+            kb.create_task_approval(
+                conn,
+                task_id=task_id,
+                approver_type="human",
+                approver_skill="github-code-review",
+            )
+        with pytest.raises(ValueError, match="agent approvals require approver_profile"):
+            kb.create_task_approval(conn, task_id=task_id, approver_type="agent")
+        with pytest.raises(ValueError, match="status must be one of"):
+            kb.create_task_approval(
+                conn,
+                task_id=task_id,
+                approver_type="agent",
+                approver_profile="reviewer",
+                status="pending",
+            )
+        with pytest.raises(ValueError, match="does not belong to task"):
+            kb.create_task_approval(
+                conn,
+                task_id=task_id,
+                approver_type="agent",
+                approver_profile="reviewer",
+                comment_id=other_comment_id,
+            )
+
+
+def test_create_task_approval_run_rejects_human_rows_and_task_mismatches(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval")
+        other_task_id = kb.create_task(conn, title="other task")
+
+        human_approval_id = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="human",
+        )
+        agent_approval_id = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+
+        with pytest.raises(ValueError, match="only valid for agent approvals"):
+            kb.create_task_approval_run(conn, approval_id=human_approval_id)
+        with pytest.raises(ValueError, match="belongs to task"):
+            kb.create_task_approval_run(
+                conn,
+                approval_id=agent_approval_id,
+                task_id=other_task_id,
+            )
+
+
+def test_reset_task_approval_clears_live_fields_only(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reset me")
+        comment_id = kb.add_comment(conn, task_id, "user", "original comment")
+        approval_id = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            approver_skill="github-code-review",
+            status="failed",
+            comment_id=comment_id,
+            claim_lock="lease-1",
+            claim_expires=123,
+            worker_pid=456,
+            last_heartbeat_at=789,
+            current_run_id=42,
+            consecutive_failures=2,
+            last_failure_error="boom",
+        )
+        before = kb.get_task_approval(conn, approval_id)
+
+        assert kb.reset_task_approval(conn, approval_id) is True
+        after = kb.get_task_approval(conn, approval_id)
+
+    assert before is not None
+    assert after is not None
+    assert after.id == before.id
+    assert after.task_id == before.task_id
+    assert after.approver_type == before.approver_type
+    assert after.approver_profile == before.approver_profile
+    assert after.approver_skill == before.approver_skill
+    assert after.created_at == before.created_at
+    assert after.status == "requested"
+    assert after.comment_id is None
+    assert after.claim_lock is None
+    assert after.claim_expires is None
+    assert after.worker_pid is None
+    assert after.last_heartbeat_at is None
+    assert after.current_run_id is None
+    assert after.consecutive_failures == 0
+    assert after.last_failure_error is None
+    assert after.updated_at >= before.updated_at
 
 
 def _make_task(**overrides) -> "kb.Task":
