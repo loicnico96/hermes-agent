@@ -453,7 +453,7 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_non_terminal_status_helpers_route_through_approval_reset_hook(kanban_home, monkeypatch):
+def test_non_terminal_status_helpers_do_not_route_through_approval_reset_hook(kanban_home, monkeypatch):
     calls: list[tuple[str | None, str]] = []
 
     def fake_hook(conn, task_id, *, old_status, new_status):
@@ -473,11 +473,30 @@ def test_non_terminal_status_helpers_route_through_approval_reset_hook(kanban_ho
         triage = kb.create_task(conn, title="triage", triage=True)
         assert kb.specify_triage_task(conn, triage, title="triage", assignee="ops") is True
 
+    assert calls == []
+
+
+def test_terminal_status_helpers_route_through_approval_reset_hook(kanban_home, monkeypatch):
+    calls: list[tuple[str | None, str]] = []
+
+    def fake_hook(conn, task_id, *, old_status, new_status):
+        assert task_id
+        calls.append((old_status, new_status))
+
+    monkeypatch.setattr(kb, "_handle_task_status_transition_approval_reset", fake_hook)
+
+    with kb.connect() as conn:
+        completed = kb.create_task(conn, title="completed", assignee="ops")
+        archived = kb.create_task(conn, title="archived", assignee="ops")
+
+        assert kb.complete_task(conn, completed, result="done") is True
+        assert kb.complete_task(conn, archived, result="done") is True
+        assert kb.archive_task(conn, archived) is True
+
     assert calls == [
-        ("ready", "scheduled"),
-        ("scheduled", "ready"),
-        ("ready", "blocked"),
-        ("triage", "todo"),
+        ("ready", "done"),
+        ("ready", "done"),
+        ("done", "archived"),
     ]
 
 
