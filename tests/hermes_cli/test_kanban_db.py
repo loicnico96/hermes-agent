@@ -903,25 +903,39 @@ def test_archive_hides_from_default_list(kanban_home):
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
 
 
+def _seed_approval_rows(conn, task_id: str) -> tuple[int, int]:
+    now = 100
+    approval_cur = conn.execute(
+        """
+        INSERT INTO task_approvals (
+            task_id, approver_type, approver_profile, approver_skill,
+            status, comment_id, claim_lock, claim_expires, worker_pid,
+            last_heartbeat_at, current_run_id, consecutive_failures,
+            last_failure_error, created_at, updated_at
+        ) VALUES (?, 'agent', 'reviewer', NULL, 'failed', NULL, 'lease-1', 10, 20, 30, 1, 2, 'boom', ?, ?)
+        """,
+        (task_id, now, now),
+    )
+    approval_id = int(approval_cur.lastrowid)
+    approval_run_cur = conn.execute(
+        """
+        INSERT INTO task_approval_runs (
+            approval_id, task_id, profile, status, claim_lock, claim_expires,
+            worker_pid, last_heartbeat_at, started_at, ended_at, outcome,
+            comment_id, error
+        ) VALUES (?, ?, 'reviewer', 'failed', 'lease-1', 10, 20, 30, 40, 50, 'failed', NULL, 'boom')
+        """,
+        (approval_id, task_id),
+    )
+    return approval_id, int(approval_run_cur.lastrowid)
+
+
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
-        approval_id = kb.create_task_approval(
-            conn,
-            task_id=tid,
-            approver_type="agent",
-            approver_profile="reviewer",
-        )
-        kb.create_task_approval_run(
-            conn,
-            approval_id=approval_id,
-            status="failed",
-            outcome="failed",
-            started_at=10,
-            ended_at=20,
-        )
+        _seed_approval_rows(conn, tid)
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result="done")
         assert kb.archive_task(conn, tid)
@@ -985,31 +999,16 @@ def test_list_tasks_order_by(kanban_home):
 def test_delete_task_removes_task_and_cascades(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="to-delete", assignee="alice")
-        comment_id = kb.add_comment(conn, t, "user", "comment")
+        kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
-        approval_id = kb.create_task_approval(
-            conn,
-            task_id=t,
-            approver_type="agent",
-            approver_profile="reviewer",
-            comment_id=comment_id,
-        )
-        kb.create_task_approval_run(
-            conn,
-            approval_id=approval_id,
-            comment_id=comment_id,
-            status="approved",
-            outcome="approved",
-            started_at=10,
-            ended_at=20,
-        )
+        _seed_approval_rows(conn, t)
         assert kb.delete_task(conn, t)
         assert kb.get_task(conn, t) is None
         assert len(kb.list_comments(conn, t)) == 0
         assert len(kb.list_events(conn, t)) == 0
         assert len(kb.list_runs(conn, t)) == 0
-        assert kb.list_task_approvals(conn, t) == []
-        assert kb.list_task_approval_runs(conn, task_id=t) == []
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE task_id = ?", (t,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE task_id = ?", (t,)).fetchone()[0] == 0
 
 
 def test_delete_task_returns_false_for_missing_task(kanban_home):
@@ -2643,215 +2642,6 @@ def test_approval_run_from_row_parses_optional_fields():
         comment_id=15,
         error=None,
     )
-
-
-def test_create_task_approval_and_run_round_trip(kanban_home):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="needs approval", assignee="alice")
-        comment_id = kb.add_comment(conn, task_id, "user", "please review")
-
-        approval_id = kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="reviewer",
-            approver_skill="github-code-review",
-            comment_id=comment_id,
-            claim_lock="lease-1",
-            claim_expires=101,
-            worker_pid=202,
-            last_heartbeat_at=303,
-        )
-        approval = kb.get_task_approval(conn, approval_id)
-        approvals = kb.list_task_approvals(conn, task_id)
-
-        approval_run_id = kb.create_task_approval_run(
-            conn,
-            approval_id=approval_id,
-            comment_id=comment_id,
-            status="approved",
-            outcome="approved",
-            started_at=1000,
-            ended_at=1010,
-        )
-        approval_run = kb.get_task_approval_run(conn, approval_run_id)
-        approval_runs = kb.list_task_approval_runs(conn, approval_id=approval_id)
-
-    assert approval is not None
-    assert approval.task_id == task_id
-    assert approval.approver_type == "agent"
-    assert approval.approver_profile == "reviewer"
-    assert approval.approver_skill == "github-code-review"
-    assert approval.comment_id == comment_id
-    assert [item.id for item in approvals] == [approval_id]
-
-    assert approval_run is not None
-    assert approval_run.approval_id == approval_id
-    assert approval_run.task_id == task_id
-    assert approval_run.profile == "reviewer"
-    assert approval_run.status == "approved"
-    assert approval_run.comment_id == comment_id
-    assert [item.id for item in approval_runs] == [approval_run_id]
-
-
-def test_create_task_approval_enforces_human_and_agent_uniqueness(kanban_home):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="needs reviewers")
-        kb.create_task_approval(conn, task_id=task_id, approver_type="human")
-        with pytest.raises(ValueError, match="already has a human approval"):
-            kb.create_task_approval(conn, task_id=task_id, approver_type="human")
-
-        kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="reviewer",
-        )
-        with pytest.raises(ValueError, match="already has an agent approval"):
-            kb.create_task_approval(
-                conn,
-                task_id=task_id,
-                approver_type="agent",
-                approver_profile="reviewer",
-            )
-
-        kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="reviewer",
-            approver_skill="security-review",
-        )
-        with pytest.raises(ValueError, match="already has an agent approval"):
-            kb.create_task_approval(
-                conn,
-                task_id=task_id,
-                approver_type="agent",
-                approver_profile="reviewer",
-                approver_skill="security-review",
-            )
-
-        other_skill_id = kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="reviewer",
-            approver_skill="docs-review",
-        )
-
-    assert other_skill_id > 0
-
-
-def test_create_task_approval_validates_identity_status_and_comment_scope(kanban_home):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="task one")
-        other_task_id = kb.create_task(conn, title="task two")
-        other_comment_id = kb.add_comment(conn, other_task_id, "user", "wrong task")
-
-        with pytest.raises(ValueError, match="human approvals cannot set approver_profile"):
-            kb.create_task_approval(
-                conn,
-                task_id=task_id,
-                approver_type="human",
-                approver_profile="reviewer",
-            )
-        with pytest.raises(ValueError, match="human approvals cannot set approver_skill"):
-            kb.create_task_approval(
-                conn,
-                task_id=task_id,
-                approver_type="human",
-                approver_skill="github-code-review",
-            )
-        with pytest.raises(ValueError, match="agent approvals require approver_profile"):
-            kb.create_task_approval(conn, task_id=task_id, approver_type="agent")
-        with pytest.raises(ValueError, match="status must be one of"):
-            kb.create_task_approval(
-                conn,
-                task_id=task_id,
-                approver_type="agent",
-                approver_profile="reviewer",
-                status="pending",
-            )
-        with pytest.raises(ValueError, match="does not belong to task"):
-            kb.create_task_approval(
-                conn,
-                task_id=task_id,
-                approver_type="agent",
-                approver_profile="reviewer",
-                comment_id=other_comment_id,
-            )
-
-
-def test_create_task_approval_run_rejects_human_rows_and_task_mismatches(kanban_home):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="needs approval")
-        other_task_id = kb.create_task(conn, title="other task")
-
-        human_approval_id = kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="human",
-        )
-        agent_approval_id = kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="reviewer",
-        )
-
-        with pytest.raises(ValueError, match="only valid for agent approvals"):
-            kb.create_task_approval_run(conn, approval_id=human_approval_id)
-        with pytest.raises(ValueError, match="belongs to task"):
-            kb.create_task_approval_run(
-                conn,
-                approval_id=agent_approval_id,
-                task_id=other_task_id,
-            )
-
-
-def test_reset_task_approval_clears_live_fields_only(kanban_home):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="reset me")
-        comment_id = kb.add_comment(conn, task_id, "user", "original comment")
-        approval_id = kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="reviewer",
-            approver_skill="github-code-review",
-            status="failed",
-            comment_id=comment_id,
-            claim_lock="lease-1",
-            claim_expires=123,
-            worker_pid=456,
-            last_heartbeat_at=789,
-            current_run_id=42,
-            consecutive_failures=2,
-            last_failure_error="boom",
-        )
-        before = kb.get_task_approval(conn, approval_id)
-
-        assert kb.reset_task_approval(conn, approval_id) is True
-        after = kb.get_task_approval(conn, approval_id)
-
-    assert before is not None
-    assert after is not None
-    assert after.id == before.id
-    assert after.task_id == before.task_id
-    assert after.approver_type == before.approver_type
-    assert after.approver_profile == before.approver_profile
-    assert after.approver_skill == before.approver_skill
-    assert after.created_at == before.created_at
-    assert after.status == "requested"
-    assert after.comment_id is None
-    assert after.claim_lock is None
-    assert after.claim_expires is None
-    assert after.worker_pid is None
-    assert after.last_heartbeat_at is None
-    assert after.current_run_id is None
-    assert after.consecutive_failures == 0
-    assert after.last_failure_error is None
-    assert after.updated_at >= before.updated_at
 
 
 def _make_task(**overrides) -> "kb.Task":
