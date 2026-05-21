@@ -435,7 +435,7 @@ def test_non_terminal_status_helpers_do_not_route_through_approval_reset_hook(ka
     assert calls == []
 
 
-def test_terminal_status_helpers_do_not_route_through_approval_reset_hook(kanban_home, monkeypatch):
+def test_terminal_status_helpers_route_through_approval_reset_hook(kanban_home, monkeypatch):
     calls: list[tuple[str | None, str]] = []
 
     def fake_hook(conn, task_id, *, old_status, new_status):
@@ -452,7 +452,11 @@ def test_terminal_status_helpers_do_not_route_through_approval_reset_hook(kanban
         assert kb.complete_task(conn, archived, result="done") is True
         assert kb.archive_task(conn, archived) is True
 
-    assert calls == []
+    assert calls == [
+        ("ready", "done"),
+        ("ready", "done"),
+        ("done", "archived"),
+    ]
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
