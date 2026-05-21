@@ -2724,6 +2724,35 @@ def list_task_approvals(
     return [Approval.from_row(row) for row in rows]
 
 
+def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
+    now = int(time.time())
+
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE task_approvals
+            SET status = 'requested',
+                comment_id = NULL,
+                claim_lock = NULL,
+                claim_expires = NULL,
+                worker_pid = NULL,
+                last_heartbeat_at = NULL,
+                current_run_id = NULL,
+                consecutive_failures = 0,
+                last_failure_error = NULL,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, int(approval_id)),
+        )
+        if cur.rowcount != 1:
+            raise ValueError(f"unknown approval {approval_id}")
+
+        approval = get_task_approval(conn, approval_id)
+        assert approval is not None
+        return approval
+
+
 def create_task_approval_run(
     conn: sqlite3.Connection,
     *,

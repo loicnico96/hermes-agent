@@ -232,3 +232,74 @@ def test_create_task_approval_run_rejects_cross_task_comment(kanban_home):
                 approval_id=approval.id,
                 comment_id=other_comment_id,
             )
+
+
+def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 5_000)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        comment_id = kb.add_comment(conn, task_id, "user", "stale review")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            approver_skill="security-review",
+            status="failed",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                SET comment_id = ?,
+                    claim_lock = ?,
+                    claim_expires = ?,
+                    worker_pid = ?,
+                    last_heartbeat_at = ?,
+                    current_run_id = ?,
+                    consecutive_failures = ?,
+                    last_failure_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    comment_id,
+                    "lease-1",
+                    123,
+                    456,
+                    789,
+                    run.id,
+                    3,
+                    "spawn failed",
+                    4_000,
+                    approval.id,
+                ),
+            )
+
+        reset = kb.reset_task_approval(conn, approval.id)
+
+    assert reset.id == approval.id
+    assert reset.task_id == task_id
+    assert reset.approver_type == "agent"
+    assert reset.approver_profile == "reviewer"
+    assert reset.approver_skill == "security-review"
+    assert reset.created_at == approval.created_at
+    assert reset.status == "requested"
+    assert reset.comment_id is None
+    assert reset.claim_lock is None
+    assert reset.claim_expires is None
+    assert reset.worker_pid is None
+    assert reset.last_heartbeat_at is None
+    assert reset.current_run_id is None
+    assert reset.consecutive_failures == 0
+    assert reset.last_failure_error is None
+    assert reset.updated_at == 5_000
+
+
+def test_reset_task_approval_rejects_unknown_approval(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="unknown approval"):
+            kb.reset_task_approval(conn, 999999)
