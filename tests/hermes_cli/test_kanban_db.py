@@ -190,7 +190,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
-    # No migration infers approval rows from legacy review/comment conventions.
+    # No additive migration infers approval rows from legacy review/comment conventions.
     with kb.connect(db_path) as migrated_again:
         assert migrated_again.execute("SELECT COUNT(*) FROM task_approvals").fetchone()[0] == 0
         assert migrated_again.execute("SELECT COUNT(*) FROM task_approval_runs").fetchone()[0] == 0
@@ -435,7 +435,7 @@ def test_non_terminal_status_helpers_do_not_route_through_approval_reset_hook(ka
     assert calls == []
 
 
-def test_terminal_status_helpers_route_through_approval_reset_hook(kanban_home, monkeypatch):
+def test_terminal_status_helpers_do_not_route_through_approval_reset_hook(kanban_home, monkeypatch):
     calls: list[tuple[str | None, str]] = []
 
     def fake_hook(conn, task_id, *, old_status, new_status):
@@ -452,11 +452,7 @@ def test_terminal_status_helpers_route_through_approval_reset_hook(kanban_home, 
         assert kb.complete_task(conn, archived, result="done") is True
         assert kb.archive_task(conn, archived) is True
 
-    assert calls == [
-        ("ready", "done"),
-        ("ready", "done"),
-        ("done", "archived"),
-    ]
+    assert calls == []
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):

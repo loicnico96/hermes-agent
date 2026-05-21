@@ -2223,7 +2223,7 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         return approval
 
 
-_APPROVAL_RESET_TRIGGER_TASK_STATUSES = frozenset({"approving", "done", "archived"})
+_APPROVAL_RESET_TRIGGER_TASK_STATUSES = frozenset({"approving"})
 
 
 def _handle_task_status_transition_approval_reset(
@@ -2235,10 +2235,10 @@ def _handle_task_status_transition_approval_reset(
 ) -> None:
     """Phase 2 insertion point for task-driven approval reset wiring.
 
-    Phase 1 intentionally lands only the named hook at transitions that own
-    approval state: entering ``approving`` and terminalizing into ``done`` /
-    ``archived``. Approval-free routing such as triage/specify/promote helpers
-    should not grow task-wide reset semantics.
+    Phase 1 intentionally keeps this helper narrow: later approval-runtime
+    slices should route approval-entry reset behavior through this hook instead
+    of scattering ``reset_task_approval()`` calls across unrelated status
+    helpers.
     """
     del conn, task_id  # Reserved for Phase 2 task-wide reset wiring.
     if old_status is None or old_status == new_status:
@@ -3402,7 +3402,6 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
-        previous = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -3436,12 +3435,6 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
-        _handle_task_status_transition_approval_reset(
-            conn,
-            task_id,
-            old_status=(previous["status"] if previous else None),
-            new_status="done",
-        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -3835,10 +3828,6 @@ def block_task(
 ) -> bool:
     """Transition ``running -> blocked``."""
     with write_txn(conn):
-        previous = conn.execute(
-            "SELECT status FROM tasks WHERE id = ? AND status IN ('running', 'ready')",
-            (task_id,),
-        ).fetchone()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4306,7 +4295,6 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
-        previous = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -4315,12 +4303,6 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _handle_task_status_transition_approval_reset(
-            conn,
-            task_id,
-            old_status=(previous["status"] if previous else None),
-            new_status="archived",
-        )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
@@ -4483,10 +4465,6 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
-        previous = conn.execute(
-            "SELECT status FROM tasks WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked')",
-            (task_id,),
-        ).fetchone()
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
