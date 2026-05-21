@@ -9,6 +9,7 @@ import sys
 import time
 import types
 import unittest.mock
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -2989,6 +2990,101 @@ def test_resolve_hermes_argv_module_actually_runs():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Approval row models
+# ---------------------------------------------------------------------------
+
+
+def test_approval_from_row_parses_nullable_and_identity_fields():
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT
+                7 AS id,
+                't_approval' AS task_id,
+                'agent' AS approver_type,
+                'reviewer' AS approver_profile,
+                'github-code-review' AS approver_skill,
+                'requested' AS status,
+                13 AS comment_id,
+                'lease-123' AS claim_lock,
+                1700000100 AS claim_expires,
+                4242 AS worker_pid,
+                1700000200 AS last_heartbeat_at,
+                9 AS current_run_id,
+                2 AS consecutive_failures,
+                'spawn failed' AS last_failure_error,
+                1700000000 AS created_at,
+                1700000300 AS updated_at
+            """
+        ).fetchone()
+
+        approval = kb.Approval.from_row(row)
+
+    assert approval == kb.Approval(
+        id=7,
+        task_id="t_approval",
+        approver_type="agent",
+        approver_profile="reviewer",
+        approver_skill="github-code-review",
+        status="requested",
+        comment_id=13,
+        claim_lock="lease-123",
+        claim_expires=1700000100,
+        worker_pid=4242,
+        last_heartbeat_at=1700000200,
+        current_run_id=9,
+        consecutive_failures=2,
+        last_failure_error="spawn failed",
+        created_at=1700000000,
+        updated_at=1700000300,
+    )
+
+
+def test_approval_run_from_row_parses_optional_fields():
+    with closing(sqlite3.connect(":memory:")) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT
+                11 AS id,
+                7 AS approval_id,
+                't_approval' AS task_id,
+                'reviewer' AS profile,
+                'approved' AS status,
+                NULL AS claim_lock,
+                NULL AS claim_expires,
+                NULL AS worker_pid,
+                NULL AS last_heartbeat_at,
+                1700000000 AS started_at,
+                1700000400 AS ended_at,
+                'approved' AS outcome,
+                15 AS comment_id,
+                NULL AS error
+            """
+        ).fetchone()
+
+        approval_run = kb.ApprovalRun.from_row(row)
+
+    assert approval_run == kb.ApprovalRun(
+        id=11,
+        approval_id=7,
+        task_id="t_approval",
+        profile="reviewer",
+        status="approved",
+        claim_lock=None,
+        claim_expires=None,
+        worker_pid=None,
+        last_heartbeat_at=None,
+        started_at=1700000000,
+        ended_at=1700000400,
+        outcome="approved",
+        comment_id=15,
+        error=None,
+    )
+
+
 def _make_task(**overrides) -> "kb.Task":
     """Minimal Task with all required fields filled in. Override anything."""
     defaults = dict(
@@ -3394,6 +3490,24 @@ def test_dispatch_review_skips_nonspawnable(kanban_home, monkeypatch):
 def test_review_status_in_valid_statuses():
     """'review' is a valid task status."""
     assert "review" in kb.VALID_STATUSES
+
+
+def test_approving_status_round_trips_through_task_reads(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="alice")
+        _set_task_status(conn, task_id, "approving")
+
+        task = kb.get_task(conn, task_id)
+        filtered = kb.list_tasks(conn, status="approving")
+
+    assert task is not None
+    assert task.status == "approving"
+    assert [item.id for item in filtered] == [task_id]
+
+
+def test_approving_status_in_valid_statuses():
+    """'approving' is a valid task status."""
+    assert "approving" in kb.VALID_STATUSES
 
 
 def test_dispatch_review_does_not_claim_ready_tasks(

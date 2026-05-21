@@ -97,9 +97,22 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "approving", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_APPROVAL_TYPES = {"human", "agent"}
+VALID_APPROVAL_STATUSES = {"requested", "approved", "rejected", "escalated", "failed"}
+VALID_APPROVAL_RUN_STATUSES = {
+    "running",
+    "approved",
+    "rejected",
+    "escalated",
+    "failed",
+    "crashed",
+    "timed_out",
+    "reclaimed",
+    "spawn_failed",
+}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -929,6 +942,92 @@ class Run:
             outcome=row["outcome"],
             summary=row["summary"],
             metadata=meta,
+            error=row["error"],
+        )
+
+
+@dataclass
+class Approval:
+    """In-memory view of a ``task_approvals`` row."""
+
+    id: int
+    task_id: str
+    approver_type: str
+    approver_profile: Optional[str]
+    approver_skill: Optional[str]
+    status: str
+    comment_id: Optional[int]
+    claim_lock: Optional[str]
+    claim_expires: Optional[int]
+    worker_pid: Optional[int]
+    last_heartbeat_at: Optional[int]
+    current_run_id: Optional[int]
+    consecutive_failures: int
+    last_failure_error: Optional[str]
+    created_at: int
+    updated_at: int
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Approval":
+        return cls(
+            id=int(row["id"]),
+            task_id=row["task_id"],
+            approver_type=row["approver_type"],
+            approver_profile=row["approver_profile"],
+            approver_skill=row["approver_skill"],
+            status=row["status"],
+            comment_id=(int(row["comment_id"]) if row["comment_id"] is not None else None),
+            claim_lock=row["claim_lock"],
+            claim_expires=(int(row["claim_expires"]) if row["claim_expires"] is not None else None),
+            worker_pid=(int(row["worker_pid"]) if row["worker_pid"] is not None else None),
+            last_heartbeat_at=(
+                int(row["last_heartbeat_at"]) if row["last_heartbeat_at"] is not None else None
+            ),
+            current_run_id=(int(row["current_run_id"]) if row["current_run_id"] is not None else None),
+            consecutive_failures=int(row["consecutive_failures"]),
+            last_failure_error=row["last_failure_error"],
+            created_at=int(row["created_at"]),
+            updated_at=int(row["updated_at"]),
+        )
+
+
+@dataclass
+class ApprovalRun:
+    """In-memory view of a ``task_approval_runs`` row."""
+
+    id: int
+    approval_id: int
+    task_id: str
+    profile: Optional[str]
+    status: str
+    claim_lock: Optional[str]
+    claim_expires: Optional[int]
+    worker_pid: Optional[int]
+    last_heartbeat_at: Optional[int]
+    started_at: int
+    ended_at: Optional[int]
+    outcome: Optional[str]
+    comment_id: Optional[int]
+    error: Optional[str]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "ApprovalRun":
+        return cls(
+            id=int(row["id"]),
+            approval_id=int(row["approval_id"]),
+            task_id=row["task_id"],
+            profile=row["profile"],
+            status=row["status"],
+            claim_lock=row["claim_lock"],
+            claim_expires=(int(row["claim_expires"]) if row["claim_expires"] is not None else None),
+            worker_pid=(int(row["worker_pid"]) if row["worker_pid"] is not None else None),
+            last_heartbeat_at=(
+                int(row["last_heartbeat_at"]) if row["last_heartbeat_at"] is not None else None
+            ),
+            started_at=int(row["started_at"]),
+            ended_at=(int(row["ended_at"]) if row["ended_at"] is not None else None),
+            outcome=row["outcome"],
+            comment_id=(int(row["comment_id"]) if row["comment_id"] is not None else None),
             error=row["error"],
         )
 
