@@ -2753,6 +2753,32 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         return approval
 
 
+_APPROVAL_RESET_PRESERVING_TASK_STATUSES = frozenset({"approving", "done", "archived"})
+
+
+def _handle_task_status_transition_approval_reset(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    old_status: Optional[str],
+    new_status: str,
+) -> None:
+    """Phase 2 insertion point for task-driven approval reset wiring.
+
+    Phase 1 intentionally lands only the named hook. Later approval-runtime
+    slices should route task-level reset behavior through this helper instead of
+    scattering ``reset_task_approval()`` calls across every status mutation
+    site.
+    """
+    del conn, task_id  # Reserved for Phase 2 task-wide reset wiring.
+    if old_status is None or old_status == new_status:
+        return
+    if new_status in _APPROVAL_RESET_PRESERVING_TASK_STATUSES:
+        return
+    # Intentionally no-op in Phase 1. Later phases should bulk-reset this
+    # task's approval rows here once the approval aggregate semantics land.
+
+
 def create_task_approval_run(
     conn: sqlite3.Connection,
     *,
@@ -4568,6 +4594,10 @@ def block_task(
 ) -> bool:
     """Transition ``running -> blocked``."""
     with write_txn(conn):
+        previous = conn.execute(
+            "SELECT status FROM tasks WHERE id = ? AND status IN ('running', 'ready')",
+            (task_id,),
+        ).fetchone()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4597,6 +4627,12 @@ def block_task(
             )
         if cur.rowcount != 1:
             return False
+        _handle_task_status_transition_approval_reset(
+            conn,
+            task_id,
+            old_status=(previous["status"] if previous else None),
+            new_status="blocked",
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="blocked", status="blocked",
@@ -4698,7 +4734,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT status, current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -4734,6 +4770,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        _handle_task_status_transition_approval_reset(
+            conn,
+            task_id,
+            old_status=(stale["status"] if stale else None),
+            new_status=new_status,
+        )
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
@@ -4799,6 +4841,12 @@ def specify_triage_task(
         )
         if cur.rowcount != 1:
             return False
+        _handle_task_status_transition_approval_reset(
+            conn,
+            task_id,
+            old_status="triage",
+            new_status="todo",
+        )
         if changed_fields and author and author.strip():
             # Inline INSERT (rather than ``add_comment``) because we're
             # already inside this function's write_txn — nested BEGIN
@@ -5095,18 +5143,23 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_approvals WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_approval_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_task_owned_rows(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
+
+
+def _delete_task_owned_rows(conn: sqlite3.Connection, task_id: str) -> None:
+    """Delete every child row owned by ``task_id`` inside an open txn."""
+    conn.execute(
+        "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+        (task_id, task_id),
+    )
+    conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_approvals WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_approval_runs WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -5123,13 +5176,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         row = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_approvals WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_approval_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_task_owned_rows(conn, task_id)
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     recompute_ready(conn)
     return True
@@ -5228,6 +5275,10 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        previous = conn.execute(
+            "SELECT status FROM tasks WHERE id = ? AND status IN ('todo', 'ready', 'running', 'blocked')",
+            (task_id,),
+        ).fetchone()
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -5244,6 +5295,12 @@ def schedule_task(
         cur = conn.execute(sql, params)
         if cur.rowcount != 1:
             return False
+        _handle_task_status_transition_approval_reset(
+            conn,
+            task_id,
+            old_status=(previous["status"] if previous else None),
+            new_status="scheduled",
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="scheduled", status="scheduled",
