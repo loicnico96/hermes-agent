@@ -412,6 +412,34 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_non_terminal_status_helpers_route_through_approval_reset_hook(kanban_home, monkeypatch):
+    calls: list[tuple[str | None, str]] = []
+
+    def fake_hook(conn, task_id, *, old_status, new_status):
+        assert task_id
+        calls.append((old_status, new_status))
+
+    monkeypatch.setattr(kb, "_handle_task_status_transition_approval_reset", fake_hook)
+
+    with kb.connect() as conn:
+        scheduled = kb.create_task(conn, title="scheduled", assignee="ops")
+        assert kb.schedule_task(conn, scheduled, reason="later") is True
+        assert kb.unblock_task(conn, scheduled) is True
+
+        blocked = kb.create_task(conn, title="blocked", assignee="ops")
+        assert kb.block_task(conn, blocked, reason="need input") is True
+
+        triage = kb.create_task(conn, title="triage", triage=True)
+        assert kb.specify_triage_task(conn, triage, title="triage", assignee="ops") is True
+
+    assert calls == [
+        ("ready", "scheduled"),
+        ("scheduled", "ready"),
+        ("ready", "blocked"),
+        ("triage", "todo"),
+    ]
+
+
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
     import signal
     import hermes_cli.kanban_db as _kb
@@ -955,6 +983,24 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+
+
+def test_delete_archived_task_only_removes_target_task_approval_rows(kanban_home):
+    with kb.connect() as conn:
+        archived = kb.create_task(conn, title="archived", assignee="worker")
+        survivor = kb.create_task(conn, title="survivor", assignee="worker")
+        archived_approval_id, archived_run_id = _seed_approval_rows(conn, archived)
+        survivor_approval_id, survivor_run_id = _seed_approval_rows(conn, survivor)
+        kb.complete_task(conn, archived, result="done")
+        assert kb.archive_task(conn, archived)
+
+        assert kb.delete_archived_task(conn, archived) is True
+
+        assert kb.get_task(conn, survivor) is not None
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE id = ?", (archived_approval_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE id = ?", (archived_run_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE id = ?", (survivor_approval_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE id = ?", (survivor_run_id,)).fetchone()[0] == 1
 
 
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
