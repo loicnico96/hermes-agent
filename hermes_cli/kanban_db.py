@@ -1985,6 +1985,285 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _normalize_approval_profile(profile: Optional[str]) -> Optional[str]:
+    profile = _normalize_optional_text(profile)
+    if profile is None:
+        return None
+    return _canonical_assignee(profile)
+
+
+def _validate_approval_identity(
+    *,
+    approver_type: str,
+    approver_profile: Optional[str],
+    approver_skill: Optional[str],
+) -> tuple[str, Optional[str], Optional[str]]:
+    if approver_type not in VALID_APPROVAL_TYPES:
+        raise ValueError(f"approver_type must be one of {sorted(VALID_APPROVAL_TYPES)}")
+
+    normalized_profile = _normalize_approval_profile(approver_profile)
+    normalized_skill = _normalize_optional_text(approver_skill)
+
+    if approver_type == "human":
+        if normalized_profile is not None:
+            raise ValueError("human approvals cannot set approver_profile")
+        if normalized_skill is not None:
+            raise ValueError("human approvals cannot set approver_skill")
+        return approver_type, None, None
+
+    if normalized_profile is None:
+        raise ValueError("agent approvals require approver_profile")
+    return approver_type, normalized_profile, normalized_skill
+
+
+def _validate_approval_status(status: str) -> str:
+    normalized_status = _normalize_optional_text(status)
+    if normalized_status not in VALID_APPROVAL_STATUSES:
+        raise ValueError(f"approval status must be one of {sorted(VALID_APPROVAL_STATUSES)}")
+    return normalized_status
+
+
+def _validate_approval_run_status(status: str) -> str:
+    normalized_status = _normalize_optional_text(status)
+    if normalized_status not in VALID_APPROVAL_RUN_STATUSES:
+        raise ValueError(
+            f"approval run status must be one of {sorted(VALID_APPROVAL_RUN_STATUSES)}"
+        )
+    return normalized_status
+
+
+def _validate_task_comment_reference(
+    conn: sqlite3.Connection, *, task_id: str, comment_id: Optional[int]
+) -> Optional[int]:
+    if comment_id is None:
+        return None
+
+    normalized_comment_id = int(comment_id)
+    row = conn.execute(
+        "SELECT task_id FROM task_comments WHERE id = ?",
+        (normalized_comment_id,),
+    ).fetchone()
+    if not row or row["task_id"] != task_id:
+        raise ValueError("comment_id must reference a comment on the same task")
+    return normalized_comment_id
+
+
+def _approval_exists(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    approver_type: str,
+    approver_profile: Optional[str],
+    approver_skill: Optional[str],
+) -> bool:
+    if approver_type == "human":
+        row = conn.execute(
+            "SELECT 1 FROM task_approvals WHERE task_id = ? AND approver_type = 'human'",
+            (task_id,),
+        ).fetchone()
+        return row is not None
+
+    if approver_skill is None:
+        row = conn.execute(
+            """
+            SELECT 1
+              FROM task_approvals
+             WHERE task_id = ?
+               AND approver_type = 'agent'
+               AND approver_profile = ?
+               AND approver_skill IS NULL
+            """,
+            (task_id, approver_profile),
+        ).fetchone()
+        return row is not None
+
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM task_approvals
+         WHERE task_id = ?
+           AND approver_type = 'agent'
+           AND approver_profile = ?
+           AND approver_skill = ?
+        """,
+        (task_id, approver_profile, approver_skill),
+    ).fetchone()
+    return row is not None
+
+
+def create_task_approval(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    approver_type: str,
+    approver_profile: Optional[str] = None,
+    approver_skill: Optional[str] = None,
+    status: str = "requested",
+    comment_id: Optional[int] = None,
+) -> Approval:
+    approver_type, approver_profile, approver_skill = _validate_approval_identity(
+        approver_type=approver_type,
+        approver_profile=approver_profile,
+        approver_skill=approver_skill,
+    )
+    status = _validate_approval_status(status)
+    now = int(time.time())
+
+    with write_txn(conn):
+        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        comment_id = _validate_task_comment_reference(
+            conn, task_id=task_id, comment_id=comment_id
+        )
+        if _approval_exists(
+            conn,
+            task_id=task_id,
+            approver_type=approver_type,
+            approver_profile=approver_profile,
+            approver_skill=approver_skill,
+        ):
+            if approver_type == "human":
+                raise ValueError(f"task {task_id} already has a human approval")
+            raise ValueError(
+                "task already has an agent approval for that profile/skill combination"
+            )
+
+        cur = conn.execute(
+            """
+            INSERT INTO task_approvals (
+                task_id, approver_type, approver_profile, approver_skill,
+                status, comment_id, claim_lock, claim_expires, worker_pid,
+                last_heartbeat_at, current_run_id, consecutive_failures,
+                last_failure_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, 0, NULL, ?, ?)
+            """,
+            (
+                task_id,
+                approver_type,
+                approver_profile,
+                approver_skill,
+                status,
+                comment_id,
+                now,
+                now,
+            ),
+        )
+        approval_id = cur.lastrowid
+        assert approval_id is not None
+        approval = get_task_approval(conn, approval_id)
+        assert approval is not None
+        return approval
+
+
+def get_task_approval(conn: sqlite3.Connection, approval_id: int) -> Optional[Approval]:
+    row = conn.execute(
+        "SELECT * FROM task_approvals WHERE id = ?",
+        (int(approval_id),),
+    ).fetchone()
+    return Approval.from_row(row) if row else None
+
+
+def list_task_approvals(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: Optional[str] = None,
+    approver_type: Optional[str] = None,
+) -> list[Approval]:
+    query = "SELECT * FROM task_approvals WHERE task_id = ?"
+    params: list[Any] = [task_id]
+    if status is not None:
+        query += " AND status = ?"
+        params.append(_validate_approval_status(status))
+    if approver_type is not None:
+        if approver_type not in VALID_APPROVAL_TYPES:
+            raise ValueError(
+                f"approver_type must be one of {sorted(VALID_APPROVAL_TYPES)}"
+            )
+        query += " AND approver_type = ?"
+        params.append(approver_type)
+    query += " ORDER BY created_at ASC, id ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [Approval.from_row(row) for row in rows]
+
+
+def create_task_approval_run(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: int,
+    status: str = "running",
+    profile: Optional[str] = None,
+    claim_lock: Optional[str] = None,
+    claim_expires: Optional[int] = None,
+    worker_pid: Optional[int] = None,
+    last_heartbeat_at: Optional[int] = None,
+    started_at: Optional[int] = None,
+    ended_at: Optional[int] = None,
+    outcome: Optional[str] = None,
+    comment_id: Optional[int] = None,
+    error: Optional[str] = None,
+) -> ApprovalRun:
+    status = _validate_approval_run_status(status)
+    normalized_profile = _normalize_approval_profile(profile)
+
+    with write_txn(conn):
+        approval = get_task_approval(conn, approval_id)
+        if approval is None:
+            raise ValueError(f"unknown approval {approval_id}")
+        if approval.approver_type != "agent":
+            raise ValueError("approval runs require an agent approval")
+
+        effective_profile = normalized_profile or approval.approver_profile
+        if effective_profile is None:
+            raise ValueError("approval runs require profile")
+
+        normalized_comment_id = _validate_task_comment_reference(
+            conn, task_id=approval.task_id, comment_id=comment_id
+        )
+        effective_started_at = int(started_at) if started_at is not None else int(time.time())
+        effective_ended_at = int(ended_at) if ended_at is not None else None
+
+        cur = conn.execute(
+            """
+            INSERT INTO task_approval_runs (
+                approval_id, task_id, profile, status, claim_lock, claim_expires,
+                worker_pid, last_heartbeat_at, started_at, ended_at, outcome,
+                comment_id, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(approval_id),
+                approval.task_id,
+                effective_profile,
+                status,
+                _normalize_optional_text(claim_lock),
+                (int(claim_expires) if claim_expires is not None else None),
+                (int(worker_pid) if worker_pid is not None else None),
+                (int(last_heartbeat_at) if last_heartbeat_at is not None else None),
+                effective_started_at,
+                effective_ended_at,
+                _normalize_optional_text(outcome),
+                normalized_comment_id,
+                _normalize_optional_text(error),
+            ),
+        )
+        run_id = cur.lastrowid
+        assert run_id is not None
+        row = conn.execute(
+            "SELECT * FROM task_approval_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        assert row is not None
+        return ApprovalRun.from_row(row)
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
