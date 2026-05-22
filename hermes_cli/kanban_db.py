@@ -2327,9 +2327,11 @@ def _compute_task_approval_aggregate_status(
     not block ``done`` once no live gate remains.
     """
     statuses = {approval.status for approval in approvals}
+    if "running" in statuses:
+        return "approving"
     if "rejected" in statuses:
         return "todo"
-    if statuses & LIVE_APPROVAL_STATUSES:
+    if "requested" in statuses:
         return "approving"
     return "done"
 

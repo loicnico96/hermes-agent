@@ -291,7 +291,7 @@ Keep the initial CLI surface small.
 If a task leaves `approving` because one approval rejected and the aggregate resolver returned the task to `todo`, any other in-flight approval workers for that task are now stale relative to current task state.
 
 Required behavior:
-- a recorded rejection moves the task through the authoritative rejection-cycle path immediately; generic approval-run liveness does not delay that transition
+- a recorded rejection keeps the task in `approving` while any approval row is still `running`; once no row remains `running`, that rejection immediately drives the authoritative rejection-cycle path
 - late valid results must not re-advance the task incorrectly
 - result-application code must re-check task/approval row state before mutating
 - if the approval row is no longer in a state compatible with the returned result, the result is discarded at the business-state layer even if the worker process only finished later
@@ -369,7 +369,7 @@ Runtime/dispatcher behavior is correct only if all of the following hold:
 6. Invalid approver output is treated as a failed attempt.
 7. After 3 consecutive failures, the approval row becomes `failed` and a human approval row exists.
 8. `escalated` and `failed` do not block `done` by themselves; the live blocking gate is the human approval row they ensure when one exists.
-9. A single authoritative rejection returns the task to `todo` and resets approval rows to `requested` in the same transaction.
+9. A single authoritative rejection returns the task to `todo` and resets approval rows to `requested` in the same transaction once no approval row remains `running`.
 10. Approval workers use independent concurrency accounting from task workers.
 11. Stale/crashed/timed-out approval workers are reclaimed using task-like lease semantics.
 12. Late approval results cannot incorrectly move a task back to `done` after the task already returned to `todo`.
