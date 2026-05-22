@@ -71,7 +71,7 @@ An approval row is runnable iff all of the following are true:
 5. `claim_lock IS NULL`
 6. the parent task is not archived
 
-Rows in `approved`, `rejected`, `escalated`, or `failed` are not runnable.
+Rows in `running`, `approved`, `rejected`, `escalated`, or `failed` are not runnable.
 Human approval rows are never runnable.
 `escalated` and `failed` are opt-out states for agent approval rows in this slice; once a row enters either state, it no longer participates in approval decision-making unless it is explicitly reset.
 
@@ -87,6 +87,7 @@ Before spawning an approval worker, the dispatcher must atomically claim the app
 
 The claim operation must:
 - verify the row is still runnable
+- consume `status = requested` and set `status = running`
 - set `claim_lock`
 - set `claim_expires`
 - set `started` bookkeeping on the new approval run row
@@ -159,7 +160,7 @@ For any valid decision:
 4. clear approval-row live claim fields
 5. clear `current_run_id`
 6. reset `consecutive_failures` to 0
-7. write the new approval-row status
+7. consume the owned approval row from `running` into the new terminal approval-row status
 8. emit an approval-decision event
 9. recompute parent task state using the aggregate resolver
 
@@ -174,7 +175,7 @@ For any valid decision:
 `decision = rejected`
 - set approval-row status to `rejected`
 - recompute task state
-- the aggregate resolver keeps the task in `approving` until all active approval runs finish, then applies the task-to-`todo` reset rule from the master spec
+- the aggregate resolver immediately applies the rejection-cycle reset rule from the master spec in the same transaction that records the authoritative live rejection
 
 ### 6.4 Escalated
 
@@ -218,10 +219,10 @@ When a failure occurs and the row remains under the limit:
 3. mark the approval run terminal with the correct failure outcome
 4. clear approval-row live claim fields
 5. clear `current_run_id`
-6. keep approval-row status as `requested`
+6. consume `status = running` back to `status = requested`
 7. emit an approval-failure event
 
-The dispatcher retries it on a later pass while the row remains `requested`.
+The dispatcher retries it on a later pass once the row is again `requested`.
 
 ### 7.4 Failure at limit
 
@@ -270,7 +271,7 @@ Reclaim steps:
 2. clear live claim fields on the approval row
 3. clear `current_run_id`
 4. increment `consecutive_failures`
-5. either leave status `requested` for retry or mark `failed` if the limit is reached
+5. consume `status = running` back to `requested`, or to `failed` if the limit is reached
 6. emit an approval reclaim/failure event
 7. recompute task state only if the row becomes `failed`
 
@@ -290,10 +291,10 @@ Keep the initial CLI surface small.
 If a task leaves `approving` because one approval rejected and the aggregate resolver returned the task to `todo`, any other in-flight approval workers for that task are now stale relative to current task state.
 
 Required behavior:
-- a recorded rejection does not move the task to `todo` immediately; the task stays in `approving` until every active approval run for that task finishes
+- a recorded rejection moves the task through the authoritative rejection-cycle path immediately; generic approval-run liveness does not delay that transition
 - late valid results must not re-advance the task incorrectly
 - result-application code must re-check task/approval row state before mutating
-- if the approval row is no longer in a state compatible with the returned result, the result is recorded in run/event history but does not reopen task progression
+- if the approval row is no longer in a state compatible with the returned result, the result is discarded at the business-state layer even if the worker process only finished later
 
 The kernel must prefer current authoritative task/approval state over late worker output.
 
@@ -317,7 +318,7 @@ Use task-centric inspection only.
 
 ### 10.2 Approval add/remove/decide commands
 
-The `hermes kanban approval ...` commands defined in the master spec must call kernel helpers that:
+The `hermes kanban approval ...` commands defined in the master spec and concretized in `03-cli-and-manual-approval-workflows.md` must call kernel helpers that:
 - mutate approval rows transactionally
 - recompute task state transactionally where required
 - use the first-class approval reset operation for both internal flows and `hermes kanban approval reset`
@@ -363,11 +364,12 @@ Runtime/dispatcher behavior is correct only if all of the following hold:
 1. Two agent approvals on the same task can be claimed and run independently.
 2. An approval row is never spawned twice concurrently.
 3. Agent approval spawning is performed only by the dispatcher.
-4. Approval workers do not mutate approval rows directly.
-5. Invalid approver output is treated as a failed attempt.
-6. After 3 consecutive failures, the approval row becomes `failed` and a human approval row exists.
-7. `escalated` and `failed` keep the task in `approving`.
-8. A single rejection returns the task to `todo` and resets approval rows to `requested`.
-9. Approval workers use independent concurrency accounting from task workers.
-10. Stale/crashed/timed-out approval workers are reclaimed using task-like lease semantics.
-11. Late approval results cannot incorrectly move a task back to `done` after the task already returned to `todo`.
+4. Claim consumes `requested` and marks the approval row `running` before subprocess spawn.
+5. Approval workers do not mutate approval rows directly.
+6. Invalid approver output is treated as a failed attempt.
+7. After 3 consecutive failures, the approval row becomes `failed` and a human approval row exists.
+8. `escalated` and `failed` do not block `done` by themselves; the live blocking gate is the human approval row they ensure when one exists.
+9. A single authoritative rejection returns the task to `todo` and resets approval rows to `requested` in the same transaction.
+10. Approval workers use independent concurrency accounting from task workers.
+11. Stale/crashed/timed-out approval workers are reclaimed using task-like lease semantics.
+12. Late approval results cannot incorrectly move a task back to `done` after the task already returned to `todo`.

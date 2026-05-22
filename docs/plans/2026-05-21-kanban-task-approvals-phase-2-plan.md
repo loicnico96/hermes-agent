@@ -19,6 +19,8 @@
 
 Land the kernel-owned task/approval aggregate state rules so approvals affect task lifecycle correctly before any Phase 3 CLI approval surface or Phase 4 dispatcher-managed approval execution is added.
 
+This plan now includes one shameless late Phase 2 extension: add a live approval-row `running` status that separates “pending and runnable” from “claimed and in flight” without changing the aggregate rule that either state keeps the parent task in `approving`.
+
 This phase must deliver:
 - one authoritative aggregate resolver in kernel code
 - completion-time routing where successful task-worker completion goes:
@@ -79,8 +81,10 @@ Recommended responsibilities for the resolver/helper layer:
 Authority rule for this phase:
 - approval-row state is the final business authority
 - approval-run rows are execution/audit bookkeeping, not the source of truth for lifecycle resolution
-- only approval rows in `requested` participate in approval decision-making
-- if an approval worker later reports against a row that is no longer `requested`, that result must have no effect
+- only approval rows in `requested` or `running` participate in live unresolved approval decision-making
+- `requested` means pending and runnable/unclaimed
+- `running` means the row has been claimed by an agent approval run and is currently in flight
+- if an approval worker later reports against a row that is no longer in the live owned `running` state for that same run, that result must have no effect
 
 A good shape would be one read helper plus one mutation helper, for example:
 - `_compute_task_approval_aggregate_state(...)`
@@ -105,9 +109,10 @@ This preserves one explicit semantic boundary:
 
 ## 3.3 While unresolved approvals exist
 
-A task must remain `approving` while any approval row is `requested`.
+A task must remain `approving` while any approval row is `requested` or `running`.
 
 Important clarifications:
+- `requested` and `running` are the live blocking approval-row states
 - `escalated` and `failed` are opt-out states for agent approval rows and do not themselves block movement
 - `approved` is satisfied
 - `rejected` triggers the rejection-cycle path described below
@@ -124,14 +129,15 @@ If any approval row is `rejected`, the resolver must implement the full rejectio
 
 Important clarifications:
 - Phase 2 should not grant business authority to “some approval run is still active” after a rejection has already been recorded
-- in the intended model, an approval result is only applied when the corresponding approval row is still `requested`
-- if a stale worker later reports against a row that has already been moved out of `requested`, that late result is discarded and does not alter task or approval state
+- in the intended model, an approval result is only applied when the corresponding approval row is still in the live owned `running` state for that same run
+- if a stale worker later reports against a row that has already been moved out of that owned `running` state, that late result is discarded and does not alter task or approval state
 - explicit/early cancellation of the stale worker is not required in v1
 
 ## 3.5 Done rule
 
 A task may move from `approving` to `done` only when:
 - there is no approval row in `requested`
+- there is no approval row in `running`
 - there is no approval row in `rejected`
 - every remaining approval row is in `approved`, `escalated`, or `failed`
 
@@ -258,17 +264,17 @@ Important guardrails:
 
 ## Task 5 — Tighten stale-result finalization semantics around row ownership
 
-Phase 2 is not adding approval-run execution, but it should lock down the business rule that approval results only apply while the approval row is still in the live request state for the same run.
+Phase 2 is not adding approval-run execution, but it should lock down the business rule that approval results only apply while the approval row is still in the live owned running state for the same run.
 
 Implementation work:
 - define the finalization/update shape so an approval result is applied only by transactionally updating the same approval row/run pair it still owns
 - require the write to match at least:
   - the target approval row id
-  - `status = 'requested'`
+  - `status = 'running'`
   - the corresponding `current_run_id` (or equivalent run-ownership marker)
 - if that conditional write matches no row, treat the result as stale/discarded with no business effect
 
-This is tighter than a generic “discard if status is no longer requested” rule because it binds the finalization to both:
+This is tighter than a generic “discard if status is no longer live” rule because it binds the finalization to both:
 - the live approval-row state
 - the exact run that still owns the row
 
@@ -290,7 +296,7 @@ Implement the branch where the task can finish approval.
 Required semantics:
 - `approved` rows are satisfied
 - `escalated` / `failed` rows remain present but are treated as opted out
-- task may reach `done` only when there is no `requested` and no `rejected`
+- task may reach `done` only when there is no `requested`, no `running`, and no `rejected`
 - if the approval set becomes empty while task is `approving`, resolver moves the task to `done`
 
 Be explicit in tests and code comments that the master spec wins here: `escalated` / `failed` do not themselves block `done`; the human approval row created on top is the real blocking gate.
@@ -381,8 +387,8 @@ Add tests proving:
 ## 5.6 Stale-result ownership enforcement
 
 Add tests proving:
-- a finalization attempt succeeds only when the approval row is still `requested` and still owned by the same `current_run_id`
-- if the row status is no longer `requested`, the result is discarded
+- a finalization attempt succeeds only when the approval row is still `running` and still owned by the same `current_run_id`
+- if the row status is no longer `running`, the result is discarded
 - if `current_run_id` no longer matches, the result is discarded
 - discarded stale results do not alter task status, approval status, or audit-facing live row state
 
@@ -432,12 +438,12 @@ Phase 2 is complete only when all of the following are true:
 - successful `complete_task(...)` sends tasks with no approval rows directly to `done`
 - successful `complete_task(...)` sends approval-bearing tasks to `approving` only after resetting attached approvals to `requested`
 - one authoritative kernel helper owns approval-aware task aggregate resolution
-- a task remains `approving` only while at least one approval row is still `requested`
+- a task remains `approving` only while at least one approval row is still `requested` or `running`
 - a `rejected` approval moves the task back to `todo` and resets approval rows in the same transaction
 - a task moves to `done` only under the exact master-spec rule set
 - `escalated` / `failed` are treated as opt-out agent rows and do not independently block `done`
 - manual `done` remains an explicit override and does not invent a fresh approval cycle
-- stale approval results can finalize only when they still own a `requested` row via the matching run id
+- stale approval results can finalize only when they still own a `running` row via the matching run id
 - non-approval task behavior still passes targeted DB tests
 
 ---
