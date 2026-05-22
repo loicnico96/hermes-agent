@@ -180,7 +180,7 @@ Optional flags:
 Rules:
 - valid only for human approval rows,
 - valid only when the parent task is currently `approving`,
-- valid only when the human approval row is currently `requested`,
+- valid when the human approval row is currently `requested` or already `approved`, so a human can reverse an approval while other approvers are still keeping the task in `approving`,
 - `--comment` appends a task comment and stores the resulting `comment_id`,
 - the command must use the same kernel decision path as other approval decisions rather than directly updating the row in CLI code,
 - task state is recomputed transactionally.
@@ -203,7 +203,7 @@ Optional flags:
 Rules:
 - valid only for human approval rows,
 - valid only when the parent task is currently `approving`,
-- valid only when the row is currently `requested`,
+- valid when the row is currently `requested` or already `approved`, so a human can change their mind while another approval remains live,
 - `--comment` appends a task comment and stores the resulting `comment_id`,
 - the command must trigger the same authoritative rejection-cycle semantics already implemented in Phase 2:
   - rejection recorded first,
@@ -280,7 +280,7 @@ If Phase 3 adds a dedicated helper for human decisions, it must:
 
 1. load the approval row,
 2. validate that it is a human row,
-3. validate that the row is currently `requested`,
+3. validate that the row is currently in the narrow manual-decision source set (`requested` or `approved`),
 4. optionally append a task comment and capture `comment_id`,
 5. update the approval row status transactionally,
 6. clear live mutable row fields exactly when the reset/decision semantics require it,
