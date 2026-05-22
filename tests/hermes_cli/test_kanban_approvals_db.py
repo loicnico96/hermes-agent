@@ -234,6 +234,39 @@ def test_create_task_approval_run_rejects_cross_task_comment(kanban_home):
             )
 
 
+def test_record_task_approval_decision_treats_missing_approval_as_stale_noop(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+
+        conn.execute("DELETE FROM task_approvals WHERE id = ?", (approval.id,))
+
+        aggregate_status = kb.record_task_approval_decision(
+            conn,
+            approval_id=approval.id,
+            expected_run_id=run.id,
+            status="approved",
+            now=9_000,
+        )
+        run_row = conn.execute(
+            "SELECT status, ended_at, outcome FROM task_approval_runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
+
+    assert aggregate_status is None
+    assert run_row is not None
+    assert run_row["status"] == "running"
+    assert run_row["ended_at"] is None
+    assert run_row["outcome"] is None
+
+
 def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban_home, monkeypatch):
     monkeypatch.setattr(kb.time, "time", lambda: 5_000)
 
@@ -576,7 +609,7 @@ def test_finalize_task_approval_row_if_owned_discards_run_ownership_mismatches(k
     assert task.status == "approving"
 
 
-def test_apply_task_approval_aggregate_transition_rejection_cycle_moves_task_to_todo(kanban_home):
+def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
         rejected_comment_id = kb.add_comment(conn, task_id, "reviewer", "needs revision")
@@ -632,18 +665,22 @@ def test_apply_task_approval_aggregate_transition_rejection_cycle_moves_task_to_
                 ("lease-2", 444, 555, 666, other_run.id, 4, "keep me", 7_100, other.id),
             )
 
-            aggregate_status = kb._finalize_task_approval_result_if_owned(
-                conn,
-                approval_id=rejected.id,
-                expected_run_id=rejected_run.id,
-                status="rejected",
-                comment_id=rejected_comment_id,
-                now=9_000,
-            )
+        aggregate_status = kb.record_task_approval_decision(
+            conn,
+            approval_id=rejected.id,
+            expected_run_id=rejected_run.id,
+            status="rejected",
+            comment_id=rejected_comment_id,
+            now=9_000,
+        )
 
         task = kb.get_task(conn, task_id)
         refreshed_rejected = kb.get_task_approval(conn, rejected.id)
         refreshed_other = kb.get_task_approval(conn, other.id)
+        rejected_run_row = conn.execute(
+            "SELECT status, ended_at, outcome, comment_id, error FROM task_approval_runs WHERE id = ?",
+            (rejected_run.id,),
+        ).fetchone()
 
     assert aggregate_status == "todo"
 
@@ -673,9 +710,15 @@ def test_apply_task_approval_aggregate_transition_rejection_cycle_moves_task_to_
     assert refreshed_other.consecutive_failures == 0
     assert refreshed_other.last_failure_error is None
     assert refreshed_other.updated_at == 9_000
+    assert rejected_run_row is not None
+    assert rejected_run_row["status"] == "rejected"
+    assert rejected_run_row["ended_at"] == 9_000
+    assert rejected_run_row["outcome"] == "rejected"
+    assert rejected_run_row["comment_id"] == rejected_comment_id
+    assert rejected_run_row["error"] is None
 
 
-def test_apply_task_approval_aggregate_transition_rejection_cycle_discards_late_results(kanban_home):
+def test_record_task_approval_decision_rejection_cycle_discards_late_results(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
         rejected_comment_id = kb.add_comment(conn, task_id, "reviewer", "needs revision")
@@ -707,15 +750,16 @@ def test_apply_task_approval_aggregate_transition_rejection_cycle_discards_late_
                 "UPDATE task_approvals SET current_run_id = ?, updated_at = ? WHERE id = ?",
                 (stale_run.id, 7_100, stale.id),
             )
-            aggregate_status = kb._finalize_task_approval_result_if_owned(
-                conn,
-                approval_id=rejected.id,
-                expected_run_id=rejected_run.id,
-                status="rejected",
-                comment_id=rejected_comment_id,
-                now=9_000,
-            )
-            assert aggregate_status == "todo"
+
+        aggregate_status = kb.record_task_approval_decision(
+            conn,
+            approval_id=rejected.id,
+            expected_run_id=rejected_run.id,
+            status="rejected",
+            comment_id=rejected_comment_id,
+            now=9_000,
+        )
+        assert aggregate_status == "todo"
 
         with kb.write_txn(conn):
             late_result_applied = kb._finalize_task_approval_row_if_owned(
