@@ -101,7 +101,17 @@ VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", 
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 VALID_APPROVAL_TYPES = {"human", "agent"}
-VALID_APPROVAL_STATUSES = {"requested", "approved", "rejected", "escalated", "failed"}
+VALID_APPROVAL_STATUSES = {
+    "requested",
+    "running",
+    "approved",
+    "rejected",
+    "escalated",
+    "failed",
+}
+LIVE_APPROVAL_STATUSES = {"requested", "running"}
+TERMINAL_APPROVAL_STATUSES = VALID_APPROVAL_STATUSES - LIVE_APPROVAL_STATUSES
+DECISION_APPROVAL_STATUSES = {"approved", "rejected", "escalated"}
 VALID_APPROVAL_RUN_STATUSES = {
     "running",
     "approved",
@@ -2560,6 +2570,24 @@ def _validate_approval_status(status: str) -> str:
     return normalized_status
 
 
+def _validate_terminal_approval_status(status: str) -> str:
+    normalized_status = _validate_approval_status(status)
+    if normalized_status not in TERMINAL_APPROVAL_STATUSES:
+        raise ValueError(
+            f"terminal approval status must be one of {sorted(TERMINAL_APPROVAL_STATUSES)}"
+        )
+    return normalized_status
+
+
+def _validate_approval_decision_status(status: str) -> str:
+    normalized_status = _validate_approval_status(status)
+    if normalized_status not in DECISION_APPROVAL_STATUSES:
+        raise ValueError(
+            f"approval decision status must be one of {sorted(DECISION_APPROVAL_STATUSES)}"
+        )
+    return normalized_status
+
+
 def _validate_approval_run_status(status: str) -> str:
     normalized_status = _normalize_optional_text(status)
     if normalized_status not in VALID_APPROVAL_RUN_STATUSES:
@@ -2831,7 +2859,7 @@ def _compute_task_approval_aggregate_status(
     statuses = {approval.status for approval in approvals}
     if "rejected" in statuses:
         return "todo"
-    if "requested" in statuses:
+    if statuses & LIVE_APPROVAL_STATUSES:
         return "approving"
     return "done"
 
@@ -2947,7 +2975,7 @@ def record_task_approval_decision(
     approvals and stale run ownership mismatches are treated as discarded
     results with no business effect.
     """
-    normalized_status = _validate_approval_status(status)
+    normalized_status = _validate_approval_decision_status(status)
     normalized_run_status = _validate_approval_run_status(status)
     effective_now = int(time.time()) if now is None else int(now)
 
@@ -3012,7 +3040,7 @@ def _finalize_task_approval_row_if_owned(
     Phase 2.3 tightens stale-result handling without pulling in the full
     approval-worker runtime. The caller must still wrap any wider business
     mutation flow in a transaction, but the row-level write itself is guarded by
-    the approval row id, ``status='requested'``, and the matching
+    the approval row id, ``status='running'``, and the matching
     ``current_run_id`` so late results from stale workers become harmless
     no-ops.
     """
@@ -3020,7 +3048,7 @@ def _finalize_task_approval_row_if_owned(
     if approval is None:
         raise ValueError(f"unknown approval {approval_id}")
 
-    normalized_status = _validate_approval_status(status)
+    normalized_status = _validate_terminal_approval_status(status)
     normalized_comment_id = _validate_task_comment_reference(
         conn, task_id=approval.task_id, comment_id=comment_id
     )
@@ -3040,7 +3068,7 @@ def _finalize_task_approval_row_if_owned(
                last_failure_error = NULL,
                updated_at = ?
          WHERE id = ?
-           AND status = 'requested'
+           AND status = 'running'
            AND current_run_id = ?
         """,
         (
