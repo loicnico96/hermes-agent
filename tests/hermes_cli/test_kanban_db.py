@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import sys
@@ -1101,6 +1102,100 @@ def test_complete_records_result(kanban_home):
     assert task.status == "done"
     assert task.result == "done and dusted"
     assert task.completed_at is not None
+
+
+@pytest.mark.parametrize(
+    ("approver_type", "approval_kwargs"),
+    [
+        ("human", {}),
+        ("agent", {"approver_profile": "reviewer"}),
+    ],
+)
+def test_complete_task_with_approvals_resets_rows_and_enters_approving(
+    kanban_home,
+    approver_type,
+    approval_kwargs,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"{approver_type} approval target", assignee="ops")
+        comment_id = kb.add_comment(conn, task_id, "user", "stale decision")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type=approver_type,
+            status="failed",
+            comment_id=comment_id,
+            **approval_kwargs,
+        )
+        run = (
+            kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+            if approver_type == "agent"
+            else None
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                   SET claim_lock = ?,
+                       claim_expires = ?,
+                       worker_pid = ?,
+                       last_heartbeat_at = ?,
+                       current_run_id = ?,
+                       consecutive_failures = ?,
+                       last_failure_error = ?
+                 WHERE id = ?
+                """,
+                (
+                    "lease-1",
+                    123,
+                    456,
+                    789,
+                    run.id if run is not None else 42,
+                    3,
+                    "stale state",
+                    approval.id,
+                ),
+            )
+
+        claimed_task = kb.claim_task(conn, task_id)
+        assert claimed_task is not None and claimed_task.current_run_id is not None
+        assert kb.complete_task(conn, task_id, result="fresh result", summary="fresh summary") is True
+
+        task = kb.get_task(conn, task_id)
+        refreshed_approval = kb.get_task_approval(conn, approval.id)
+        closed_run = conn.execute(
+            "SELECT status, outcome, summary FROM task_runs WHERE id = ?",
+            (claimed_task.current_run_id,),
+        ).fetchone()
+        completed_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert task is not None
+    assert task.status == "approving"
+    assert task.result == "fresh result"
+    assert task.completed_at is not None
+
+    assert refreshed_approval is not None
+    assert refreshed_approval.status == "requested"
+    assert refreshed_approval.comment_id is None
+    assert refreshed_approval.claim_lock is None
+    assert refreshed_approval.claim_expires is None
+    assert refreshed_approval.worker_pid is None
+    assert refreshed_approval.last_heartbeat_at is None
+    assert refreshed_approval.current_run_id is None
+    assert refreshed_approval.consecutive_failures == 0
+    assert refreshed_approval.last_failure_error is None
+
+    assert closed_run is not None
+    assert closed_run["status"] == "done"
+    assert closed_run["outcome"] == "completed"
+    assert closed_run["summary"] == "fresh summary"
+
+    assert completed_event is not None
+    payload = json.loads(completed_event["payload"])
+    assert payload["task_status"] == "approving"
 
 
 def test_block_then_unblock(kanban_home):
