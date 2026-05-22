@@ -84,6 +84,7 @@ Authority rule for this phase:
 - only approval rows in `requested` or `running` participate in live unresolved approval decision-making
 - `requested` means pending and runnable/unclaimed
 - `running` means the row has been claimed by an agent approval run and is currently in flight
+- aggregate priority is exact: any `running` -> `approving`; else any `rejected` -> `todo`; else any `requested` -> `approving`; else `done`
 - if an approval worker later reports against a row that is no longer in the live owned `running` state for that same run, that result must have no effect
 
 A good shape would be one read helper plus one mutation helper, for example:
@@ -120,7 +121,7 @@ Important clarifications:
 
 ## 3.4 Rejection cycle
 
-If any approval row is `rejected`, the resolver must implement the full rejection cycle from the master spec:
+If any approval row is `rejected` and no approval row remains `running`, the resolver must implement the full rejection cycle from the master spec:
 1. rejection is recorded first
 2. task transitions from `approving` to `todo`
 3. in that same transaction, reset all approval rows to `requested`
@@ -128,7 +129,8 @@ If any approval row is `rejected`, the resolver must implement the full rejectio
 5. in that same transaction, clear each row’s consecutive-failure state
 
 Important clarifications:
-- Phase 2 should not grant business authority to “some approval run is still active” after a rejection has already been recorded
+- a still-`running` approval row intentionally outranks a recorded `rejected` row so already-running approvers can finish and contribute stacking feedback/comments
+- a merely `requested` approval row does not outrank `rejected`; once no row remains `running`, the rejection cycle fires immediately
 - in the intended model, an approval result is only applied when the corresponding approval row is still in the live owned `running` state for that same run
 - if a stale worker later reports against a row that has already been moved out of that owned `running` state, that late result is discarded and does not alter task or approval state
 - explicit/early cancellation of the stale worker is not required in v1
