@@ -1,6 +1,6 @@
 # Kanban Task Approvals — Master Spec
 
-Status: Draft (no code changes yet)
+Status: Draft (phased rollout; Phase 2 kernel semantics landed, Phase 3 CLI/manual workflows next)
 Owner: Hermes Kanban
 Scope: Kanban DB, dispatcher/runtime, worker prompt contract, and CLI surface. Dashboard UI is out of scope.
 
@@ -81,13 +81,15 @@ Meaning:
 Approval rows use exactly these statuses:
 
 - `requested`
+- `running`
 - `approved`
 - `rejected`
 - `escalated`
 - `failed`
 
 Definitions:
-- `requested`: approval is pending.
+- `requested`: approval is pending and not currently claimed by an agent approval run.
+- `running`: an agent approval row has been claimed and is currently owned by a live approval run.
 - `approved`: this approver approved the task result.
 - `rejected`: this approver rejected the task result; the task must return to `todo`.
 - `escalated`: this approver intentionally declined to decide and handed the decision to human review.
@@ -107,45 +109,46 @@ The worker does not decide whether approvals are needed at completion time. The 
 
 ### 4.2 While any approval is unresolved
 
-A task remains `approving` while any approval row is in one of these states:
-- `requested`
-- `escalated`
-- `failed`
+A task remains `approving` while any approval row is in `requested` or `running`.
 
-A task also remains `approving` while any approval run is still active, even if a rejection has already been recorded.
-
-Rationale:
-- `requested` is unresolved.
-- `escalated` and `failed` both require human review before the task can move on.
-- running approval workers must be allowed to finish before the task returns to `todo`.
+Clarifications:
+- `requested` and `running` are the live blocking approval-row states.
+- `escalated` and `failed` are agent opt-out states that remain present for audit/history but do not independently block `done`.
+- when an agent approval escalates or fails, the blocking gate is the human approval row that remains `requested`, not the `escalated` or `failed` row itself.
+- approval-run liveness is execution bookkeeping and must not outrank authoritative approval-row state.
 
 ### 4.3 Rejection rule
 
 If any approval row becomes `rejected`:
 
 1. Record the rejection and emit approval decision events.
-2. Keep the task in `approving` until every active approval run for that task has finished.
-3. After the last active approval run for that task finishes, transition the task from `approving` to `todo`.
-4. In the same transaction as that transition, reset all approval-row statuses back to `requested`.
-5. In the same reset transaction, clear approval-row `comment_id` values.
-6. In the same reset transaction, clear approval-row consecutive failure counts and last failure errors.
-7. Preserve audit history through events and task comments; do not preserve old decision state in the live rows.
+2. Transition the task from `approving` to `todo` as soon as that rejection is authoritatively recorded.
+3. In the same transaction as that transition, reset all approval-row statuses back to `requested`.
+4. In the same reset transaction, clear approval-row `comment_id` values.
+5. In the same reset transaction, clear approval-row consecutive failure counts and last failure errors.
+6. Preserve audit history through events and task comments; do not preserve old decision state in the live rows.
+
+Clarifications:
+- approval-row state is the business authority.
+- generic approval-run liveness does not keep a task in `approving` after a rejection has been recorded.
+- stale late worker results are discarded by row/run ownership checks and do not delay the rejection cycle.
 
 This is the only rule in this slice that returns a task from approval back into execution.
 
 ### 4.4 Done rule
 
 A task moves from `approving` to `done` only when:
-- there is no approval row in `requested` or `rejected`, and
-- there is no active approval run, and
+- there is no approval row in `requested`,
+- there is no approval row in `running`,
+- there is no approval row in `rejected`, and
 - every remaining approval row is in `approved`, `escalated`, or `failed`.
 
 Implications:
 - if the last approval row is removed while the task is `approving`, the task moves to `done`
 - `escalated` and `failed` agent rows do not block `done` by themselves; those rows have opted out of the approval decision
-- the blocking gate is the human approval row they assign on top
+- the blocking gate is the human approval row they assign on top when one exists
 - when human approval approves the task, the escalated/failed agent rows remain `escalated` / `failed`
-- removing the blocking human approval row must reset all `escalated` / `failed` agent rows in the same transaction, so there is no window where the task can fall through to `done` without explicit human approval
+- the aggregate resolver is driven by approval-row state, not by generic approval-run liveness
 
 ---
 
@@ -203,6 +206,8 @@ Resetting an approval row means:
 4. clear `current_run_id`
 5. set `consecutive_failures = 0`
 6. clear `last_failure_error`
+
+If the row was previously `running`, reset does not need to terminate the already-spawned agent process eagerly; any later result from that old run becomes stale/discarded because the row no longer remains in the owned `running` state for that run.
 
 The reset operation is used by:
 - rejection-cycle reset when a task returns to `todo`
@@ -274,7 +279,7 @@ Supported filters in this slice:
 ```bash
 hermes kanban approval list
 hermes kanban approval list --task <task_id>
-hermes kanban approval list --status <requested|approved|rejected|escalated|failed>
+hermes kanban approval list --status <requested|running|approved|rejected|escalated|failed>
 hermes kanban approval list --type <human|agent>
 hermes kanban approval list --json
 ```
@@ -326,9 +331,9 @@ hermes kanban approval reset <approval_id>
 
 Rules:
 - applies the approval reset operation from section 5.4
-- recomputes task state after mutation
-- is valid for rows in `approved`, `rejected`, `escalated`, or `failed`
-- is invalid for a currently claimed/running approval row unless that run is reclaimed first by kernel logic
+- does not recompute task status; with the task still in `approving` and the row reset to `requested`, the aggregate necessarily remains `approving`
+- is valid for rows in `running`, `approved`, `rejected`, `escalated`, or `failed`
+- if the row was `running`, reset does not require eagerly killing the already-spawned agent process; any later result is stale/discarded because the row no longer remains in the owned `running` state for that run
 
 ### 7.3 Existing command changes
 
@@ -400,3 +405,4 @@ Requirements:
 
 DB migration details are specified in `01-db-and-migration.md`.
 Runtime/dispatcher details are specified in `02-runtime-and-dispatch.md`.
+Concrete Phase 3 CLI/manual workflow details are specified in `03-cli-and-manual-approval-workflows.md`.
