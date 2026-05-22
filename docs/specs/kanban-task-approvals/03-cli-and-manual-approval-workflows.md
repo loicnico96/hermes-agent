@@ -180,7 +180,7 @@ Optional flags:
 Rules:
 - valid only for human approval rows,
 - valid only when the parent task is currently `approving`,
-- manual human decisions do not gate on the approval row's prior status; if the row is human and the parent task is currently `approving`, the decision is allowed,
+- manual human decisions do not add a separate requested-only precondition; while a valid human approval row remains attached to a parent task in `approving`, the decision is allowed through the shared kernel path,
 - `--comment` appends a task comment and stores the resulting `comment_id`,
 - the command must use the same kernel decision path as other approval decisions rather than directly updating the row in CLI code,
 - task state is recomputed transactionally.
@@ -203,7 +203,7 @@ Optional flags:
 Rules:
 - valid only for human approval rows,
 - valid only when the parent task is currently `approving`,
-- manual human decisions do not gate on the approval row's prior status; if the row is human and the parent task is currently `approving`, the decision is allowed,
+- manual human decisions do not add a separate requested-only precondition; while a valid human approval row remains attached to a parent task in `approving`, the decision is allowed through the shared kernel path,
 - `--comment` appends a task comment and stores the resulting `comment_id`,
 - the command must trigger the same authoritative rejection-cycle semantics already implemented in Phase 2:
   - rejection recorded first,

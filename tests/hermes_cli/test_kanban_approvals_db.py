@@ -680,7 +680,7 @@ def test_record_manual_task_approval_decision_allows_human_change_of_mind_while_
     assert [comment.body for comment in comments] == ["changed my mind"]
 
 
-def test_record_manual_task_approval_decision_allows_any_prior_human_status_while_approving(
+def test_record_manual_task_approval_decision_allows_reaffirming_human_approval_while_approving(
     kanban_home,
     monkeypatch,
 ):
@@ -688,35 +688,45 @@ def test_record_manual_task_approval_decision_allows_any_prior_human_status_whil
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
-        approval = kb.create_task_approval(
+        human = kb.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="human",
-            status="failed",
+            status="approved",
+        )
+        agent = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
         )
         conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
 
         aggregate_status = kb.record_manual_task_approval_decision(
             conn,
-            approval_id=approval.id,
+            approval_id=human.id,
             status="approved",
-            comment="override stale state",
+            comment="still approved",
             comment_author="reviewer",
         )
 
         task = kb.get_task(conn, task_id)
-        refreshed = kb.get_task_approval(conn, approval.id)
+        refreshed_human = kb.get_task_approval(conn, human.id)
+        refreshed_agent = kb.get_task_approval(conn, agent.id)
         comments = kb.list_comments(conn, task_id)
 
-    assert aggregate_status == "done"
+    assert aggregate_status == "approving"
     assert task is not None
-    assert task.status == "done"
-    assert refreshed is not None
-    assert refreshed.status == "approved"
-    assert refreshed.comment_id == comments[0].id
-    assert refreshed.updated_at == 8_900
+    assert task.status == "approving"
+    assert refreshed_human is not None
+    assert refreshed_human.status == "approved"
+    assert refreshed_human.comment_id == comments[0].id
+    assert refreshed_human.updated_at == 8_900
+    assert refreshed_agent is not None
+    assert refreshed_agent.status == "requested"
     assert [comment.author for comment in comments] == ["reviewer"]
-    assert [comment.body for comment in comments] == ["override stale state"]
+    assert [comment.body for comment in comments] == ["still approved"]
 
 
 @pytest.mark.parametrize(
@@ -738,7 +748,7 @@ def test_record_manual_task_approval_decision_enforces_human_and_approving_gate(
 ):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
-        approval = kb.create_task_approval(conn, task_id=task_id, status="failed", **approval_kwargs)
+        approval = kb.create_task_approval(conn, task_id=task_id, **approval_kwargs)
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (task_status, task_id))
 
         with pytest.raises(ValueError, match=message):
