@@ -77,11 +77,11 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     migration adds those columns, or boards predating the column fail to
     open before migration can run.
 
-    Covers all indexed additive columns:
-    - ``tasks.session_id``              -> ``idx_tasks_session_id``    (#28447)
-    - ``tasks.tenant``                  -> ``idx_tasks_tenant``        (#16081)
-    - ``tasks.idempotency_key``         -> ``idx_tasks_idempotency``   (#17805)
-    - ``task_events.run_id``            -> ``idx_events_run``          (#17805)
+    Covers all four indexes that sit on additive columns:
+    - ``tasks.session_id``       -> ``idx_tasks_session_id``    (#28447)
+    - ``tasks.tenant``           -> ``idx_tasks_tenant``        (#16081)
+    - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency``   (#17805)
+    - ``task_events.run_id``     -> ``idx_events_run``          (#17805)
     """
     db_path = tmp_path / "legacy-kanban.db"
     conn = sqlite3.connect(str(db_path))

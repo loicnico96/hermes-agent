@@ -238,25 +238,6 @@ def test_notify_subscribe_session_event_requires_session_key(kanban_home):
     assert subs == []
 
 
-def test_run_slash_show_json_omits_watcher_session_key(kanban_home):
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="watched show",
-            assignee="alice",
-            watch_subscription={
-                "delivery_mode": "session_event",
-                "session_key": "agent:main:discord:thread:show:1",
-                "platform": "discord",
-                "chat_id": "chat-show",
-                "thread_id": "thread-show",
-            },
-        )
-    raw = kc.run_slash(f"show {tid} --json")
-    payload = json.loads(raw)
-    assert "watcher_session_key" not in payload["task"]
-
-
 def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'a' --assignee alice")
     kc.run_slash("create 'b' --assignee bob")

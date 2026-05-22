@@ -922,29 +922,30 @@ CREATE TABLE IF NOT EXISTS task_runs (
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
 -- the original requester so human-in-the-loop workflows close the loop.
 CREATE TABLE IF NOT EXISTS kanban_notify_subs (
-    task_id          TEXT NOT NULL,
-    platform         TEXT NOT NULL,
-    chat_id          TEXT NOT NULL,
-    thread_id        TEXT NOT NULL DEFAULT '',
-    user_id          TEXT,
-    delivery_mode    TEXT NOT NULL DEFAULT 'notification',
-    session_key      TEXT,
-    last_event_id    INTEGER NOT NULL DEFAULT 0,
-    created_at       INTEGER NOT NULL,
+    task_id       TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    thread_id     TEXT NOT NULL DEFAULT '',
+    user_id       TEXT,
     notifier_profile TEXT,
-    PRIMARY KEY (task_id, platform, chat_id, thread_id, delivery_mode, session_key)
+    created_at    INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL DEFAULT 0,
+    delivery_mode TEXT NOT NULL DEFAULT 'notification',
+    session_key   TEXT,
+    PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
-CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
+CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
+
 
 # ---------------------------------------------------------------------------
 # Connection helpers

@@ -107,6 +107,7 @@ async def test_task_watcher_bridge_enqueues_done_event_and_advances_session_even
         if key == "agent:main:discord:thread:watch:done" else None
     )
     fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
     fake_adapter._active_sessions = {}
     fake_adapter._pending_messages = {}
     fake_adapter._heal_stale_session_lock = MagicMock()
@@ -165,6 +166,7 @@ async def test_task_watcher_bridge_enqueues_blocked_event(kanban_home):
         if key == "agent:main:discord:thread:watch:blocked" else None
     )
     fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock()
     fake_adapter._active_sessions = {}
     fake_adapter._pending_messages = {}
     fake_adapter._heal_stale_session_lock = MagicMock()

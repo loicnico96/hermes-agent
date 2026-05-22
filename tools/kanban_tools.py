@@ -1166,8 +1166,7 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Explicit Hermes gateway session key to bind as the child "
                     "task's session-event watcher. Required when you want watcher "
-                    "handbacks on spawned subtasks; no implicit inheritance or env "
-                    "fallback exists."
+                    "handbacks on spawned subtasks; no implicit fallback exists."
                 ),
             },
             "skills": {
