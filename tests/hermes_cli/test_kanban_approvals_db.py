@@ -460,6 +460,138 @@ def test_compute_task_approval_aggregate_status(kanban_home, statuses, expected_
     assert kb._compute_task_approval_aggregate_status(approvals) == expected_status
 
 
+def test_apply_task_approval_aggregate_transition_marks_approving_task_done_when_all_gates_are_satisfied(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="aggregate target", assignee="ops")
+        agent = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="escalated",
+        )
+        human = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="human",
+            status="approved",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        with kb.write_txn(conn):
+            aggregate_status = kb._apply_task_approval_aggregate_transition(
+                conn,
+                task_id,
+                approvals=[agent, human],
+                now=9_000,
+            )
+
+        task = kb.get_task(conn, task_id)
+        refreshed_agent = kb.get_task_approval(conn, agent.id)
+        refreshed_human = kb.get_task_approval(conn, human.id)
+
+    assert aggregate_status == "done"
+    assert task is not None
+    assert task.status == "done"
+    assert refreshed_agent is not None
+    assert refreshed_agent.status == "escalated"
+    assert refreshed_human is not None
+    assert refreshed_human.status == "approved"
+
+
+
+def test_apply_task_approval_aggregate_transition_marks_approving_task_done_when_last_gate_is_removed(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="aggregate target", assignee="ops")
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        with kb.write_txn(conn):
+            aggregate_status = kb._apply_task_approval_aggregate_transition(
+                conn,
+                task_id,
+                approvals=[],
+                now=9_000,
+            )
+
+        task = kb.get_task(conn, task_id)
+
+    assert aggregate_status == "done"
+    assert task is not None
+    assert task.status == "done"
+
+
+
+def test_record_task_approval_decision_marks_approving_task_done_when_live_gate_is_satisfied(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval_comment_id = kb.add_comment(conn, task_id, "reviewer", "looks good")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                   SET claim_lock = ?,
+                       claim_expires = ?,
+                       worker_pid = ?,
+                       last_heartbeat_at = ?,
+                       current_run_id = ?,
+                       consecutive_failures = ?,
+                       last_failure_error = ?,
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                ("lease-1", 123, 456, 789, run.id, 2, "old failure", 7_000, approval.id),
+            )
+
+        aggregate_status = kb.record_task_approval_decision(
+            conn,
+            approval_id=approval.id,
+            expected_run_id=run.id,
+            status="approved",
+            comment_id=approval_comment_id,
+            now=9_000,
+        )
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+        run_row = conn.execute(
+            "SELECT status, ended_at, outcome, comment_id, error FROM task_approval_runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
+
+    assert aggregate_status == "done"
+    assert refreshed is not None
+    assert refreshed.status == "approved"
+    assert refreshed.comment_id == approval_comment_id
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 0
+    assert refreshed.last_failure_error is None
+    assert task is not None
+    assert task.status == "done"
+    assert run_row is not None
+    assert run_row["status"] == "approved"
+    assert run_row["ended_at"] == 9_000
+    assert run_row["outcome"] == "approved"
+    assert run_row["comment_id"] == approval_comment_id
+    assert run_row["error"] is None
+
+
+
 def test_finalize_task_approval_row_if_owned_applies_terminal_status(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")

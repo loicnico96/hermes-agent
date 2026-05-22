@@ -2315,33 +2315,44 @@ def _apply_task_approval_aggregate_transition(
 ) -> str:
     """Apply the authoritative approval aggregate transition for ``task_id``.
 
-    Phase 2 keeps approval-row state as the only business authority. Approval
-    runs remain execution bookkeeping, so once a rejection is authoritatively
-    recorded on a live approval row the task must immediately leave
-    ``approving`` and return to ``todo`` in the same transaction that resets the
-    attached approval rows back to ``requested``.
+    Approval rows are the business authority for whether an ``approving`` task
+    should return to execution or finish. Rejections own the reset boundary and
+    move the task back to ``todo`` in the same transaction that resets the live
+    approval rows. Satisfied or fully opted-out aggregates move the task to
+    ``done`` without rewriting the approval rows, preserving their audit state.
 
     The caller must pass the task's current approval rows explicitly and keep
     this helper inside the same write transaction that finalized the relevant
-    approval-row result. Non-rejection aggregates are currently read-only in
-    this slice and simply return the computed state without mutating the task.
+    approval-row result.
     """
     aggregate_status = _compute_task_approval_aggregate_status(approvals)
-    if aggregate_status != "todo":
+    effective_now = int(time.time()) if now is None else int(now)
+
+    if aggregate_status == "todo":
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'todo'
+             WHERE id = ?
+               AND status = 'approving'
+            """,
+            (task_id,),
+        )
+        if cur.rowcount == 1:
+            _reset_task_approvals_for_task(conn, task_id, now=effective_now)
         return aggregate_status
 
-    effective_now = int(time.time()) if now is None else int(now)
-    cur = conn.execute(
-        """
-        UPDATE tasks
-           SET status = 'todo'
-         WHERE id = ?
-           AND status = 'approving'
-        """,
-        (task_id,),
-    )
-    if cur.rowcount == 1:
-        _reset_task_approvals_for_task(conn, task_id, now=effective_now)
+    if aggregate_status == "done":
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'done'
+             WHERE id = ?
+               AND status = 'approving'
+            """,
+            (task_id,),
+        )
+
     return aggregate_status
 
 
