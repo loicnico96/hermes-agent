@@ -630,6 +630,55 @@ def test_record_manual_task_approval_decision_rejects_and_resets_cycle(kanban_ho
     assert [comment.body for comment in comments] == ["needs changes"]
 
 
+def test_record_manual_task_approval_decision_allows_human_change_of_mind_while_approving(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_750)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        human = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="human",
+            status="approved",
+        )
+        agent = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        aggregate_status = kb.record_manual_task_approval_decision(
+            conn,
+            approval_id=human.id,
+            status="rejected",
+            comment="changed my mind",
+            comment_author="reviewer",
+        )
+
+        task = kb.get_task(conn, task_id)
+        refreshed_human = kb.get_task_approval(conn, human.id)
+        refreshed_agent = kb.get_task_approval(conn, agent.id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert aggregate_status == "todo"
+    assert task is not None
+    assert task.status == "todo"
+    assert refreshed_human is not None
+    assert refreshed_human.status == "requested"
+    assert refreshed_human.comment_id is None
+    assert refreshed_human.updated_at == 8_750
+    assert refreshed_agent is not None
+    assert refreshed_agent.status == "requested"
+    assert refreshed_agent.updated_at == 8_750
+    assert [comment.author for comment in comments] == ["reviewer"]
+    assert [comment.body for comment in comments] == ["changed my mind"]
+
 
 @pytest.mark.parametrize(
     ("approval_kwargs", "task_status", "approval_status", "message"),
@@ -644,12 +693,12 @@ def test_record_manual_task_approval_decision_rejects_and_resets_cycle(kanban_ho
         (
             {"approver_type": "human"},
             "approving",
-            "approved",
-            "manual approval decisions require approval status requested",
+            "failed",
+            "manual approval decisions require approval status in approved, requested",
         ),
     ],
 )
-def test_record_manual_task_approval_decision_enforces_human_requested_approving_gate(
+def test_record_manual_task_approval_decision_enforces_human_allowed_status_and_approving_gate(
     kanban_home,
     approval_kwargs,
     task_status,

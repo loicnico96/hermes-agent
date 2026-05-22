@@ -2362,6 +2362,33 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     assert approve_show["comments"][-1]["author"] == "approver"
     assert approve_show["comments"][-1]["body"] == "looks good"
 
+    change_task = json.loads(run_slash("create 'change target' --assignee worker --json"))
+    change_task_id = change_task["id"]
+    change_human = json.loads(run_slash(f"approval add {change_task_id} --human --json"))
+    json.loads(run_slash(f"approval add {change_task_id} --agent reviewer --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (change_task_id,))
+
+    change_approve_payload = json.loads(
+        run_slash(f"approval approve {change_human['id']} --comment 'initial yes' --json")
+    )
+    change_reject_payload = json.loads(
+        run_slash(f"approval reject {change_human['id']} --comment 'actually no' --json")
+    )
+    change_show = json.loads(run_slash(f"show {change_task_id} --json"))
+
+    assert change_approve_payload["approval"]["status"] == "approved"
+    assert change_approve_payload["task_status"] == "approving"
+    assert change_approve_payload["aggregate_status"] == "approving"
+    assert change_reject_payload["approval"]["id"] == change_human["id"]
+    assert change_reject_payload["approval"]["status"] == "requested"
+    assert change_reject_payload["task_status"] == "todo"
+    assert change_reject_payload["aggregate_status"] == "todo"
+    assert change_show["task"]["status"] == "todo"
+    assert [row["status"] for row in change_show["approvals"]] == ["requested", "requested"]
+    assert [comment["body"] for comment in change_show["comments"][-2:]] == ["initial yes", "actually no"]
+
     reject_task = json.loads(run_slash("create 'reject target' --assignee worker --json"))
     reject_task_id = reject_task["id"]
     reject_human = json.loads(run_slash(f"approval add {reject_task_id} --human --json"))
