@@ -2306,6 +2306,90 @@ def _compute_task_approval_aggregate_status(
     return "done"
 
 
+def _apply_task_approval_aggregate_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approvals: Optional[Sequence[Approval]] = None,
+    now: Optional[int] = None,
+) -> str:
+    """Apply the authoritative approval aggregate transition for ``task_id``.
+
+    Phase 2 keeps approval-row state as the only business authority. Approval
+    runs remain execution bookkeeping, so once a rejection is authoritatively
+    recorded on a live approval row the task must immediately leave
+    ``approving`` and return to ``todo`` in the same transaction that resets the
+    attached approval rows back to ``requested``.
+
+    The caller is responsible for wrapping this helper inside the same write
+    transaction that finalized the relevant approval-row result. Non-rejection
+    aggregates are currently read-only in this slice and simply return the
+    computed state without mutating the task.
+    """
+    effective_approvals = (
+        list(approvals) if approvals is not None else list_task_approvals(conn, task_id)
+    )
+    aggregate_status = _compute_task_approval_aggregate_status(effective_approvals)
+    if aggregate_status != "todo":
+        return aggregate_status
+
+    effective_now = int(time.time()) if now is None else int(now)
+    cur = conn.execute(
+        """
+        UPDATE tasks
+           SET status = 'todo'
+         WHERE id = ?
+           AND status = 'approving'
+        """,
+        (task_id,),
+    )
+    if cur.rowcount == 1:
+        _reset_task_approvals_for_task(conn, task_id, now=effective_now)
+    return aggregate_status
+
+
+def _finalize_task_approval_result_if_owned(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: int,
+    expected_run_id: int,
+    status: str,
+    comment_id: Optional[int] = None,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    """Finalize a live approval result and apply any aggregate task transition.
+
+    This is the Phase 2 authority point for approval-result business effects.
+    The conditional row-finalization guard rejects stale workers, and any live
+    result then flows immediately into the task-level aggregate transition in
+    the same transaction.
+
+    Returns the computed aggregate status when the live row accepted the result.
+    Returns ``None`` when the result was stale/discarded and had no business
+    effect.
+    """
+    approval = get_task_approval(conn, approval_id)
+    if approval is None:
+        raise ValueError(f"unknown approval {approval_id}")
+
+    effective_now = int(time.time()) if now is None else int(now)
+    finalized = _finalize_task_approval_row_if_owned(
+        conn,
+        approval_id=approval_id,
+        expected_run_id=expected_run_id,
+        status=status,
+        comment_id=comment_id,
+        now=effective_now,
+    )
+    if not finalized:
+        return None
+    return _apply_task_approval_aggregate_transition(
+        conn,
+        approval.task_id,
+        now=effective_now,
+    )
+
+
 def _finalize_task_approval_row_if_owned(
     conn: sqlite3.Connection,
     *,
