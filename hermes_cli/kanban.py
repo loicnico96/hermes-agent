@@ -33,13 +33,14 @@ from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_p
 # ---------------------------------------------------------------------------
 
 _STATUS_ICONS = {
-    "todo":     "◻",
-    "ready":    "▶",
-    "running":  "●",
-    "scheduled":"⏱",
-    "blocked":  "⊘",
-    "done":     "✓",
-    "archived": "—",
+    "todo":      "◻",
+    "ready":     "▶",
+    "running":   "●",
+    "scheduled": "⏱",
+    "blocked":   "⊘",
+    "approving": "☑",
+    "done":      "✓",
+    "archived":  "—",
 }
 
 
@@ -79,6 +80,46 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
     }
+
+
+def _approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
+    return {
+        "id": approval.id,
+        "task_id": approval.task_id,
+        "approver_type": approval.approver_type,
+        "approver_profile": approval.approver_profile,
+        "approver_skill": approval.approver_skill,
+        "status": approval.status,
+        "comment_id": approval.comment_id,
+        "claim_lock": approval.claim_lock,
+        "claim_expires": approval.claim_expires,
+        "worker_pid": approval.worker_pid,
+        "last_heartbeat_at": approval.last_heartbeat_at,
+        "current_run_id": approval.current_run_id,
+        "consecutive_failures": approval.consecutive_failures,
+        "last_failure_error": approval.last_failure_error,
+        "created_at": approval.created_at,
+        "updated_at": approval.updated_at,
+    }
+
+
+def _format_approval_target(approval: kb.Approval) -> str:
+    if approval.approver_type == "human":
+        return "human"
+
+    target = f"agent @{approval.approver_profile}"
+    if approval.approver_skill:
+        target += f" skill={approval.approver_skill}"
+    return target
+
+
+def _format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> str:
+    bits = [f"#{approval.id}", f"{approval.status:10s}", _format_approval_target(approval)]
+    if include_task_id:
+        bits.append(f"task={approval.task_id}")
+    if approval.comment_id is not None:
+        bits.append(f"comment=#{approval.comment_id}")
+    return "  " + "  ".join(bits)
 
 
 def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
@@ -420,6 +461,38 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         metavar="VALUE",
         help="With --state-type: keep runs whose column equals this value",
     )
+
+    # --- approval ---
+    p_approval = sub.add_parser(
+        "approval",
+        help="Manage task approval rows",
+    )
+    approval_sub = p_approval.add_subparsers(dest="approval_action")
+
+    p_approval_add = approval_sub.add_parser("add", help="Attach an approval row to a task")
+    p_approval_add.add_argument("task_id")
+    approval_identity = p_approval_add.add_mutually_exclusive_group(required=True)
+    approval_identity.add_argument("--human", action="store_true", help="Create a human approval gate")
+    approval_identity.add_argument("--agent", metavar="PROFILE", help="Create an agent approval gate for this profile")
+    p_approval_add.add_argument("--skill", default=None, help="Optional skill name for an agent approval")
+    p_approval_add.add_argument("--json", action="store_true")
+
+    p_approval_list = approval_sub.add_parser("list", help="List approval rows")
+    p_approval_list.add_argument("--task", default=None, help="Restrict to one task id")
+    p_approval_list.add_argument(
+        "--status",
+        default=None,
+        choices=sorted(kb.VALID_APPROVAL_STATUSES),
+        help="Restrict to one approval status",
+    )
+    p_approval_list.add_argument(
+        "--type",
+        dest="approver_type",
+        default=None,
+        choices=sorted(kb.VALID_APPROVAL_TYPES),
+        help="Restrict to human or agent approvals",
+    )
+    p_approval_list.add_argument("--json", action="store_true")
 
     # --- assign ---
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
@@ -918,6 +991,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         "list":     _cmd_list,
         "ls":       _cmd_list,
         "show":     _cmd_show,
+        "approval": _dispatch_approval,
         "assign":   _cmd_assign,
         "reclaim":  _cmd_reclaim,
         "reassign": _cmd_reassign,
@@ -1012,6 +1086,19 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
+    return 2
+
+
+def _dispatch_approval(args: argparse.Namespace) -> int:
+    sub = getattr(args, "approval_action", None)
+    if not sub:
+        print("kanban approval: specify a subcommand (add, list)", file=sys.stderr)
+        return 2
+    if sub == "add":
+        return _cmd_approval_add(args)
+    if sub == "list":
+        return _cmd_approval_list(args)
+    print(f"kanban approval: unknown action {sub!r}", file=sys.stderr)
     return 2
 
 
@@ -1436,6 +1523,57 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_approval_add(args: argparse.Namespace) -> int:
+    approver_type = "human" if getattr(args, "human", False) else "agent"
+    if approver_type == "human" and getattr(args, "skill", None):
+        raise ValueError("--skill is only valid with --agent")
+
+    with kb.connect() as conn:
+        approval = kb.create_task_approval(
+            conn,
+            task_id=args.task_id,
+            approver_type=approver_type,
+            approver_profile=getattr(args, "agent", None),
+            approver_skill=getattr(args, "skill", None),
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps(_approval_to_dict(approval), indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Added approval #{approval.id} to {approval.task_id} "
+            f"({approval.status}, {_format_approval_target(approval)})"
+        )
+    return 0
+
+
+def _cmd_approval_list(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        task_id = getattr(args, "task", None)
+        if task_id is not None and kb.get_task(conn, task_id) is None:
+            print(f"no such task: {task_id}", file=sys.stderr)
+            return 1
+        approvals = kb.list_approvals(
+            conn,
+            task_id=task_id,
+            status=getattr(args, "status", None),
+            approver_type=getattr(args, "approver_type", None),
+        )
+
+    if getattr(args, "json", False):
+        print(json.dumps([_approval_to_dict(approval) for approval in approvals], indent=2, ensure_ascii=False))
+        return 0
+
+    if not approvals:
+        print("(no matching approvals)")
+        return 0
+
+    include_task_id = task_id is None
+    for approval in approvals:
+        print(_format_approval_line(approval, include_task_id=include_task_id))
+    return 0
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk = _run_state_kwargs(args)
     if rsk is None:
@@ -1453,6 +1591,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
+        approvals = kb.list_task_approvals(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
         # ``tasks.result`` is left NULL unless the caller explicitly passed
@@ -1466,6 +1605,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
+            "approvals": [_approval_to_dict(approval) for approval in approvals],
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1578,6 +1718,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print("Latest summary:")
         print(latest_summary)
+    if approvals:
+        print()
+        print(f"Approvals ({len(approvals)}):")
+        for approval in approvals:
+            print(_format_approval_line(approval, include_task_id=False))
     if comments:
         print()
         print(f"Comments ({len(comments)}):")
