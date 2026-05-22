@@ -464,6 +464,8 @@ def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home,
         (["approved", "approved"], "done"),
         (["approved", "requested"], "approving"),
         (["approved", "running"], "approving"),
+        (["requested", "rejected"], "todo"),
+        (["running", "rejected"], "approving"),
         (["approved", "rejected"], "todo"),
         (["escalated", "approved"], "done"),
         (["failed", "approved"], "done"),
@@ -783,7 +785,7 @@ def test_finalize_task_approval_row_if_owned_discards_run_ownership_mismatches(k
     assert task.status == "approving"
 
 
-def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban_home):
+def test_record_task_approval_decision_keeps_task_approving_while_other_approval_is_running(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
         rejected_comment_id = kb.add_comment(conn, task_id, "reviewer", "needs revision")
@@ -856,14 +858,14 @@ def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban
             (rejected_run.id,),
         ).fetchone()
 
-    assert aggregate_status == "todo"
+    assert aggregate_status == "approving"
 
     assert task is not None
-    assert task.status == "todo"
+    assert task.status == "approving"
 
     assert refreshed_rejected is not None
-    assert refreshed_rejected.status == "requested"
-    assert refreshed_rejected.comment_id is None
+    assert refreshed_rejected.status == "rejected"
+    assert refreshed_rejected.comment_id == rejected_comment_id
     assert refreshed_rejected.claim_lock is None
     assert refreshed_rejected.claim_expires is None
     assert refreshed_rejected.worker_pid is None
@@ -874,16 +876,16 @@ def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban
     assert refreshed_rejected.updated_at == 9_000
 
     assert refreshed_other is not None
-    assert refreshed_other.status == "requested"
+    assert refreshed_other.status == "running"
     assert refreshed_other.comment_id is None
-    assert refreshed_other.claim_lock is None
-    assert refreshed_other.claim_expires is None
-    assert refreshed_other.worker_pid is None
-    assert refreshed_other.last_heartbeat_at is None
-    assert refreshed_other.current_run_id is None
-    assert refreshed_other.consecutive_failures == 0
-    assert refreshed_other.last_failure_error is None
-    assert refreshed_other.updated_at == 9_000
+    assert refreshed_other.claim_lock == "lease-2"
+    assert refreshed_other.claim_expires == 444
+    assert refreshed_other.worker_pid == 555
+    assert refreshed_other.last_heartbeat_at == 666
+    assert refreshed_other.current_run_id == other_run.id
+    assert refreshed_other.consecutive_failures == 4
+    assert refreshed_other.last_failure_error == "keep me"
+    assert refreshed_other.updated_at == 7_100
     assert rejected_run_row is not None
     assert rejected_run_row["status"] == "rejected"
     assert rejected_run_row["ended_at"] == 9_000
@@ -892,11 +894,11 @@ def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban
     assert rejected_run_row["error"] is None
 
 
-def test_record_task_approval_decision_rejection_cycle_discards_late_results(kanban_home):
+def test_record_task_approval_decision_moves_task_to_todo_after_last_running_approval_finishes(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
         rejected_comment_id = kb.add_comment(conn, task_id, "reviewer", "needs revision")
-        stale_comment_id = kb.add_comment(conn, task_id, "reviewer-2", "late approval")
+        final_comment_id = kb.add_comment(conn, task_id, "reviewer-2", "late approval")
         rejected = kb.create_task_approval(
             conn,
             task_id=task_id,
@@ -904,7 +906,7 @@ def test_record_task_approval_decision_rejection_cycle_discards_late_results(kan
             approver_profile="reviewer",
             status="requested",
         )
-        stale = kb.create_task_approval(
+        other = kb.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -912,7 +914,7 @@ def test_record_task_approval_decision_rejection_cycle_discards_late_results(kan
             status="requested",
         )
         rejected_run = kb.create_task_approval_run(conn, approval_id=rejected.id, status="running")
-        stale_run = kb.create_task_approval_run(conn, approval_id=stale.id, status="running")
+        other_run = kb.create_task_approval_run(conn, approval_id=other.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
 
         with kb.write_txn(conn):
@@ -922,10 +924,10 @@ def test_record_task_approval_decision_rejection_cycle_discards_late_results(kan
             )
             conn.execute(
                 "UPDATE task_approvals SET status = 'running', current_run_id = ?, updated_at = ? WHERE id = ?",
-                (stale_run.id, 7_100, stale.id),
+                (other_run.id, 7_100, other.id),
             )
 
-        aggregate_status = kb.record_task_approval_decision(
+        first_aggregate_status = kb.record_task_approval_decision(
             conn,
             approval_id=rejected.id,
             expected_run_id=rejected_run.id,
@@ -933,26 +935,31 @@ def test_record_task_approval_decision_rejection_cycle_discards_late_results(kan
             comment_id=rejected_comment_id,
             now=9_000,
         )
-        assert aggregate_status == "todo"
+        assert first_aggregate_status == "approving"
 
-        with kb.write_txn(conn):
-            late_result_applied = kb._finalize_task_approval_row_if_owned(
-                conn,
-                approval_id=stale.id,
-                expected_run_id=stale_run.id,
-                status="approved",
-                comment_id=stale_comment_id,
-                now=9_100,
-            )
+        final_aggregate_status = kb.record_task_approval_decision(
+            conn,
+            approval_id=other.id,
+            expected_run_id=other_run.id,
+            status="approved",
+            comment_id=final_comment_id,
+            now=9_100,
+        )
 
         task = kb.get_task(conn, task_id)
-        refreshed_stale = kb.get_task_approval(conn, stale.id)
+        refreshed_rejected = kb.get_task_approval(conn, rejected.id)
+        refreshed_other = kb.get_task_approval(conn, other.id)
 
-    assert late_result_applied is False
+    assert final_aggregate_status == "todo"
     assert task is not None
     assert task.status == "todo"
-    assert refreshed_stale is not None
-    assert refreshed_stale.status == "requested"
-    assert refreshed_stale.comment_id is None
-    assert refreshed_stale.current_run_id is None
-    assert refreshed_stale.updated_at == 9_000
+    assert refreshed_rejected is not None
+    assert refreshed_rejected.status == "requested"
+    assert refreshed_rejected.comment_id is None
+    assert refreshed_rejected.current_run_id is None
+    assert refreshed_rejected.updated_at == 9_100
+    assert refreshed_other is not None
+    assert refreshed_other.status == "requested"
+    assert refreshed_other.comment_id is None
+    assert refreshed_other.current_run_id is None
+    assert refreshed_other.updated_at == 9_100

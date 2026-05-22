@@ -109,10 +109,11 @@ The worker does not decide whether approvals are needed at completion time. The 
 
 ### 4.2 While any approval is unresolved
 
-A task remains `approving` while any approval row is in `requested` or `running`.
+A task remains `approving` while any approval row is in `requested` or `running`, with one priority caveat: a live `running` row outranks an already-recorded `rejected` row, while an idle `requested` row does not.
 
 Clarifications:
 - `requested` and `running` are the live blocking approval-row states.
+- aggregate priority is: any `running` -> `approving`; else any `rejected` -> `todo`; else any `requested` -> `approving`; else `done`.
 - `escalated` and `failed` are agent opt-out states that remain present for audit/history but do not independently block `done`.
 - when an agent approval escalates or fails, the blocking gate is the human approval row that remains `requested`, not the `escalated` or `failed` row itself.
 - approval-run liveness is execution bookkeeping and must not outrank authoritative approval-row state.
@@ -130,8 +131,9 @@ If any approval row becomes `rejected`:
 
 Clarifications:
 - approval-row state is the business authority.
-- generic approval-run liveness does not keep a task in `approving` after a rejection has been recorded.
-- stale late worker results are discarded by row/run ownership checks and do not delay the rejection cycle.
+- a recorded rejection does not move the task back to `todo` until no approval row remains `running`; this lets already-running approvers finish and contribute stacking feedback/comments.
+- once no approval row remains `running`, any surviving `rejected` row outranks `requested` rows and immediately drives the rejection cycle.
+- stale late worker results are discarded by row/run ownership checks when the row is no longer owned by that run.
 
 This is the only rule in this slice that returns a task from approval back into execution.
 
