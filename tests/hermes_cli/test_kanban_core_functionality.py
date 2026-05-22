@@ -2326,6 +2326,60 @@ def test_cli_approval_remove_and_reset(kanban_home):
     assert shown_after_reset["approvals"][0]["last_failure_error"] is None
 
 
+
+def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "approver")
+
+    approve_task = json.loads(run_slash("create 'approve target' --assignee worker --json"))
+    approve_task_id = approve_task["id"]
+    approve_gate = json.loads(run_slash(f"approval add {approve_task_id} --human --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (approve_task_id,))
+
+    approve_payload = json.loads(
+        run_slash(f"approval approve {approve_gate['id']} --comment 'looks good' --json")
+    )
+    approve_show = json.loads(run_slash(f"show {approve_task_id} --json"))
+
+    assert approve_payload["approval"]["id"] == approve_gate["id"]
+    assert approve_payload["approval"]["status"] == "approved"
+    assert approve_payload["task_status"] == "done"
+    assert approve_payload["aggregate_status"] == "done"
+    assert approve_show["task"]["status"] == "done"
+    assert approve_show["approvals"][0]["comment_id"] is not None
+    assert approve_show["comments"][-1]["author"] == "approver"
+    assert approve_show["comments"][-1]["body"] == "looks good"
+
+    reject_task = json.loads(run_slash("create 'reject target' --assignee worker --json"))
+    reject_task_id = reject_task["id"]
+    reject_human = json.loads(run_slash(f"approval add {reject_task_id} --human --json"))
+    reject_agent = json.loads(run_slash(f"approval add {reject_task_id} --agent reviewer --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (reject_task_id,))
+        conn.execute(
+            "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
+            (7_200, reject_agent["id"]),
+        )
+
+    reject_payload = json.loads(
+        run_slash(f"approval reject {reject_human['id']} --comment 'needs changes' --json")
+    )
+    reject_show = json.loads(run_slash(f"show {reject_task_id} --json"))
+
+    assert reject_payload["approval"]["id"] == reject_human["id"]
+    assert reject_payload["approval"]["status"] == "requested"
+    assert reject_payload["approval"]["comment_id"] is None
+    assert reject_payload["task_status"] == "todo"
+    assert reject_payload["aggregate_status"] == "todo"
+    assert reject_show["task"]["status"] == "todo"
+    assert [row["status"] for row in reject_show["approvals"]] == ["requested", "requested"]
+    assert reject_show["comments"][-1]["author"] == "approver"
+    assert reject_show["comments"][-1]["body"] == "needs changes"
+
+
+
 # -------------------------------------------------------------------------
 # Pre-merge audit by @erosika (issue #16102 comment 4331125835) — fixes
 # -------------------------------------------------------------------------

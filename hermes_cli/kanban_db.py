@@ -2110,6 +2110,85 @@ def list_task_approvals(
 _OPERATOR_RESETTABLE_APPROVAL_STATUSES = {"running", "approved", "rejected", "escalated", "failed"}
 
 
+def record_manual_task_approval_decision(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: int,
+    status: str,
+    comment: Optional[str] = None,
+    comment_author: Optional[str] = None,
+    now: Optional[int] = None,
+) -> str:
+    """Record a human approval decision through the same aggregate authority path.
+
+    Manual human decisions do not own ``task_approval_runs`` rows, but they must
+    still validate the live approval gate and route through the shared aggregate
+    transition helpers in the same write transaction.
+    """
+    normalized_status = _validate_approval_decision_status(status)
+    effective_now = int(time.time()) if now is None else int(now)
+
+    with write_txn(conn):
+        approval = get_task_approval(conn, approval_id)
+        if approval is None:
+            raise ValueError(f"unknown approval {approval_id}")
+        if approval.approver_type != "human":
+            raise ValueError("manual approval decisions require a human approval")
+        if approval.status != "requested":
+            raise ValueError("manual approval decisions require approval status requested")
+
+        task = get_task(conn, approval.task_id)
+        assert task is not None
+        if task.status != "approving":
+            raise ValueError("parent task must be approving")
+
+        comment_id = None
+        if comment is not None:
+            effective_author = _normalize_optional_text(comment_author)
+            if effective_author is None:
+                raise ValueError("comment author is required")
+            comment_id = _insert_task_comment(
+                conn,
+                task_id=approval.task_id,
+                author=effective_author,
+                body=comment,
+                now=effective_now,
+            )
+
+        cur = conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = ?,
+                   comment_id = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_heartbeat_at = NULL,
+                   current_run_id = NULL,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL,
+                   updated_at = ?
+             WHERE id = ?
+               AND status = 'requested'
+            """,
+            (
+                normalized_status,
+                comment_id,
+                effective_now,
+                int(approval_id),
+            ),
+        )
+        assert cur.rowcount == 1
+
+        approvals = list_task_approvals(conn, approval.task_id)
+        return _apply_task_approval_aggregate_transition(
+            conn,
+            approval.task_id,
+            approvals=approvals,
+            now=effective_now,
+        )
+
+
 def remove_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
     with write_txn(conn):
         approval = get_task_approval(conn, approval_id)
@@ -2695,26 +2774,41 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
-def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+def _insert_task_comment(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    author: str,
+    body: str,
+    now: Optional[int] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
-    now = int(time.time())
+
+    effective_now = int(time.time()) if now is None else int(now)
+    if not conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone():
+        raise ValueError(f"unknown task {task_id}")
+
+    normalized_author = author.strip()
+    normalized_body = body.strip()
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, normalized_author, normalized_body, effective_now),
+    )
+    _append_event(conn, task_id, "commented", {"author": normalized_author, "len": len(normalized_body)})
+    return int(cur.lastrowid or 0)
+
+
+def add_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str
+) -> int:
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
-            raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
-        )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        return _insert_task_comment(conn, task_id=task_id, author=author, body=body)
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
