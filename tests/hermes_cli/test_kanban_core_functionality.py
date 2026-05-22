@@ -2389,6 +2389,30 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     assert [row["status"] for row in change_show["approvals"]] == ["requested", "requested"]
     assert [comment["body"] for comment in change_show["comments"][-2:]] == ["initial yes", "actually no"]
 
+    stale_task = json.loads(run_slash("create 'stale target' --assignee worker --json"))
+    stale_task_id = stale_task["id"]
+    stale_human = json.loads(run_slash(f"approval add {stale_task_id} --human --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (stale_task_id,))
+        conn.execute(
+            "UPDATE task_approvals SET status = 'failed', updated_at = ? WHERE id = ?",
+            (7_150, stale_human["id"]),
+        )
+
+    stale_payload = json.loads(
+        run_slash(f"approval approve {stale_human['id']} --comment 'override stale state' --json")
+    )
+    stale_show = json.loads(run_slash(f"show {stale_task_id} --json"))
+
+    assert stale_payload["approval"]["id"] == stale_human["id"]
+    assert stale_payload["approval"]["status"] == "approved"
+    assert stale_payload["task_status"] == "done"
+    assert stale_payload["aggregate_status"] == "done"
+    assert stale_show["task"]["status"] == "done"
+    assert stale_show["approvals"][0]["comment_id"] is not None
+    assert stale_show["comments"][-1]["body"] == "override stale state"
+
     reject_task = json.loads(run_slash("create 'reject target' --assignee worker --json"))
     reject_task_id = reject_task["id"]
     reject_human = json.loads(run_slash(f"approval add {reject_task_id} --human --json"))
