@@ -680,34 +680,65 @@ def test_record_manual_task_approval_decision_allows_human_change_of_mind_while_
     assert [comment.body for comment in comments] == ["changed my mind"]
 
 
+def test_record_manual_task_approval_decision_allows_any_prior_human_status_while_approving(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_900)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="human",
+            status="failed",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        aggregate_status = kb.record_manual_task_approval_decision(
+            conn,
+            approval_id=approval.id,
+            status="approved",
+            comment="override stale state",
+            comment_author="reviewer",
+        )
+
+        task = kb.get_task(conn, task_id)
+        refreshed = kb.get_task_approval(conn, approval.id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert aggregate_status == "done"
+    assert task is not None
+    assert task.status == "done"
+    assert refreshed is not None
+    assert refreshed.status == "approved"
+    assert refreshed.comment_id == comments[0].id
+    assert refreshed.updated_at == 8_900
+    assert [comment.author for comment in comments] == ["reviewer"]
+    assert [comment.body for comment in comments] == ["override stale state"]
+
+
 @pytest.mark.parametrize(
-    ("approval_kwargs", "task_status", "approval_status", "message"),
+    ("approval_kwargs", "task_status", "message"),
     [
         (
             {"approver_type": "agent", "approver_profile": "reviewer"},
             "approving",
-            "requested",
             "manual approval decisions require a human approval",
         ),
-        ({"approver_type": "human"}, "done", "requested", "parent task must be approving"),
-        (
-            {"approver_type": "human"},
-            "approving",
-            "failed",
-            "manual approval decisions require approval status in approved, requested",
-        ),
+        ({"approver_type": "human"}, "done", "parent task must be approving"),
     ],
 )
-def test_record_manual_task_approval_decision_enforces_human_allowed_status_and_approving_gate(
+def test_record_manual_task_approval_decision_enforces_human_and_approving_gate(
     kanban_home,
     approval_kwargs,
     task_status,
-    approval_status,
     message,
 ):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
-        approval = kb.create_task_approval(conn, task_id=task_id, status=approval_status, **approval_kwargs)
+        approval = kb.create_task_approval(conn, task_id=task_id, status="failed", **approval_kwargs)
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (task_status, task_id))
 
         with pytest.raises(ValueError, match=message):
