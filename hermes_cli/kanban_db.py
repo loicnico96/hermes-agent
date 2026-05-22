@@ -1645,7 +1645,7 @@ def create_task(
                             thread_id,
                             user_id,
                             delivery_mode,
-                            session_key or "",
+                            session_key,
                             notifier_profile,
                             now,
                         ),
@@ -1852,12 +1852,7 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
-    """Undo a notification claim when delivery fails.
-
-    The CAS guard only rewinds if no later notifier advanced the row after our
-    claim. This keeps retry behavior for transient send failures without
-    clobbering newer progress.
-    """
+    """Remove one parent→child dependency edge and refresh child readiness."""
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -5883,7 +5878,6 @@ def add_notify_sub(
     if delivery_mode == "notification":
         session_key = None
     now = int(time.time())
-    session_key_db = session_key or ""
     with write_txn(conn):
         conn.execute(
             """
@@ -5898,7 +5892,7 @@ def add_notify_sub(
                 thread_id,
                 user_id,
                 delivery_mode,
-                session_key_db,
+                session_key,
                 notifier_profile,
                 now,
             ),
@@ -5911,7 +5905,8 @@ def add_notify_sub(
                 UPDATE kanban_notify_subs
                    SET notifier_profile = ?
                  WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND delivery_mode = ? AND session_key = ?
+                   AND delivery_mode = ?
+                   AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)
                    AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
                 (
@@ -5921,7 +5916,8 @@ def add_notify_sub(
                     chat_id,
                     thread_id,
                     delivery_mode,
-                    session_key_db,
+                    session_key,
+                    session_key,
                 ),
             )
 
@@ -5952,14 +5948,16 @@ def remove_notify_sub(
         cur = conn.execute(
             "DELETE FROM kanban_notify_subs WHERE task_id = ? "
             "AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND delivery_mode = ? AND session_key = ?",
+            "AND delivery_mode = ? "
+            "AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
             (
                 task_id,
                 platform,
                 chat_id,
                 thread_id or "",
                 str(delivery_mode or "notification").strip().lower() or "notification",
-                str(session_key or "").strip(),
+                (str(session_key).strip() if session_key is not None else None),
+                (str(session_key).strip() if session_key is not None else None),
             ),
         )
     return cur.rowcount > 0
@@ -5985,14 +5983,16 @@ def unseen_events_for_sub(
     row = conn.execute(
         "SELECT last_event_id FROM kanban_notify_subs "
         "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-        "AND delivery_mode = ? AND session_key = ?",
+        "AND delivery_mode = ? "
+        "AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
         (
             task_id,
             platform,
             chat_id,
             thread_id or "",
             str(delivery_mode or "notification").strip().lower() or "notification",
-            str(session_key or "").strip(),
+            (str(session_key).strip() if session_key is not None else None),
+            (str(session_key).strip() if session_key is not None else None),
         ),
     ).fetchone()
     if row is None:
@@ -6053,14 +6053,16 @@ def claim_unseen_events_for_sub(
         row = conn.execute(
             "SELECT last_event_id FROM kanban_notify_subs "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND delivery_mode = ? AND session_key = ?",
+            "AND delivery_mode = ? "
+            "AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
             (
                 task_id,
                 platform,
                 chat_id,
                 thread_id or "",
                 str(delivery_mode or "notification").strip().lower() or "notification",
-                str(session_key or "").strip(),
+                (str(session_key).strip() if session_key is not None else None),
+                (str(session_key).strip() if session_key is not None else None),
             ),
         ).fetchone()
         if row is None:
@@ -6081,7 +6083,8 @@ def claim_unseen_events_for_sub(
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND delivery_mode = ? AND session_key = ? AND last_event_id = ?",
+            "AND delivery_mode = ? "
+            "AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?) AND last_event_id = ?",
             (
                 int(new_cursor),
                 task_id,
@@ -6089,7 +6092,8 @@ def claim_unseen_events_for_sub(
                 chat_id,
                 thread_id or "",
                 str(delivery_mode or "notification").strip().lower() or "notification",
-                str(session_key or "").strip(),
+                (str(session_key).strip() if session_key is not None else None),
+                (str(session_key).strip() if session_key is not None else None),
                 int(old_cursor),
             ),
         )
@@ -6111,7 +6115,8 @@ def advance_notify_cursor(
         conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND delivery_mode = ? AND session_key = ?",
+            "AND delivery_mode = ? "
+            "AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?)",
             (
                 int(new_cursor),
                 task_id,
@@ -6119,7 +6124,8 @@ def advance_notify_cursor(
                 chat_id,
                 thread_id or "",
                 str(delivery_mode or "notification").strip().lower() or "notification",
-                str(session_key or "").strip(),
+                (str(session_key).strip() if session_key is not None else None),
+                (str(session_key).strip() if session_key is not None else None),
             ),
         )
 
@@ -6143,7 +6149,8 @@ def rewind_notify_cursor(
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
-            "AND delivery_mode = ? AND session_key = ? AND last_event_id = ?",
+            "AND delivery_mode = ? "
+            "AND ((session_key IS NULL AND ? IS NULL) OR session_key = ?) AND last_event_id = ?",
             (
                 int(old_cursor),
                 task_id,
@@ -6151,7 +6158,8 @@ def rewind_notify_cursor(
                 chat_id,
                 thread_id or "",
                 str(delivery_mode or "notification").strip().lower() or "notification",
-                str(session_key or "").strip(),
+                (str(session_key).strip() if session_key is not None else None),
+                (str(session_key).strip() if session_key is not None else None),
                 int(claimed_cursor),
             ),
         )
