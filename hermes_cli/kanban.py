@@ -512,6 +512,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_approval_remove.add_argument("approval_id", type=int)
     p_approval_remove.add_argument("--json", action="store_true")
 
+    p_approval_approve = approval_sub.add_parser("approve", help="Record a human approval decision")
+    p_approval_approve.add_argument("approval_id", type=int)
+    p_approval_approve.add_argument("--comment", default=None, help="Optional task comment to append")
+    p_approval_approve.add_argument("--json", action="store_true")
+
+    p_approval_reject = approval_sub.add_parser("reject", help="Record a human rejection decision")
+    p_approval_reject.add_argument("approval_id", type=int)
+    p_approval_reject.add_argument("--comment", default=None, help="Optional task comment to append")
+    p_approval_reject.add_argument("--json", action="store_true")
+
     p_approval_reset = approval_sub.add_parser("reset", help="Reset one approval row back to requested")
     p_approval_reset.add_argument("approval_id", type=int)
     p_approval_reset.add_argument("--json", action="store_true")
@@ -1105,7 +1115,7 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 def _dispatch_approval(args: argparse.Namespace) -> int:
     sub = getattr(args, "approval_action", None)
     if not sub:
-        print("kanban approval: specify a subcommand (add, list, remove, reset)", file=sys.stderr)
+        print("kanban approval: specify a subcommand (add, list, remove, approve, reject, reset)", file=sys.stderr)
         return 2
     if sub == "add":
         return _cmd_approval_add(args)
@@ -1113,6 +1123,10 @@ def _dispatch_approval(args: argparse.Namespace) -> int:
         return _cmd_approval_list(args)
     if sub == "remove":
         return _cmd_approval_remove(args)
+    if sub == "approve":
+        return _cmd_approval_decide(args, status="approved")
+    if sub == "reject":
+        return _cmd_approval_decide(args, status="rejected")
     if sub == "reset":
         return _cmd_approval_reset(args)
     print(f"kanban approval: unknown action {sub!r}", file=sys.stderr)
@@ -1612,6 +1626,31 @@ def _cmd_approval_remove(args: argparse.Namespace) -> int:
     else:
         print(
             f"Removed approval #{approval.id} from {approval.task_id}; "
+            f"task status is now {payload['task_status']}"
+        )
+    return 0
+
+
+def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
+    with kb.connect() as conn:
+        aggregate_status = kb.record_manual_task_approval_decision(
+            conn,
+            approval_id=args.approval_id,
+            status=status,
+            comment=getattr(args, "comment", None),
+            comment_author=_profile_author(),
+        )
+        approval = kb.get_task_approval(conn, args.approval_id)
+        assert approval is not None
+        payload = _approval_mutation_payload(conn, approval)
+        payload["aggregate_status"] = aggregate_status
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        verb = "approved" if status == "approved" else "rejected"
+        print(
+            f"Recorded {verb} decision for approval #{approval.id} on {approval.task_id}; "
             f"task status is now {payload['task_status']}"
         )
     return 0
