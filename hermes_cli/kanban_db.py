@@ -2304,6 +2304,64 @@ def _compute_task_approval_aggregate_status(
     if "requested" in statuses:
         return "approving"
     return "done"
+
+
+def _finalize_task_approval_row_if_owned(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: int,
+    expected_run_id: int,
+    status: str,
+    comment_id: Optional[int] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Apply a terminal approval-row update only if the live run still owns it.
+
+    Phase 2.3 tightens stale-result handling without pulling in the full
+    approval-worker runtime. The caller must still wrap any wider business
+    mutation flow in a transaction, but the row-level write itself is guarded by
+    the approval row id, ``status='requested'``, and the matching
+    ``current_run_id`` so late results from stale workers become harmless
+    no-ops.
+    """
+    approval = get_task_approval(conn, approval_id)
+    if approval is None:
+        raise ValueError(f"unknown approval {approval_id}")
+
+    normalized_status = _validate_approval_status(status)
+    normalized_comment_id = _validate_task_comment_reference(
+        conn, task_id=approval.task_id, comment_id=comment_id
+    )
+    effective_now = int(time.time()) if now is None else int(now)
+
+    cur = conn.execute(
+        """
+        UPDATE task_approvals
+           SET status = ?,
+               comment_id = ?,
+               claim_lock = NULL,
+               claim_expires = NULL,
+               worker_pid = NULL,
+               last_heartbeat_at = NULL,
+               current_run_id = NULL,
+               consecutive_failures = 0,
+               last_failure_error = NULL,
+               updated_at = ?
+         WHERE id = ?
+           AND status = 'requested'
+           AND current_run_id = ?
+        """,
+        (
+            normalized_status,
+            normalized_comment_id,
+            effective_now,
+            int(approval_id),
+            int(expected_run_id),
+        ),
+    )
+    return cur.rowcount == 1
+
+
 def create_task_approval_run(
     conn: sqlite3.Connection,
     *,
