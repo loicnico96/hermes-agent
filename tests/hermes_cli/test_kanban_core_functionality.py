@@ -2292,6 +2292,51 @@ def test_cli_approval_add_list_and_show(kanban_home):
     assert [row["id"] for row in shown_json["approvals"]] == [human_approval["id"], agent_approval["id"]]
 
 
+
+def test_cli_approval_remove_and_reset(kanban_home):
+    task_data = json.loads(run_slash("create 'approval target' --assignee worker --json"))
+    task_id = task_data["id"]
+
+    removed = json.loads(run_slash(f"approval add {task_id} --agent reviewer --json"))
+    survivor = json.loads(run_slash(f"approval add {task_id} --human --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute(
+            "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
+            (7_000, survivor["id"]),
+        )
+
+    removed_payload = json.loads(run_slash(f"approval remove {removed['id']} --json"))
+    shown_after_remove = json.loads(run_slash(f"show {task_id} --json"))
+
+    assert removed_payload["approval"]["id"] == removed["id"]
+    assert removed_payload["task_status"] == "done"
+    assert [row["id"] for row in shown_after_remove["approvals"]] == [survivor["id"]]
+    assert shown_after_remove["task"]["status"] == "done"
+
+    second_task = json.loads(run_slash("create 'reset target' --assignee worker --json"))
+    second_task_id = second_task["id"]
+    reset_target = json.loads(run_slash(f"approval add {second_task_id} --agent reviewer --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (second_task_id,))
+        conn.execute(
+            "UPDATE task_approvals SET status = 'failed', comment_id = 123, consecutive_failures = 2, last_failure_error = 'boom' WHERE id = ?",
+            (reset_target["id"],),
+        )
+
+    reset_payload = json.loads(run_slash(f"approval reset {reset_target['id']} --json"))
+    shown_after_reset = json.loads(run_slash(f"show {second_task_id} --json"))
+
+    assert reset_payload["approval"]["id"] == reset_target["id"]
+    assert reset_payload["task_status"] == "approving"
+    assert shown_after_reset["task"]["status"] == "approving"
+    assert shown_after_reset["approvals"][0]["status"] == "requested"
+    assert shown_after_reset["approvals"][0]["consecutive_failures"] == 0
+    assert shown_after_reset["approvals"][0]["last_failure_error"] is None
+
+
 # -------------------------------------------------------------------------
 # Pre-merge audit by @erosika (issue #16102 comment 4331125835) — fixes
 # -------------------------------------------------------------------------
