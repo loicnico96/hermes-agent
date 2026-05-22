@@ -2778,6 +2778,7 @@ def list_task_approvals(
 
 
 _OPERATOR_RESETTABLE_APPROVAL_STATUSES = {"running", "approved", "rejected", "escalated", "failed"}
+_MANUAL_DECISION_SOURCE_STATUSES = {"requested", "approved"}
 
 
 def record_manual_task_approval_decision(
@@ -2804,8 +2805,11 @@ def record_manual_task_approval_decision(
             raise ValueError(f"unknown approval {approval_id}")
         if approval.approver_type != "human":
             raise ValueError("manual approval decisions require a human approval")
-        if approval.status != "requested":
-            raise ValueError("manual approval decisions require approval status requested")
+        if approval.status not in _MANUAL_DECISION_SOURCE_STATUSES:
+            allowed_statuses = ", ".join(sorted(_MANUAL_DECISION_SOURCE_STATUSES))
+            raise ValueError(
+                f"manual approval decisions require approval status in {allowed_statuses}"
+            )
 
         task = get_task(conn, approval.task_id)
         assert task is not None
@@ -2839,7 +2843,7 @@ def record_manual_task_approval_decision(
                    last_failure_error = NULL,
                    updated_at = ?
              WHERE id = ?
-               AND status = 'requested'
+               AND status IN ('requested', 'approved')
             """,
             (
                 normalized_status,
