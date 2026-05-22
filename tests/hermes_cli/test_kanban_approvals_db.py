@@ -303,3 +303,83 @@ def test_reset_task_approval_rejects_unknown_approval(kanban_home):
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="unknown approval"):
             kb.reset_task_approval(conn, 999999)
+
+
+def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 7_000)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        other_task_id = kb.create_task(conn, title="other target")
+        comment_id = kb.add_comment(conn, task_id, "user", "stale review")
+        other_comment_id = kb.add_comment(conn, other_task_id, "user", "other stale review")
+
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="failed",
+        )
+        other = kb.create_task_approval(
+            conn,
+            task_id=other_task_id,
+            approver_type="agent",
+            approver_profile="security",
+            status="approved",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                SET comment_id = ?,
+                    claim_lock = ?,
+                    claim_expires = ?,
+                    worker_pid = ?,
+                    last_heartbeat_at = ?,
+                    current_run_id = ?,
+                    consecutive_failures = ?,
+                    last_failure_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (comment_id, "lease-1", 123, 456, 789, run.id, 3, "spawn failed", 6_000, approval.id),
+            )
+            conn.execute(
+                """
+                UPDATE task_approvals
+                SET comment_id = ?,
+                    consecutive_failures = ?,
+                    last_failure_error = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (other_comment_id, 2, "keep me", 6_100, other.id),
+            )
+
+            reset_count = kb._reset_task_approvals_for_task(conn, task_id)
+
+        reset = kb.get_task_approval(conn, approval.id)
+        untouched = kb.get_task_approval(conn, other.id)
+
+    assert reset_count == 1
+    assert reset is not None
+    assert reset.status == "requested"
+    assert reset.comment_id is None
+    assert reset.claim_lock is None
+    assert reset.claim_expires is None
+    assert reset.worker_pid is None
+    assert reset.last_heartbeat_at is None
+    assert reset.current_run_id is None
+    assert reset.consecutive_failures == 0
+    assert reset.last_failure_error is None
+    assert reset.updated_at == 7_000
+
+    assert untouched is not None
+    assert untouched.status == "approved"
+    assert untouched.comment_id == other_comment_id
+    assert untouched.consecutive_failures == 2
+    assert untouched.last_failure_error == "keep me"
+    assert untouched.updated_at == 6_100

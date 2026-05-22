@@ -2058,23 +2058,7 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
     now = int(time.time())
 
     with write_txn(conn):
-        cur = conn.execute(
-            """
-            UPDATE task_approvals
-            SET status = 'requested',
-                comment_id = NULL,
-                claim_lock = NULL,
-                claim_expires = NULL,
-                worker_pid = NULL,
-                last_heartbeat_at = NULL,
-                current_run_id = NULL,
-                consecutive_failures = 0,
-                last_failure_error = NULL,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (now, int(approval_id)),
-        )
+        cur = _reset_task_approval_row(conn, approval_id=int(approval_id), now=now)
         if cur.rowcount != 1:
             raise ValueError(f"unknown approval {approval_id}")
 
@@ -2083,30 +2067,88 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         return approval
 
 
-_APPROVAL_RESET_TRIGGER_TASK_STATUSES = frozenset({"approving", "done", "archived"})
+_TASK_APPROVAL_RESET_SET_SQL = """
+status = 'requested',
+comment_id = NULL,
+claim_lock = NULL,
+claim_expires = NULL,
+worker_pid = NULL,
+last_heartbeat_at = NULL,
+current_run_id = NULL,
+consecutive_failures = 0,
+last_failure_error = NULL,
+updated_at = ?
+"""
 
 
-def _handle_task_status_transition_approval_reset(
+def _reset_task_approval_row(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: int,
+    now: int,
+) -> sqlite3.Cursor:
+    return conn.execute(
+        f"""
+        UPDATE task_approvals
+        SET {_TASK_APPROVAL_RESET_SET_SQL}
+        WHERE id = ?
+        """,
+        (now, int(approval_id)),
+    )
+
+
+def _reset_task_approvals_for_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
-    old_status: Optional[str],
-    new_status: str,
-) -> None:
-    """Phase 2 insertion point for task-driven approval reset wiring.
+    now: Optional[int] = None,
+) -> int:
+    """Bulk-reset every approval row attached to ``task_id``.
 
-    Phase 1 intentionally lands only the named hook at transitions that own
-    approval state: entering ``approving`` and terminalizing into ``done`` /
-    ``archived``. Approval-free routing such as triage/specify/promote helpers
-    should not grow task-wide reset semantics.
+    This is the task-scoped primitive Phase 2 owners should call once the
+    aggregate lifecycle semantics land. Keep the ownership decision in the
+    concrete mutator (completion cycle, rejection cycle, or a future manual
+    override that actually exits an approval-bearing status domain) rather than
+    routing all task-status writes through a generic transition hook.
     """
-    del conn, task_id  # Reserved for Phase 2 task-wide reset wiring.
-    if old_status is None or old_status == new_status:
-        return
-    if new_status not in _APPROVAL_RESET_TRIGGER_TASK_STATUSES:
-        return
-    # Intentionally no-op in Phase 1. Later phases should bulk-reset this
-    # task's approval rows here once the approval aggregate semantics land.
+    effective_now = int(time.time()) if now is None else int(now)
+    cur = conn.execute(
+        f"""
+        UPDATE task_approvals
+        SET {_TASK_APPROVAL_RESET_SET_SQL}
+        WHERE task_id = ?
+        """,
+        (effective_now, task_id),
+    )
+    return int(cur.rowcount)
+
+
+def _prepare_task_approvals_for_new_completion_cycle(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> None:
+    """Successful worker completion owns the fresh-result reset boundary.
+
+    Phase 2 intentionally keeps reset ownership attached to the concrete
+    operation that produced a new task result rather than to a generic
+    ``old_status -> new_status`` router. In the current mutator surface:
+
+    - ``complete_task`` owns the successful-completion boundary.
+    - no existing manual override helper currently moves a task from
+      ``done`` / ``approving`` / ``archived`` back into a non-approval-bearing
+      status.
+    - ``archive_task``, ``block_task``, ``unblock_task``, ``schedule_task``,
+      ``recompute_ready``, ``claim_task``, and ``reclaim_task`` do not currently
+      cross a reset boundary because of their allowed source-status domains.
+
+    Later Phase 2 work will make ``complete_task`` call
+    :func:`_reset_task_approvals_for_task` when it actually routes a fresh
+    completion into a new approval cycle. Keeping this explicit hook local to
+    ``complete_task`` makes that ownership obvious and prevents ``archived`` or
+    other non-reset transitions from inheriting reset behavior by function name
+    alone.
+    """
+    del conn, task_id
 
 
 def create_task_approval_run(
@@ -3262,7 +3304,6 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
-        previous = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -3296,12 +3337,7 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
-        _handle_task_status_transition_approval_reset(
-            conn,
-            task_id,
-            old_status=(previous["status"] if previous else None),
-            new_status="done",
-        )
+        _prepare_task_approvals_for_new_completion_cycle(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -3916,7 +3952,6 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
-        previous = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -3925,12 +3960,6 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _handle_task_status_transition_approval_reset(
-            conn,
-            task_id,
-            old_status=(previous["status"] if previous else None),
-            new_status="archived",
-        )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
