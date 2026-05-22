@@ -2270,6 +2270,28 @@ def test_cli_show_json_carries_runs(kanban_home):
         assert "run_id" in e
 
 
+def test_cli_approval_add_list_and_show(kanban_home):
+    task_data = json.loads(run_slash("create 'approval target' --assignee worker --json"))
+    task_id = task_data["id"]
+
+    human_approval = json.loads(run_slash(f"approval add {task_id} --human --json"))
+    agent_approval = json.loads(
+        run_slash(f"approval add {task_id} --agent reviewer --skill security-review --json")
+    )
+
+    board_rows = json.loads(run_slash("approval list --json"))
+    task_rows = json.loads(run_slash(f"approval list --task {task_id} --json"))
+    shown = run_slash(f"show {task_id}")
+    shown_json = json.loads(run_slash(f"show {task_id} --json"))
+
+    assert [row["id"] for row in board_rows] == [human_approval["id"], agent_approval["id"]]
+    assert [row["id"] for row in task_rows] == [human_approval["id"], agent_approval["id"]]
+    assert "Approvals (2):" in shown
+    assert "human" in shown
+    assert "agent @reviewer skill=security-review" in shown
+    assert [row["id"] for row in shown_json["approvals"]] == [human_approval["id"], agent_approval["id"]]
+
+
 # -------------------------------------------------------------------------
 # Pre-merge audit by @erosika (issue #16102 comment 4331125835) — fixes
 # -------------------------------------------------------------------------
