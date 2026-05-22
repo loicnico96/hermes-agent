@@ -554,6 +554,122 @@ def test_remove_task_approval_rejects_unknown_approval(kanban_home):
             kb.remove_task_approval(conn, 999999)
 
 
+
+def test_record_manual_task_approval_decision_approves_human_gate_and_keeps_comment(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_000)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(conn, task_id=task_id, approver_type="human")
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        aggregate_status = kb.record_manual_task_approval_decision(
+            conn,
+            approval_id=approval.id,
+            status="approved",
+            comment="ship it",
+            comment_author="reviewer",
+        )
+
+        task = kb.get_task(conn, task_id)
+        refreshed = kb.get_task_approval(conn, approval.id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert aggregate_status == "done"
+    assert task is not None
+    assert task.status == "done"
+    assert refreshed is not None
+    assert refreshed.status == "approved"
+    assert refreshed.comment_id == comments[0].id
+    assert refreshed.updated_at == 8_000
+    assert [comment.author for comment in comments] == ["reviewer"]
+    assert [comment.body for comment in comments] == ["ship it"]
+
+
+
+def test_record_manual_task_approval_decision_rejects_and_resets_cycle(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_500)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        human = kb.create_task_approval(conn, task_id=task_id, approver_type="human")
+        agent = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="approved",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        aggregate_status = kb.record_manual_task_approval_decision(
+            conn,
+            approval_id=human.id,
+            status="rejected",
+            comment="needs changes",
+            comment_author="reviewer",
+        )
+
+        task = kb.get_task(conn, task_id)
+        refreshed_human = kb.get_task_approval(conn, human.id)
+        refreshed_agent = kb.get_task_approval(conn, agent.id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert aggregate_status == "todo"
+    assert task is not None
+    assert task.status == "todo"
+    assert refreshed_human is not None
+    assert refreshed_human.status == "requested"
+    assert refreshed_human.comment_id is None
+    assert refreshed_human.updated_at == 8_500
+    assert refreshed_agent is not None
+    assert refreshed_agent.status == "requested"
+    assert refreshed_agent.comment_id is None
+    assert refreshed_agent.updated_at == 8_500
+    assert [comment.author for comment in comments] == ["reviewer"]
+    assert [comment.body for comment in comments] == ["needs changes"]
+
+
+
+@pytest.mark.parametrize(
+    ("approval_kwargs", "task_status", "approval_status", "message"),
+    [
+        (
+            {"approver_type": "agent", "approver_profile": "reviewer"},
+            "approving",
+            "requested",
+            "manual approval decisions require a human approval",
+        ),
+        ({"approver_type": "human"}, "done", "requested", "parent task must be approving"),
+        (
+            {"approver_type": "human"},
+            "approving",
+            "approved",
+            "manual approval decisions require approval status requested",
+        ),
+    ],
+)
+def test_record_manual_task_approval_decision_enforces_human_requested_approving_gate(
+    kanban_home,
+    approval_kwargs,
+    task_status,
+    approval_status,
+    message,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(conn, task_id=task_id, status=approval_status, **approval_kwargs)
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (task_status, task_id))
+
+        with pytest.raises(ValueError, match=message):
+            kb.record_manual_task_approval_decision(
+                conn,
+                approval_id=approval.id,
+                status="approved",
+            )
+
+
+
 def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home, monkeypatch):
     monkeypatch.setattr(kb.time, "time", lambda: 7_000)
 
