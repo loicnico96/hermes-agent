@@ -181,8 +181,17 @@ def test_list_approvals_supports_board_wide_filters(kanban_home):
         agent_rows = kb.list_approvals(conn, approver_type="agent")
         running_rows = kb.list_approvals(conn, status="running")
 
-    assert [approval.id for approval in all_rows] == [first_human.id, first_agent.id, second_agent.id]
-    assert [approval.id for approval in agent_rows] == [first_agent.id, second_agent.id]
+    expected_all = sorted(
+        [first_human, first_agent, second_agent],
+        key=lambda approval: (approval.task_id, approval.created_at, approval.id),
+    )
+    expected_agents = sorted(
+        [first_agent, second_agent],
+        key=lambda approval: (approval.task_id, approval.created_at, approval.id),
+    )
+
+    assert [approval.id for approval in all_rows] == [approval.id for approval in expected_all]
+    assert [approval.id for approval in agent_rows] == [approval.id for approval in expected_agents]
     assert [approval.id for approval in running_rows] == [first_agent.id]
 
 
@@ -382,6 +391,7 @@ def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban
                     approval.id,
                 ),
             )
+            conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
 
         reset = kb.reset_task_approval(conn, approval.id)
         run_row = conn.execute(
@@ -411,10 +421,137 @@ def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban
     assert run_row["outcome"] is None
 
 
+def test_reset_task_approval_requires_parent_task_to_be_approving(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="approved",
+        )
+
+        with pytest.raises(ValueError, match="parent task must be approving"):
+            kb.reset_task_approval(conn, approval.id)
+
+
+@pytest.mark.parametrize("status", ["running", "approved", "rejected", "escalated", "failed"])
+def test_reset_task_approval_accepts_only_live_operator_reset_statuses(kanban_home, monkeypatch, status):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_000)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status=status,
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        reset = kb.reset_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+
+    assert reset.status == "requested"
+    assert reset.updated_at == 8_000
+    assert task is not None
+    assert task.status == "approving"
+
+
+
+def test_reset_task_approval_rejects_requested_rows(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        with pytest.raises(ValueError, match="reset only supports statuses"):
+            kb.reset_task_approval(conn, approval.id)
+
+
+
 def test_reset_task_approval_rejects_unknown_approval(kanban_home):
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="unknown approval"):
             kb.reset_task_approval(conn, 999999)
+
+
+
+def test_remove_task_approval_recomputes_approving_parent_state(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        removed = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        survivor = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="human",
+            status="approved",
+        )
+        removed_run = kb.create_task_approval_run(conn, approval_id=removed.id, status="running")
+        conn.execute(
+            "UPDATE task_approvals SET current_run_id = ?, claim_lock = ?, updated_at = ? WHERE id = ?",
+            (removed_run.id, "lease-1", 7_500, removed.id),
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        deleted = kb.remove_task_approval(conn, removed.id)
+        task = kb.get_task(conn, task_id)
+        survivor_after = kb.get_task_approval(conn, survivor.id)
+        removed_after = kb.get_task_approval(conn, removed.id)
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_approval_runs WHERE approval_id = ?",
+            (removed.id,),
+        ).fetchone()[0]
+
+    assert deleted.id == removed.id
+    assert deleted.task_id == task_id
+    assert removed_after is None
+    assert survivor_after is not None
+    assert survivor_after.id == survivor.id
+    assert run_count == 0
+    assert task is not None
+    assert task.status == "done"
+
+
+
+def test_remove_task_approval_leaves_non_approving_parent_status_unchanged(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+
+        deleted = kb.remove_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+
+    assert deleted.id == approval.id
+    assert task is not None
+    assert task.status == "ready"
+
+
+
+def test_remove_task_approval_rejects_unknown_approval(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="unknown approval"):
+            kb.remove_task_approval(conn, 999999)
 
 
 def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home, monkeypatch):
