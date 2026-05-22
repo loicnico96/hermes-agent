@@ -1606,17 +1606,18 @@ def create_task(
                     ),
                 )
                 if watch_subscription:
-                    platform = str(watch_subscription.get("platform") or "").strip().lower()
-                    chat_id = str(watch_subscription.get("chat_id") or "").strip()
-                    thread_id = str(watch_subscription.get("thread_id") or "").strip()
-                    user_id = (str(watch_subscription.get("user_id") or "").strip() or None)
+                    watch_sub = watch_subscription
+                    platform = str(watch_sub.get("platform") or "").strip().lower()
+                    chat_id = str(watch_sub.get("chat_id") or "").strip()
+                    thread_id = str(watch_sub.get("thread_id") or "").strip()
+                    user_id = (str(watch_sub.get("user_id") or "").strip() or None)
                     delivery_mode = (
-                        str(watch_subscription.get("delivery_mode") or "notification").strip().lower()
+                        str(watch_sub.get("delivery_mode") or "notification").strip().lower()
                         or "notification"
                     )
-                    session_key = str(watch_subscription.get("session_key") or "").strip() or None
+                    session_key = str(watch_sub.get("session_key") or "").strip() or None
                     notifier_profile = (
-                        str(watch_subscription.get("notifier_profile") or "").strip() or None
+                        str(watch_sub.get("notifier_profile") or "").strip() or None
                     )
                     if not platform or not chat_id:
                         raise ValueError("watch subscription platform and chat_id are required")
@@ -6135,6 +6136,9 @@ def rewind_notify_cursor(
     old_cursor: int,
 ) -> bool:
     with write_txn(conn):
+        # CAS rewind: only restore ``old_cursor`` if the row still points at
+        # the claimed range. If another watcher tick already advanced or
+        # unsubscribed the row, leave that newer state untouched.
         cur = conn.execute(
             "UPDATE kanban_notify_subs SET last_event_id = ? "
             "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "

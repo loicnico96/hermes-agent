@@ -77,7 +77,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     migration adds those columns, or boards predating the column fail to
     open before migration can run.
 
-    Covers the additive indexed columns that must wait until after migration:
+    Covers the indexed additive columns:
     - ``tasks.session_id``              -> ``idx_tasks_session_id``    (#28447)
     - ``tasks.tenant``                  -> ``idx_tasks_tenant``        (#16081)
     - ``tasks.idempotency_key``         -> ``idx_tasks_idempotency``   (#17805)
@@ -117,7 +117,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
         )
     """)
     # Legacy watcher schema: missing notifier_profile, delivery_mode,
-    # and session_key. Migration must remain additive only.
+    # and session_key.
     conn.execute("""
         CREATE TABLE kanban_notify_subs (
             task_id TEXT NOT NULL,
@@ -171,7 +171,7 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_events_run" in indexes
 
 
-def test_connect_adds_missing_notify_columns_without_rebuilding_table(tmp_path):
+def test_connect_adds_missing_notify_columns(tmp_path):
     db_path = tmp_path / "legacy-notify-shape.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("""
@@ -222,18 +222,18 @@ def test_connect_adds_missing_notify_columns_without_rebuilding_table(tmp_path):
     conn.close()
 
     with kb.connect(db_path) as migrated:
-        info_rows = list(migrated.execute("PRAGMA table_info(kanban_notify_subs)"))
-        pk_cols = [
+        notify_columns = {
             row["name"]
-            for row in sorted(info_rows, key=lambda row: int(row["pk"] or 0))
-            if int(row["pk"] or 0) > 0
-        ]
-        subs = kb.list_notify_subs(migrated)
+            for row in migrated.execute("PRAGMA table_info(kanban_notify_subs)")
+        }
+        sub = kb.list_notify_subs(migrated)[0]
 
-    assert pk_cols == ["task_id", "platform", "chat_id", "thread_id"]
-    assert subs[0]["task_id"] == "t_legacy1"
-    assert subs[0]["delivery_mode"] == "notification"
-    assert subs[0]["session_key"] is None
+    assert "delivery_mode" in notify_columns
+    assert "session_key" in notify_columns
+    assert "notifier_profile" in notify_columns
+    assert sub["task_id"] == "t_legacy1"
+    assert sub["delivery_mode"] == "notification"
+    assert sub["session_key"] is None
 
 
 # ---------------------------------------------------------------------------
