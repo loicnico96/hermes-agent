@@ -412,14 +412,14 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
         assert kb.get_task(conn, child).status == "ready"
 
 
-def test_non_terminal_status_helpers_do_not_route_through_approval_reset_hook(kanban_home, monkeypatch):
-    calls: list[tuple[str | None, str]] = []
+def test_non_owner_status_helpers_do_not_prepare_approval_reset(kanban_home, monkeypatch):
+    calls: list[str] = []
 
-    def fake_hook(conn, task_id, *, old_status, new_status):
+    def fake_hook(conn, task_id):
         assert task_id
-        calls.append((old_status, new_status))
+        calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_handle_task_status_transition_approval_reset", fake_hook)
+    monkeypatch.setattr(kb, "_prepare_task_approvals_for_new_completion_cycle", fake_hook)
 
     with kb.connect() as conn:
         scheduled = kb.create_task(conn, title="scheduled", assignee="ops")
@@ -432,31 +432,54 @@ def test_non_terminal_status_helpers_do_not_route_through_approval_reset_hook(ka
         triage = kb.create_task(conn, title="triage", triage=True)
         assert kb.specify_triage_task(conn, triage, title="triage", assignee="ops") is True
 
+        ready = kb.create_task(conn, title="ready", assignee="ops")
+        assert kb.claim_task(conn, ready, claimer="host:ops") is not None
+        assert kb.reclaim_task(conn, ready, reason="stop") is True
+
+        parent = kb.create_task(conn, title="parent", assignee="ops")
+        _set_task_status(conn, parent, "done")
+        child = kb.create_task(conn, title="child", assignee="ops", parents=[parent])
+        _set_task_status(conn, child, "blocked")
+        assert kb.recompute_ready(conn) == 1
+
     assert calls == []
 
 
-def test_terminal_status_helpers_route_through_approval_reset_hook(kanban_home, monkeypatch):
-    calls: list[tuple[str | None, str]] = []
+def test_complete_task_owns_completion_cycle_approval_reset_preparation(kanban_home, monkeypatch):
+    calls: list[str] = []
 
-    def fake_hook(conn, task_id, *, old_status, new_status):
+    def fake_hook(conn, task_id):
         assert task_id
-        calls.append((old_status, new_status))
+        calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_handle_task_status_transition_approval_reset", fake_hook)
+    monkeypatch.setattr(kb, "_prepare_task_approvals_for_new_completion_cycle", fake_hook)
 
     with kb.connect() as conn:
         completed = kb.create_task(conn, title="completed", assignee="ops")
-        archived = kb.create_task(conn, title="archived", assignee="ops")
-
         assert kb.complete_task(conn, completed, result="done") is True
-        assert kb.complete_task(conn, archived, result="done") is True
+
+    assert calls == [completed]
+
+
+def test_archive_task_is_not_an_approval_reset_owner(kanban_home, monkeypatch):
+    calls: list[str] = []
+
+    def fake_hook(conn, task_id):
+        assert task_id
+        calls.append(task_id)
+
+    monkeypatch.setattr(kb, "_prepare_task_approvals_for_new_completion_cycle", fake_hook)
+
+    with kb.connect() as conn:
+        archived = kb.create_task(conn, title="archived", assignee="ops")
+        _set_task_status(conn, archived, "done")
+
+        # Archive is still inside the approval-bearing domain, so it must not
+        # inherit completion-cycle reset behavior just because it touches a
+        # terminal-looking status.
         assert kb.archive_task(conn, archived) is True
 
-    assert calls == [
-        ("ready", "done"),
-        ("ready", "done"),
-        ("done", "archived"),
-    ]
+    assert calls == []
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
