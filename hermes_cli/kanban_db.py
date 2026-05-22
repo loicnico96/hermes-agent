@@ -2005,8 +2005,11 @@ def create_task_approval(
     now = int(time.time())
 
     with write_txn(conn):
-        if not conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+        task = get_task(conn, task_id)
+        if task is None:
             raise ValueError(f"unknown task {task_id}")
+        if task.status in {"done", "archived"}:
+            raise ValueError(f"cannot add approvals to tasks in status {task.status}")
         comment_id = _validate_task_comment_reference(
             conn, task_id=task_id, comment_id=comment_id
         )
@@ -2058,15 +2061,18 @@ def get_task_approval(conn: sqlite3.Connection, approval_id: int) -> Optional[Ap
     return Approval.from_row(row) if row else None
 
 
-def list_task_approvals(
+def list_approvals(
     conn: sqlite3.Connection,
-    task_id: str,
     *,
+    task_id: Optional[str] = None,
     status: Optional[str] = None,
     approver_type: Optional[str] = None,
 ) -> list[Approval]:
-    query = "SELECT * FROM task_approvals WHERE task_id = ?"
-    params: list[Any] = [task_id]
+    query = "SELECT * FROM task_approvals WHERE 1 = 1"
+    params: list[Any] = []
+    if task_id is not None:
+        query += " AND task_id = ?"
+        params.append(task_id)
     if status is not None:
         query += " AND status = ?"
         params.append(_validate_approval_status(status))
@@ -2077,9 +2083,28 @@ def list_task_approvals(
             )
         query += " AND approver_type = ?"
         params.append(approver_type)
-    query += " ORDER BY created_at ASC, id ASC"
+
+    if task_id is None:
+        query += " ORDER BY task_id ASC, created_at ASC, id ASC"
+    else:
+        query += " ORDER BY created_at ASC, id ASC"
     rows = conn.execute(query, params).fetchall()
     return [Approval.from_row(row) for row in rows]
+
+
+def list_task_approvals(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: Optional[str] = None,
+    approver_type: Optional[str] = None,
+) -> list[Approval]:
+    return list_approvals(
+        conn,
+        task_id=task_id,
+        status=status,
+        approver_type=approver_type,
+    )
 
 
 def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:

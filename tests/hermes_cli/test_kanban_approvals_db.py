@@ -103,6 +103,19 @@ def test_create_task_approval_rejects_unknown_task_and_cross_task_comment(kanban
             )
 
 
+@pytest.mark.parametrize("status", ["done", "archived"])
+def test_create_task_approval_rejects_terminal_tasks(kanban_home, status):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"{status} target")
+        if status == "done":
+            assert kb.complete_task(conn, task_id, result="finished") is True
+        else:
+            assert kb.archive_task(conn, task_id) is True
+
+        with pytest.raises(ValueError, match=f"cannot add approvals to tasks in status {status}"):
+            kb.create_task_approval(conn, task_id=task_id, approver_type="human")
+
+
 def test_create_task_approval_enforces_human_and_agent_uniqueness(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target")
@@ -141,6 +154,36 @@ def test_create_task_approval_enforces_human_and_agent_uniqueness(kanban_home):
                 approver_profile="Reviewer",
                 approver_skill="security-review",
             )
+
+
+def test_list_approvals_supports_board_wide_filters(kanban_home):
+    with kb.connect() as conn:
+        first_task_id = kb.create_task(conn, title="first target")
+        second_task_id = kb.create_task(conn, title="second target")
+
+        first_human = kb.create_task_approval(conn, task_id=first_task_id, approver_type="human")
+        first_agent = kb.create_task_approval(
+            conn,
+            task_id=first_task_id,
+            approver_type="agent",
+            approver_profile="reviewer-a",
+            status="running",
+        )
+        second_agent = kb.create_task_approval(
+            conn,
+            task_id=second_task_id,
+            approver_type="agent",
+            approver_profile="reviewer-b",
+            status="approved",
+        )
+
+        all_rows = kb.list_approvals(conn)
+        agent_rows = kb.list_approvals(conn, approver_type="agent")
+        running_rows = kb.list_approvals(conn, status="running")
+
+    assert [approval.id for approval in all_rows] == [first_human.id, first_agent.id, second_agent.id]
+    assert [approval.id for approval in agent_rows] == [first_agent.id, second_agent.id]
+    assert [approval.id for approval in running_rows] == [first_agent.id]
 
 
 def test_create_task_approval_run_inserts_agent_runs(kanban_home):
