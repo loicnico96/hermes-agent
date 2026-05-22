@@ -383,3 +383,45 @@ def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home,
     assert untouched.consecutive_failures == 2
     assert untouched.last_failure_error == "keep me"
     assert untouched.updated_at == 6_100
+
+
+@pytest.mark.parametrize(
+    ("statuses", "expected_status"),
+    [
+        ([], "done"),
+        (["requested"], "approving"),
+        (["approved"], "done"),
+        (["approved", "approved"], "done"),
+        (["approved", "requested"], "approving"),
+        (["approved", "rejected"], "todo"),
+        (["escalated", "approved"], "done"),
+        (["failed", "approved"], "done"),
+        (["failed", "requested"], "approving"),
+    ],
+)
+def test_compute_task_approval_aggregate_status(kanban_home, statuses, expected_status):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="aggregate target")
+        approvals = []
+        for index, status in enumerate(statuses):
+            if index == 0:
+                approvals.append(
+                    kb.create_task_approval(
+                        conn,
+                        task_id=task_id,
+                        approver_type="human",
+                        status=status,
+                    )
+                )
+            else:
+                approvals.append(
+                    kb.create_task_approval(
+                        conn,
+                        task_id=task_id,
+                        approver_type="agent",
+                        approver_profile=f"reviewer-{index}",
+                        status=status,
+                    )
+                )
+
+    assert kb._compute_task_approval_aggregate_status(approvals) == expected_status
