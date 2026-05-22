@@ -2266,7 +2266,7 @@ def _reset_task_approvals_for_task(
 def _prepare_task_approvals_for_new_completion_cycle(
     conn: sqlite3.Connection,
     task_id: str,
-) -> list[Approval]:
+) -> None:
     """Successful worker completion owns the fresh-result reset boundary.
 
     Phase 2 intentionally keeps reset ownership attached to the concrete
@@ -2285,16 +2285,7 @@ def _prepare_task_approvals_for_new_completion_cycle(
     every row back to ``requested`` before the task can re-enter the approval
     domain for the freshly produced result.
     """
-    approvals = list_task_approvals(conn, task_id)
-    if not approvals:
-        return []
-
-    reset_count = _reset_task_approvals_for_task(conn, task_id)
-    if reset_count != len(approvals):
-        raise AssertionError(
-            "approval reset drifted from attached approval count during completion cycle"
-        )
-    return list_task_approvals(conn, task_id)
+    _reset_task_approvals_for_task(conn, task_id)
 
 
 def _compute_task_approval_aggregate_status(
@@ -2313,24 +2304,6 @@ def _compute_task_approval_aggregate_status(
     if "requested" in statuses:
         return "approving"
     return "done"
-
-
-def _resolve_task_approval_aggregate_for_completion(
-    conn: sqlite3.Connection,
-    task_id: str,
-) -> str:
-    """Resolve post-completion task status from the authoritative approval set.
-
-    Successful task completion is the semantic boundary that creates a fresh
-    result. Any attached approval rows must therefore be reset first so stale
-    decision state cannot silently approve the new output.
-    """
-    approvals = _prepare_task_approvals_for_new_completion_cycle(conn, task_id)
-    if approvals:
-        return _compute_task_approval_aggregate_status(approvals)
-    return "done"
-
-
 def create_task_approval_run(
     conn: sqlite3.Connection,
     *,
@@ -3484,16 +3457,10 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
-        task_row = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if task_row is None or task_row["status"] not in {"running", "ready", "blocked"}:
-            return False
-        if expected_run_id is not None and task_row["current_run_id"] != int(expected_run_id):
-            return False
-
-        next_status = _resolve_task_approval_aggregate_for_completion(conn, task_id)
+        # Successful worker completion owns the fresh-result reset boundary.
+        # If approvals are attached, the new task result must enter a fresh
+        # approval cycle instead of reusing stale approval state.
+        next_status = "approving" if list_task_approvals(conn, task_id) else "done"
 
         if expected_run_id is None:
             cur = conn.execute(
@@ -3506,6 +3473,7 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
                 """,
                 (next_status, result, now, task_id),
             )
@@ -3520,12 +3488,15 @@ def complete_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
+                   AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
                 (next_status, result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
+        if next_status == "approving":
+            _prepare_task_approvals_for_new_completion_cycle(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",

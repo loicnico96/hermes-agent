@@ -446,7 +446,7 @@ def test_non_owner_status_helpers_do_not_prepare_approval_reset(kanban_home, mon
     assert calls == []
 
 
-def test_complete_task_owns_completion_cycle_approval_reset_preparation(kanban_home, monkeypatch):
+def test_complete_task_prepares_completion_cycle_only_when_approvals_exist(kanban_home, monkeypatch):
     calls: list[str] = []
 
     def fake_hook(conn, task_id):
@@ -456,10 +456,14 @@ def test_complete_task_owns_completion_cycle_approval_reset_preparation(kanban_h
     monkeypatch.setattr(kb, "_prepare_task_approvals_for_new_completion_cycle", fake_hook)
 
     with kb.connect() as conn:
-        completed = kb.create_task(conn, title="completed", assignee="ops")
-        assert kb.complete_task(conn, completed, result="done") is True
+        no_approval_task = kb.create_task(conn, title="no approval", assignee="ops")
+        assert kb.complete_task(conn, no_approval_task, result="done") is True
 
-    assert calls == [completed]
+        approval_task = kb.create_task(conn, title="with approval", assignee="ops")
+        kb.create_task_approval(conn, task_id=approval_task, approver_type="human")
+        assert kb.complete_task(conn, approval_task, result="done") is True
+
+    assert calls == [approval_task]
 
 
 def test_archive_task_is_not_an_approval_reset_owner(kanban_home, monkeypatch):
