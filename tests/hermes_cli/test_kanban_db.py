@@ -793,16 +793,17 @@ def test_complete_records_result(kanban_home):
 
 
 @pytest.mark.parametrize(
-    ("approver_type", "approval_kwargs"),
+    ("approver_type", "approval_kwargs", "initial_status"),
     [
-        ("human", {}),
-        ("agent", {"approver_profile": "reviewer"}),
+        ("human", {}, "approved"),
+        ("agent", {"approver_profile": "reviewer"}, "failed"),
     ],
 )
 def test_complete_task_with_approvals_resets_rows_and_enters_approving(
     kanban_home,
     approver_type,
     approval_kwargs,
+    initial_status,
 ):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title=f"{approver_type} approval target", assignee="ops")
@@ -811,7 +812,7 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approving(
             conn,
             task_id=task_id,
             approver_type=approver_type,
-            status="failed",
+            status=initial_status,
             comment_id=comment_id,
             **approval_kwargs,
         )
