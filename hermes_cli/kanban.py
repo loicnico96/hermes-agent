@@ -508,6 +508,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_approval_list.add_argument("--json", action="store_true")
 
+    p_approval_remove = approval_sub.add_parser("remove", help="Remove one approval row")
+    p_approval_remove.add_argument("approval_id", type=int)
+    p_approval_remove.add_argument("--json", action="store_true")
+
+    p_approval_reset = approval_sub.add_parser("reset", help="Reset one approval row back to requested")
+    p_approval_reset.add_argument("approval_id", type=int)
+    p_approval_reset.add_argument("--json", action="store_true")
+
     # --- assign ---
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
@@ -1097,12 +1105,16 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 def _dispatch_approval(args: argparse.Namespace) -> int:
     sub = getattr(args, "approval_action", None)
     if not sub:
-        print("kanban approval: specify a subcommand (add, list)", file=sys.stderr)
+        print("kanban approval: specify a subcommand (add, list, remove, reset)", file=sys.stderr)
         return 2
     if sub == "add":
         return _cmd_approval_add(args)
     if sub == "list":
         return _cmd_approval_list(args)
+    if sub == "remove":
+        return _cmd_approval_remove(args)
+    if sub == "reset":
+        return _cmd_approval_reset(args)
     print(f"kanban approval: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1578,6 +1590,45 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
     include_task_id = task_id is None
     for approval in approvals:
         print(_format_approval_line(approval, include_task_id=include_task_id))
+    return 0
+
+
+def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, Any]:
+    task = kb.get_task(conn, approval.task_id)
+    assert task is not None
+    return {
+        "approval": _approval_to_dict(approval),
+        "task_status": task.status,
+    }
+
+
+def _cmd_approval_remove(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        approval = kb.remove_task_approval(conn, args.approval_id)
+        payload = _approval_mutation_payload(conn, approval)
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Removed approval #{approval.id} from {approval.task_id}; "
+            f"task status is now {payload['task_status']}"
+        )
+    return 0
+
+
+def _cmd_approval_reset(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        approval = kb.reset_task_approval(conn, args.approval_id)
+        payload = _approval_mutation_payload(conn, approval)
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Reset approval #{approval.id} on {approval.task_id} to requested; "
+            f"task status remains {payload['task_status']}"
+        )
     return 0
 
 

@@ -2777,13 +2777,53 @@ def list_task_approvals(
     )
 
 
+_OPERATOR_RESETTABLE_APPROVAL_STATUSES = {"running", "approved", "rejected", "escalated", "failed"}
+
+
+def remove_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
+    with write_txn(conn):
+        approval = get_task_approval(conn, approval_id)
+        if approval is None:
+            raise ValueError(f"unknown approval {approval_id}")
+
+        task = get_task(conn, approval.task_id)
+        assert task is not None
+
+        conn.execute("DELETE FROM task_approval_runs WHERE approval_id = ?", (approval.id,))
+        deleted = conn.execute("DELETE FROM task_approvals WHERE id = ?", (approval.id,))
+        assert deleted.rowcount == 1
+
+        if task.status == "approving":
+            remaining = list_task_approvals(conn, approval.task_id)
+            _apply_task_approval_aggregate_transition(
+                conn,
+                approval.task_id,
+                approvals=remaining,
+            )
+
+        return approval
+
+
 def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
     now = int(time.time())
 
     with write_txn(conn):
-        cur = _reset_task_approval_row(conn, approval_id=int(approval_id), now=now)
-        if cur.rowcount != 1:
+        approval = get_task_approval(conn, approval_id)
+        if approval is None:
             raise ValueError(f"unknown approval {approval_id}")
+
+        task = get_task(conn, approval.task_id)
+        assert task is not None
+        if task.status != "approving":
+            raise ValueError("parent task must be approving")
+        if approval.status not in _OPERATOR_RESETTABLE_APPROVAL_STATUSES:
+            raise ValueError(
+                "reset only supports statuses "
+                f"{sorted(_OPERATOR_RESETTABLE_APPROVAL_STATUSES)}"
+            )
+
+        cur = _reset_task_approval_row(conn, approval_id=int(approval_id), now=now)
+        assert cur.rowcount == 1
 
         approval = get_task_approval(conn, approval_id)
         assert approval is not None
