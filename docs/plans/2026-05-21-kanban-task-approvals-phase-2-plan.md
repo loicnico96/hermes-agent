@@ -21,12 +21,17 @@ Land the kernel-owned task/approval aggregate state rules so approvals affect ta
 
 This phase must deliver:
 - one authoritative aggregate resolver in kernel code
-- completion-time routing from `running|ready|blocked -> approving` when approval rows exist
+- completion-time routing where successful task-worker completion goes:
+  - directly to `done` when no approval rows exist
+  - to `approving` only after attached approval rows are reset to `requested`
 - exact `approving -> done` behavior from the master spec
 - exact rejection-cycle behavior from the master spec
-- task-state-transition reset wiring for approval rows when a task moves to a status other than `approving`, `done`, or `archived`
+- explicit reset wiring for the only approval-reset boundaries in this slice:
+  - successful task completion
+  - rejection-driven `approving -> todo`
+  - manual movement from `done` / `approving` / `archived` to any non-approval-bearing status
 - explicit handling for `escalated` / `failed` as agent opt-out states that do not themselves block `done`
-- guardrails so late or stale approval state cannot incorrectly push a task through the wrong lifecycle path
+- guardrails so stale approval-worker results cannot incorrectly mutate approval/task state
 
 This phase must **not** deliver:
 - `hermes kanban approval ...` CLI commands
@@ -67,10 +72,15 @@ Phase 2 should introduce one kernel helper that owns approval-aware task resolut
 
 Recommended responsibilities for the resolver/helper layer:
 - inspect all approval rows for a task
-- inspect whether any approval run is still active for that task
 - decide whether the task must remain `approving`, move to `done`, or move to `todo`
 - perform rejection-cycle resets transactionally when the task returns to `todo`
 - leave non-approval task semantics unchanged when a task has no approval rows
+
+Authority rule for this phase:
+- approval-row state is the final business authority
+- approval-run rows are execution/audit bookkeeping, not the source of truth for lifecycle resolution
+- only approval rows in `requested` participate in approval decision-making
+- if an approval worker later reports against a row that is no longer `requested`, that result must have no effect
 
 A good shape would be one read helper plus one mutation helper, for example:
 - `_compute_task_approval_aggregate_state(...)`
@@ -80,43 +90,49 @@ Exact names may differ, but the implementation should end with one obvious autho
 
 ## 3.2 Entering `approving`
 
-When `complete_task(...)` finishes normally and the task has one or more approval rows, the task must go to `approving`, not `done`.
+When `complete_task(...)` finishes normally:
+- if the task has no approval rows, it moves directly to `done`
+- if the task has one or more approval rows, reset all attached approval rows to `requested` and then move the task to `approving`
 
 Important details:
 - the worker/completion path does not decide whether approvals are required based on worker output
 - the kernel checks for attached approval rows
-- this rule applies even if all rows currently happen to be `approved`; completion routing still goes through the aggregate helper so later transitions are not split across codepaths
+- resetting to `requested` on successful completion is deliberate, even if the rows already happen to be `requested`
+- any previously non-requested approval state from an older completion cycle must not be reused as if it approved the newly finished task result
+
+This preserves one explicit semantic boundary:
+- successful task-worker completion means “a fresh result now exists, so attached approvers must be re-requested before approval begins”
 
 ## 3.3 While unresolved approvals exist
 
-A task must remain `approving` while any approval row is:
-- `requested`
-- `escalated`
-- `failed`
+A task must remain `approving` while any approval row is `requested`.
 
-A task must also remain `approving` while any approval run for that task is still active, even if a rejection has already been recorded.
-
-For Phase 2, “active approval run” should be derived from persisted approval-run state, not from future dispatcher assumptions.
+Important clarifications:
+- `escalated` and `failed` are opt-out states for agent approval rows and do not themselves block movement
+- `approved` is satisfied
+- `rejected` triggers the rejection-cycle path described below
+- the blocking human gate in escalation/failure flows is the human approval row that remains `requested`, not the original `escalated` / `failed` agent row
 
 ## 3.4 Rejection cycle
 
 If any approval row is `rejected`, the resolver must implement the full rejection cycle from the master spec:
 1. rejection is recorded first
-2. task stays `approving` while any approval run for that task is still active
-3. after the last active approval run finishes, task transitions from `approving` to `todo`
-4. in that same transaction, reset all approval rows to `requested`
-5. in that same transaction, clear each row’s `comment_id`
-6. in that same transaction, clear each row’s consecutive-failure state
+2. task transitions from `approving` to `todo`
+3. in that same transaction, reset all approval rows to `requested`
+4. in that same transaction, clear each row’s `comment_id`
+5. in that same transaction, clear each row’s consecutive-failure state
 
-Preserve the distinction between:
-- “rejection exists, but another approval run is still live” -> task stays `approving`
-- “rejection exists, and no approval run is still live” -> task goes to `todo` and all approval rows reset immediately in the same transaction
+Important clarifications:
+- Phase 2 should not grant business authority to “some approval run is still active” after a rejection has already been recorded
+- in the intended model, an approval result is only applied when the corresponding approval row is still `requested`
+- if a stale worker later reports against a row that has already been moved out of `requested`, that late result is discarded and does not alter task or approval state
+- explicit/early cancellation of the stale worker is not required in v1
 
 ## 3.5 Done rule
 
 A task may move from `approving` to `done` only when:
-- there is no approval row in `requested` or `rejected`
-- there is no active approval run
+- there is no approval row in `requested`
+- there is no approval row in `rejected`
 - every remaining approval row is in `approved`, `escalated`, or `failed`
 
 Critical implications to preserve:
@@ -127,16 +143,16 @@ Critical implications to preserve:
 
 ## 3.6 Reset-on-task-transition rule
 
-Approval rows must be reset whenever a task moves to a status other than `approving`, `done`, or `archived`.
+Approval reset boundaries in this slice are only:
+1. successful task completion
+2. rejection-driven `approving -> todo`
+3. manual movement from one of `done` / `approving` / `archived` to any non-approval-bearing status
 
-In practice, Phase 2 should wire this through a centralized task-status transition path rather than trying to remember it ad hoc in scattered helpers.
+Do not specify a broader generic rule like “every transition outside approving/done/archived resets approvals.” The reset contract should stay attached to those explicit semantic boundaries.
 
-This rule matters for transitions such as:
-- `approving -> todo`
-- `approving -> ready` if such a path exists internally
-- `approving -> blocked`
-- `approving -> scheduled`
-- any later manual/internal status mutation that exits approval mode without archiving or terminalizing
+Important distinctions to preserve:
+- successful task-worker completion is approval-aware and may route to `done` or `approving` depending on whether approval rows exist
+- an explicit manual move to `done` is a pure override and must not invent a fresh approval cycle or route through `approving`
 
 The Phase 1 placeholder hook in `_handle_task_status_transition_approval_reset(...)` should become real in this phase.
 
@@ -161,40 +177,70 @@ Goal:
 - identify which codepaths must route through the new aggregate/reset authority
 - avoid leaving one stray direct transition that silently skips approval reset semantics
 
-## Task 2 — Replace the Phase 1 placeholder with real approval-reset transition wiring
+## Task 2 — Replace the Phase 1 placeholder with explicit per-operation reset ownership
 
-Turn `_handle_task_status_transition_approval_reset(...)` into a real kernel operation.
+Do **not** introduce a new generic centralized “task status A -> status B” approval-reset helper. Hermes does not currently have one shared status-transition function for tasks, and this phase should not invent one just to carry approval semantics.
+
+Instead, wire approval reset only in the concrete operations that actually own one of the explicit reset boundaries.
 
 Implementation requirements:
 - no-op when status does not change
-- no-op when new status is one of `approving`, `done`, or `archived`
-- otherwise bulk-reset all approval rows for that task using the first-class reset semantics from Phase 1
+- no-op for ordinary non-boundary status transitions that do not cross an explicit approval reset boundary
+- bulk-reset all approval rows only in the concrete operations that own the three explicit boundaries:
+  - successful completion with attached approval rows
+  - rejection-driven return to `todo`
+  - manual movement from `done` / `approving` / `archived` to a non-approval-bearing status
 - preserve transaction boundaries so the task-status change and approval reset happen atomically when they belong to the same mutation flow
 
+Concrete function ownership for this phase:
+- `complete_task(...)`
+  - owns the “successful task completion” reset boundary
+  - if approval rows exist, it resets them to `requested` and moves the task to `approving`
+- the approval-result application/finalization helper introduced or extended in this phase
+  - owns the rejection-driven `approving -> todo` reset boundary
+  - when a `rejected` result is authoritatively recorded, it resets approval rows in the same transaction as the task move back to `todo`
+- any explicit/manual status override helper that can move a task out of `done`, `approving`, or `archived` into a non-approval-bearing status
+  - today this may be no existing function at all; if such a helper already exists or is added later, that exact helper must own the reset itself
+
+Concrete functions that should **not** care about approval reset in this phase **as currently implemented** because their allowed source statuses do not cross the defined reset boundaries:
+- `recompute_ready(...)`
+- `claim_task(...)`
+- `reclaim_task(...)`
+- `block_task(...)` in its current `running|ready -> blocked` shape
+- `unblock_task(...)` in its current `blocked|scheduled -> ready|todo` shape
+- `archive_task(...)` because `archived` is itself approval-bearing
+- `schedule_task(...)` in its current `todo|ready|running|blocked -> scheduled` shape
+- normal create/specify/promote/spawn flows
+
+Important qualification:
+- this is a statement about the **current allowed source statuses**, not a permanent exemption by function name
+- if a helper such as `block_task(...)`, `schedule_task(...)`, or another status mutator later becomes allowed to move a task out of `done`, `approving`, or `archived` into a non-approval-bearing status, that exact helper becomes an approval-reset owner for that path
+
 Recommended refinement:
-- introduce a task-scoped bulk reset helper rather than looping through `reset_task_approval(...)` one row at a time inside nested write transactions
-- keep the single-row `reset_task_approval(...)` helper as the canonical row-level primitive, but add an internal bulk version for transactional task transitions
+- introduce a task-scoped internal bulk reset primitive rather than looping through `reset_task_approval(...)` one row at a time inside nested write transactions
+- keep the single-row `reset_task_approval(...)` helper as the canonical row-level primitive
+- do **not** let that bulk primitive turn into a generic all-status-transition router; it should be called only from the concrete owning operations above
 
 ## Task 3 — Introduce one authoritative aggregate resolver helper
 
-Add a dedicated internal resolver in `hermes_cli/kanban_db.py` that computes the correct task outcome from current approval rows plus approval-run activity.
+Add a dedicated internal resolver in `hermes_cli/kanban_db.py` that computes the correct task outcome from current approval rows.
 
 Minimum inputs:
 - `task_id`
 - current task status
 - current approval rows for the task
-- whether any approval run is still active
 
 Minimum outputs/behaviors:
 - “stay `approving`”
 - “move to `done`”
 - “move to `todo` and reset approvals now”
-- “no approval effect because no approval rows exist”
+- “while already in `approving`, no approval rows remain, so move to `done`”
 
 Implementation notes:
 - treat the master spec’s aggregate rules as the only truth source
 - do not encode CLI-specific policy in this helper
 - do not couple it to future dispatcher spawning logic
+- keep run-liveness/stale-result handling outside the aggregate decision itself except where needed to reject stale finalization attempts transactionally
 
 ## Task 4 — Wire `complete_task(...)` through the aggregate resolver
 
@@ -202,34 +248,36 @@ Update `complete_task(...)` so completion does not hardcode `done` when approval
 
 Concrete behavior change:
 - if no approval rows exist, retain current `-> done` behavior
-- if one or more approval rows exist, persist `-> approving` instead
-- after the row update, run the aggregate resolver inside the same write transaction so the persisted terminal state is consistent with current approval rows and approval-run activity
+- if one or more approval rows exist, reset them all to `requested` in the same transaction and persist `-> approving`
+- keep this completion path distinct from explicit manual `done` commands; only successful task-worker completion should invoke this approval-aware routing
 
 Important guardrails:
 - preserve existing run-closing/result-recording behavior as much as possible
 - preserve non-approval completion behavior for boards that never use approvals
 - do not let the result summary / metadata write path fork approval semantics in a second location
 
-## Task 5 — Implement approval-run activity checks for aggregate resolution
+## Task 5 — Tighten stale-result finalization semantics around row ownership
 
-Phase 2 is not adding approval-run execution, but the resolver still needs a persisted definition of “active approval run” for rejection-cycle tests and later phases.
+Phase 2 is not adding approval-run execution, but it should lock down the business rule that approval results only apply while the approval row is still in the live request state for the same run.
 
 Implementation work:
-- add a small internal helper that answers whether the task currently has any active approval runs
-- base it on `task_approval_runs.status` and/or `task_approvals.current_run_id` in a way that is compatible with the runtime spec’s future statuses
-- document in code which statuses are considered active in Phase 2
+- define the finalization/update shape so an approval result is applied only by transactionally updating the same approval row/run pair it still owns
+- require the write to match at least:
+  - the target approval row id
+  - `status = 'requested'`
+  - the corresponding `current_run_id` (or equivalent run-ownership marker)
+- if that conditional write matches no row, treat the result as stale/discarded with no business effect
 
-Recommended active set for planning purposes:
-- treat `task_approval_runs.status='running'` as active
-- avoid prematurely treating terminal statuses (`approved`, `rejected`, `escalated`, `failed`, `crashed`, `timed_out`, `reclaimed`, `spawn_failed`) as active
+This is tighter than a generic “discard if status is no longer requested” rule because it binds the finalization to both:
+- the live approval-row state
+- the exact run that still owns the row
 
 ## Task 6 — Encode the rejection-cycle resolver path
 
 Implement the branch where a task with one or more `rejected` approvals is resolved.
 
 Required semantics:
-- if any approval run is still active, task stays `approving`
-- once no approval run is active, task becomes `todo`
+- once a rejection is authoritatively recorded on a row, task becomes `todo`
 - in the same transaction as that `todo` transition, all approval rows are bulk-reset to `requested`
 - reset must clear `comment_id`, claim fields, `current_run_id`, `consecutive_failures`, and `last_failure_error`
 
@@ -242,28 +290,31 @@ Implement the branch where the task can finish approval.
 Required semantics:
 - `approved` rows are satisfied
 - `escalated` / `failed` rows remain present but are treated as opted out
-- task may reach `done` only when there is no `requested`, no `rejected`, and no active approval run
+- task may reach `done` only when there is no `requested` and no `rejected`
 - if the approval set becomes empty while task is `approving`, resolver moves the task to `done`
 
 Be explicit in tests and code comments that the master spec wins here: `escalated` / `failed` do not themselves block `done`; the human approval row created on top is the real blocking gate.
 
-## Task 8 — Route all non-terminal status transitions through the reset hook
+## Task 8 — Route only the explicit manual exit boundaries through the owning operations
 
-After the resolver exists, update the rest of the task-status mutation helpers so any transition out of `approving` into a non-`approving` / non-`done` / non-`archived` state triggers approval reset.
+After the resolver exists, update only the concrete status-mutation operations that actually can manually move a task from one of `done` / `approving` / `archived` to a non-approval-bearing status.
 
 Likely cases to cover:
-- reclaim/demotion helpers that set `todo` or `ready`
-- block/unblock paths
-- scheduling/promote/demote paths if they can touch an `approving` task
+- explicit/manual CLI-facing status mutation helpers that can move a task out of `done`, `approving`, or `archived`
+- recovery/admin helpers that can force a task back into `todo`, `ready`, `blocked`, or `scheduled`
 
-The goal is not to add new user-visible flows, but to make the invariant true regardless of which internal codepath performs the status change.
+Important implementation note:
+- if no such helper currently exists, do not invent one in Phase 2 just to satisfy the plan
+- instead, document that the boundary is part of the contract and must be implemented in the exact operation that eventually provides that manual move
+
+Do not broaden this into “all non-terminal transitions reset approvals.” Keep it attached to the explicit manual exit boundaries above.
 
 ## Task 9 — Add narrow defensive assertions around impossible state combinations
 
 Add low-cost guardrails in the resolver/helper layer for cases that would otherwise hide semantic drift, for example:
-- task in `done` with a still-active approval run
-- task in `approving` with zero approvals and no active approval run after recompute
-- task leaving `approving` without routing through the reset hook
+- task in `approving` with zero approvals after recompute
+- a completion path that enters `approving` without first resetting attached approvals to `requested`
+- a stale approval result attempting to finalize a row/run pair it no longer owns
 
 Do not add speculative recovery logic. Assertions or tightly-scoped normalization are enough if they make tests clearer and reduce future drift.
 
@@ -275,9 +326,10 @@ Do not add speculative recovery logic. Assertions or tightly-scoped normalizatio
 
 Add tests covering:
 - completing a task with no approval rows still ends in `done`
-- completing a task with a human approval row ends in `approving`
-- completing a task with an agent approval row ends in `approving`
+- completing a task with a human approval row resets that row to `requested` and ends in `approving`
+- completing a task with an agent approval row resets that row to `requested` and ends in `approving`
 - completion still records result/run history correctly when the terminal task status becomes `approving` instead of `done`
+- explicit manual move to `done` does not invent or re-trigger an approval cycle
 
 Likely file:
 - `tests/hermes_cli/test_kanban_db.py`
@@ -285,7 +337,8 @@ Likely file:
 ## 5.2 Aggregate `approving -> done` resolution
 
 Add tests covering:
-- `approving` task with all approvals `approved` and no active approval runs resolves to `done`
+- `approving` task with no approval rows resolves to `done`
+- `approving` task with all approvals `approved` resolves to `done`
 - `approving` task with one `approved` agent row plus one `approved` human row resolves to `done`
 - `approving` task with `escalated` or `failed` agent row plus approved human gate resolves to `done`
 - `approving` task with last approval row removed resolves to `done`
@@ -297,33 +350,43 @@ Likely file:
 ## 5.3 Rejection-cycle behavior
 
 Add tests covering:
-- one approval row becomes `rejected` while another approval run is still active -> task remains `approving`
-- once the last active approval run is no longer active, the same task resolves to `todo`
+- one approval row becomes `rejected` -> task immediately moves from `approving` to `todo`
 - the `approving -> todo` transition resets all approval rows in the same transaction
 - after reset, all rows are back to `requested`
 - after reset, all `comment_id` values are cleared
 - after reset, all failure counters and last-failure errors are cleared
+- a stale later result for the old run has no effect after the rejection/reset has already happened
 
 This is the most important semantic test cluster in Phase 2.
 
-## 5.4 Reset-on-task-transition coverage
+## 5.4 Reset-boundary coverage
 
-Add tests proving approval rows reset whenever the task leaves `approving`, `done`, or `archived` for another state.
+Add tests proving approval rows reset only at the explicit boundaries described above.
 
 Minimum scenarios:
-- direct/internal `approving -> todo` path triggers reset
-- internal `approving -> blocked` path triggers reset if such a transition helper exists
-- transitions into `done` and `archived` do **not** reset
+- successful completion with approvals triggers reset-to-requested before entering `approving`
+- rejection-driven `approving -> todo` triggers reset
+- manual move from `approving` to `todo` triggers reset if that helper exists
+- manual move from `done` to `todo` or `ready` triggers reset if that helper exists
+- transitions into `done` and `archived` do **not** themselves reset as a generic side effect
 - transitions that never changed status do not reset
 
 ## 5.5 Opt-out semantics for `escalated` / `failed`
 
 Add tests proving:
-- `escalated` alone keeps the task in `approving` while the human gate is unresolved
-- `failed` alone keeps the task in `approving` while the human gate is unresolved
-- once the human gate is approved and no run is active, `escalated` / `failed` rows remaining in place do not block `done`
+- `escalated` alone does not block `done`; the unresolved blocker is the human gate row that remains `requested`
+- `failed` alone does not block `done`; the unresolved blocker is the human gate row that remains `requested`
+- once the human gate is approved, remaining `escalated` / `failed` agent rows do not block `done`
 
-## 5.6 No-regression coverage for boards without approvals
+## 5.6 Stale-result ownership enforcement
+
+Add tests proving:
+- a finalization attempt succeeds only when the approval row is still `requested` and still owned by the same `current_run_id`
+- if the row status is no longer `requested`, the result is discarded
+- if `current_run_id` no longer matches, the result is discarded
+- discarded stale results do not alter task status, approval status, or audit-facing live row state
+
+## 5.7 No-regression coverage for boards without approvals
 
 Run or extend existing tests around:
 - normal completion
@@ -357,8 +420,8 @@ Recommended targeted sweep during implementation:
 
 ```bash
 cd /home/hermes/worktrees/hermes-agent/kanban-task-approvals-20260521
-pytest tests/hermes_cli/test_kanban_db.py -k "complete or archive or reclaim or approving" -q
-pytest tests/hermes_cli/test_kanban_approvals_db.py -k "approval and (done or rejected or escalated or failed or reset)" -q
+pytest tests/hermes_cli/test_kanban_db.py -k "complete or archive or reclaim or approving or done" -q
+pytest tests/hermes_cli/test_kanban_approvals_db.py -k "approval and (done or rejected or escalated or failed or reset or stale)" -q
 ```
 
 ---
@@ -366,15 +429,15 @@ pytest tests/hermes_cli/test_kanban_approvals_db.py -k "approval and (done or re
 ## 7. Phase 2 exit criteria
 
 Phase 2 is complete only when all of the following are true:
-- `complete_task(...)` sends approval-bearing tasks to `approving`, not directly to `done`
+- successful `complete_task(...)` sends tasks with no approval rows directly to `done`
+- successful `complete_task(...)` sends approval-bearing tasks to `approving` only after resetting attached approvals to `requested`
 - one authoritative kernel helper owns approval-aware task aggregate resolution
-- a task remains `approving` while any approval row is `requested`, `escalated`, or `failed`
-- a task remains `approving` while any approval run for that task is active
-- a `rejected` approval does not move the task to `todo` until the final active approval run finishes
-- the eventual `approving -> todo` rejection transition resets all approval rows in the same transaction
+- a task remains `approving` only while at least one approval row is still `requested`
+- a `rejected` approval moves the task back to `todo` and resets approval rows in the same transaction
 - a task moves to `done` only under the exact master-spec rule set
 - `escalated` / `failed` are treated as opt-out agent rows and do not independently block `done`
-- approval rows reset whenever a task moves to a status other than `approving`, `done`, or `archived`
+- manual `done` remains an explicit override and does not invent a fresh approval cycle
+- stale approval results can finalize only when they still own a `requested` row via the matching run id
 - non-approval task behavior still passes targeted DB tests
 
 ---
@@ -385,7 +448,7 @@ Do not pull these into Phase 2:
 - `hermes kanban approval add|list|remove|approve|reject|reset`
 - task-show approval rendering work
 - dispatcher-owned claiming or spawning of agent approvers
-- approval-run stale detection, heartbeat, timeout, or reclaim behavior
+- approval-run stale detection, heartbeat, timeout, or reclaim behavior beyond the narrow stale-result ownership guard described above
 - approval-agent prompt contracts or output parsing
 - automatic human-gate creation during `escalated` / `failed` result application
 - dashboard UI or gateway approval UX
