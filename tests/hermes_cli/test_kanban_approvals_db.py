@@ -425,3 +425,152 @@ def test_compute_task_approval_aggregate_status(kanban_home, statuses, expected_
                 )
 
     assert kb._compute_task_approval_aggregate_status(approvals) == expected_status
+
+
+def test_finalize_task_approval_row_if_owned_applies_terminal_status(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval_comment_id = kb.add_comment(conn, task_id, "reviewer", "looks good")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                   SET claim_lock = ?,
+                       claim_expires = ?,
+                       worker_pid = ?,
+                       last_heartbeat_at = ?,
+                       current_run_id = ?,
+                       consecutive_failures = ?,
+                       last_failure_error = ?
+                 WHERE id = ?
+                """,
+                ("lease-1", 123, 456, 789, run.id, 2, "old failure", approval.id),
+            )
+
+            finalized = kb._finalize_task_approval_row_if_owned(
+                conn,
+                approval_id=approval.id,
+                expected_run_id=run.id,
+                status="approved",
+                comment_id=approval_comment_id,
+                now=9_000,
+            )
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+
+    assert finalized is True
+    assert refreshed is not None
+    assert refreshed.status == "approved"
+    assert refreshed.comment_id == approval_comment_id
+    assert refreshed.claim_lock is None
+    assert refreshed.claim_expires is None
+    assert refreshed.worker_pid is None
+    assert refreshed.last_heartbeat_at is None
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 0
+    assert refreshed.last_failure_error is None
+    assert refreshed.updated_at == 9_000
+    assert task is not None
+    assert task.status == "approving"
+
+
+def test_finalize_task_approval_row_if_owned_discards_non_requested_rows(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                   SET status = 'failed',
+                       claim_lock = ?,
+                       current_run_id = ?,
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                ("lease-1", run.id, 6_000, approval.id),
+            )
+
+            finalized = kb._finalize_task_approval_row_if_owned(
+                conn,
+                approval_id=approval.id,
+                expected_run_id=run.id,
+                status="approved",
+                now=9_000,
+            )
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+
+    assert finalized is False
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.claim_lock == "lease-1"
+    assert refreshed.current_run_id == run.id
+    assert refreshed.updated_at == 6_000
+    assert task is not None
+    assert task.status == "approving"
+
+
+def test_finalize_task_approval_row_if_owned_discards_run_ownership_mismatches(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        stale_run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                   SET claim_lock = ?,
+                       current_run_id = ?,
+                       updated_at = ?
+                 WHERE id = ?
+                """,
+                ("lease-1", run.id, 6_500, approval.id),
+            )
+
+            finalized = kb._finalize_task_approval_row_if_owned(
+                conn,
+                approval_id=approval.id,
+                expected_run_id=stale_run.id,
+                status="rejected",
+                now=9_000,
+            )
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+
+    assert finalized is False
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.claim_lock == "lease-1"
+    assert refreshed.current_run_id == run.id
+    assert refreshed.updated_at == 6_500
+    assert task is not None
+    assert task.status == "approving"
