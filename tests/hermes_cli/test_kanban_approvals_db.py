@@ -37,17 +37,17 @@ def test_create_get_and_list_task_approvals(kanban_home):
             approver_type="agent",
             approver_profile="Reviewer",
             approver_skill="security-review",
-            status="approved",
+            status="running",
         )
 
         fetched = kb.get_task_approval(conn, human.id)
         approvals = kb.list_task_approvals(conn, task_id)
-        approved = kb.list_task_approvals(conn, task_id, status="approved")
+        running = kb.list_task_approvals(conn, task_id, status="running")
         agents = kb.list_task_approvals(conn, task_id, approver_type="agent")
 
     assert fetched == human
     assert [approval.id for approval in approvals] == [human.id, agent.id]
-    assert [approval.id for approval in approved] == [agent.id]
+    assert [approval.id for approval in running] == [agent.id]
     assert [approval.id for approval in agents] == [agent.id]
     assert human.comment_id == comment_id
     assert human.approver_profile is None
@@ -267,6 +267,34 @@ def test_record_task_approval_decision_treats_missing_approval_as_stale_noop(kan
     assert run_row["outcome"] is None
 
 
+def test_record_task_approval_decision_rejects_live_or_retry_statuses(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="running",
+        )
+
+        with pytest.raises(ValueError, match="approval decision status must be one of"):
+            kb.record_task_approval_decision(
+                conn,
+                approval_id=approval.id,
+                expected_run_id=1,
+                status="running",
+            )
+
+        with pytest.raises(ValueError, match="approval decision status must be one of"):
+            kb.record_task_approval_decision(
+                conn,
+                approval_id=approval.id,
+                expected_run_id=1,
+                status="failed",
+            )
+
+
 def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban_home, monkeypatch):
     monkeypatch.setattr(kb.time, "time", lambda: 5_000)
 
@@ -279,7 +307,7 @@ def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban
             approver_type="agent",
             approver_profile="reviewer",
             approver_skill="security-review",
-            status="failed",
+            status="running",
         )
         run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
 
@@ -313,6 +341,10 @@ def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban
             )
 
         reset = kb.reset_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, ended_at, outcome FROM task_approval_runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
 
     assert reset.id == approval.id
     assert reset.task_id == task_id
@@ -330,6 +362,10 @@ def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban
     assert reset.consecutive_failures == 0
     assert reset.last_failure_error is None
     assert reset.updated_at == 5_000
+    assert run_row is not None
+    assert run_row["status"] == "running"
+    assert run_row["ended_at"] is None
+    assert run_row["outcome"] is None
 
 
 def test_reset_task_approval_rejects_unknown_approval(kanban_home):
@@ -423,13 +459,16 @@ def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home,
     [
         ([], "done"),
         (["requested"], "approving"),
+        (["running"], "approving"),
         (["approved"], "done"),
         (["approved", "approved"], "done"),
         (["approved", "requested"], "approving"),
+        (["approved", "running"], "approving"),
         (["approved", "rejected"], "todo"),
         (["escalated", "approved"], "done"),
         (["failed", "approved"], "done"),
         (["failed", "requested"], "approving"),
+        (["failed", "running"], "approving"),
     ],
 )
 def test_compute_task_approval_aggregate_status(kanban_home, statuses, expected_status):
@@ -545,7 +584,8 @@ def test_record_task_approval_decision_marks_approving_task_done_when_live_gate_
             conn.execute(
                 """
                 UPDATE task_approvals
-                   SET claim_lock = ?,
+                   SET status = 'running',
+                       claim_lock = ?,
                        claim_expires = ?,
                        worker_pid = ?,
                        last_heartbeat_at = ?,
@@ -609,7 +649,8 @@ def test_finalize_task_approval_row_if_owned_applies_terminal_status(kanban_home
             conn.execute(
                 """
                 UPDATE task_approvals
-                   SET claim_lock = ?,
+                   SET status = 'running',
+                       claim_lock = ?,
                        claim_expires = ?,
                        worker_pid = ?,
                        last_heartbeat_at = ?,
@@ -649,7 +690,7 @@ def test_finalize_task_approval_row_if_owned_applies_terminal_status(kanban_home
     assert task.status == "approving"
 
 
-def test_finalize_task_approval_row_if_owned_discards_non_requested_rows(kanban_home):
+def test_finalize_task_approval_row_if_owned_discards_non_running_rows(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
         approval = kb.create_task_approval(
@@ -712,7 +753,8 @@ def test_finalize_task_approval_row_if_owned_discards_run_ownership_mismatches(k
             conn.execute(
                 """
                 UPDATE task_approvals
-                   SET claim_lock = ?,
+                   SET status = 'running',
+                       claim_lock = ?,
                        current_run_id = ?,
                        updated_at = ?
                  WHERE id = ?
@@ -733,7 +775,7 @@ def test_finalize_task_approval_row_if_owned_discards_run_ownership_mismatches(k
 
     assert finalized is False
     assert refreshed is not None
-    assert refreshed.status == "requested"
+    assert refreshed.status == "running"
     assert refreshed.claim_lock == "lease-1"
     assert refreshed.current_run_id == run.id
     assert refreshed.updated_at == 6_500
@@ -745,7 +787,6 @@ def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
         rejected_comment_id = kb.add_comment(conn, task_id, "reviewer", "needs revision")
-        stale_comment_id = kb.add_comment(conn, task_id, "reviewer-2", "old approval")
         rejected = kb.create_task_approval(
             conn,
             task_id=task_id,
@@ -758,8 +799,7 @@ def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban
             task_id=task_id,
             approver_type="agent",
             approver_profile="reviewer-2",
-            status="approved",
-            comment_id=stale_comment_id,
+            status="requested",
         )
         rejected_run = kb.create_task_approval_run(conn, approval_id=rejected.id, status="running")
         other_run = kb.create_task_approval_run(conn, approval_id=other.id, status="running")
@@ -769,7 +809,8 @@ def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban
             conn.execute(
                 """
                 UPDATE task_approvals
-                   SET claim_lock = ?,
+                   SET status = 'running',
+                       claim_lock = ?,
                        claim_expires = ?,
                        worker_pid = ?,
                        last_heartbeat_at = ?,
@@ -784,7 +825,8 @@ def test_record_task_approval_decision_rejection_cycle_moves_task_to_todo(kanban
             conn.execute(
                 """
                 UPDATE task_approvals
-                   SET claim_lock = ?,
+                   SET status = 'running',
+                       claim_lock = ?,
                        claim_expires = ?,
                        worker_pid = ?,
                        last_heartbeat_at = ?,
@@ -875,11 +917,11 @@ def test_record_task_approval_decision_rejection_cycle_discards_late_results(kan
 
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE task_approvals SET current_run_id = ?, updated_at = ? WHERE id = ?",
+                "UPDATE task_approvals SET status = 'running', current_run_id = ?, updated_at = ? WHERE id = ?",
                 (rejected_run.id, 7_000, rejected.id),
             )
             conn.execute(
-                "UPDATE task_approvals SET current_run_id = ?, updated_at = ? WHERE id = ?",
+                "UPDATE task_approvals SET status = 'running', current_run_id = ?, updated_at = ? WHERE id = ?",
                 (stale_run.id, 7_100, stale.id),
             )
 
