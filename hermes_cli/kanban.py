@@ -1479,7 +1479,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
-            "approvals": [approvals_cli._approval_to_dict(approval) for approval in approvals],
+            "approvals": [approvals_cli.approval_to_dict(approval) for approval in approvals],
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1596,7 +1596,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print(f"Approvals ({len(approvals)}):")
         for approval in approvals:
-            print(approvals_cli._format_approval_line(approval, include_task_id=False))
+            print(approvals_cli.format_approval_line(approval, include_task_id=False))
     if comments:
         print()
         print(f"Comments ({len(comments)}):")
