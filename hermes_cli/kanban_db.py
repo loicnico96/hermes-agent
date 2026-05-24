@@ -2107,10 +2107,6 @@ def list_task_approvals(
     )
 
 
-_OPERATOR_RESETTABLE_APPROVAL_STATUSES = {"running", "approved", "rejected", "escalated", "failed"}
-_MANUAL_DECISION_SOURCE_STATUSES = {"requested", "approved"}
-
-
 def _approval_is_actively_owned(approval: Approval) -> bool:
     return approval.status == "running" or any(
         marker is not None
@@ -2146,12 +2142,6 @@ def record_manual_task_approval_decision(
         assert task is not None
         if task.status != "approving":
             raise ValueError("parent task must be approving")
-        if approval.status not in _MANUAL_DECISION_SOURCE_STATUSES:
-            raise ValueError(
-                "manual approval decisions only support statuses "
-                f"{sorted(_MANUAL_DECISION_SOURCE_STATUSES)}"
-            )
-
         comment_id = None
         if comment is not None:
             effective_author = _normalize_optional_text(comment_author)
@@ -2206,9 +2196,9 @@ def remove_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval
 
         task = get_task(conn, approval.task_id)
         assert task is not None
-        if _approval_is_actively_owned(approval):
-            raise ValueError("cannot remove an actively owned approval")
-
+        # Eager removal intentionally leaves any already-spawned approver stale.
+        # A later phase may add explicit cancellation to avoid wasted turns, but
+        # the database remains authoritative today and late results must noop.
         conn.execute("DELETE FROM task_approval_runs WHERE approval_id = ?", (approval.id,))
         deleted = conn.execute("DELETE FROM task_approvals WHERE id = ?", (approval.id,))
         assert deleted.rowcount == 1
@@ -2236,11 +2226,6 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         assert task is not None
         if task.status != "approving":
             raise ValueError("parent task must be approving")
-        if approval.status not in _OPERATOR_RESETTABLE_APPROVAL_STATUSES:
-            raise ValueError(
-                "reset only supports statuses "
-                f"{sorted(_OPERATOR_RESETTABLE_APPROVAL_STATUSES)}"
-            )
 
         cur = _reset_task_approval_row(conn, approval_id=int(approval_id), now=now)
         assert cur.rowcount == 1
@@ -2471,6 +2456,19 @@ def record_task_approval_decision(
         if approval is None:
             return None
 
+        run_row = conn.execute(
+            """
+            SELECT id
+              FROM task_approval_runs
+             WHERE id = ?
+               AND approval_id = ?
+               AND status = 'running'
+            """,
+            (int(expected_run_id), int(approval_id)),
+        ).fetchone()
+        if run_row is None:
+            return None
+
         aggregate_status = _finalize_task_approval_result_if_owned(
             conn,
             approval=approval,
@@ -2505,10 +2503,7 @@ def record_task_approval_decision(
             ),
         )
         if run_cur.rowcount != 1:
-            raise RuntimeError(
-                "approval run decision could not close the owned run row: "
-                f"approval_id={approval_id} run_id={expected_run_id}"
-            )
+            return None
 
         return aggregate_status
 
