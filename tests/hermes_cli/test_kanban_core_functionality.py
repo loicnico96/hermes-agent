@@ -2301,7 +2301,19 @@ def test_cli_approval_remove_and_reset(kanban_home):
     survivor = json.loads(run_slash(f"approval add {task_id} --human --json"))
 
     with kb.connect() as conn:
+        removed_run = kb.create_task_approval_run(conn, approval_id=removed["id"], status="running")
         conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   current_run_id = ?,
+                   claim_lock = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (removed_run.id, "lease-1", 6_900, removed["id"]),
+        )
         conn.execute(
             "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
             (7_000, survivor["id"]),
@@ -2314,6 +2326,12 @@ def test_cli_approval_remove_and_reset(kanban_home):
     assert removed_payload["task_status"] == "done"
     assert [row["id"] for row in shown_after_remove["approvals"]] == [survivor["id"]]
     assert shown_after_remove["task"]["status"] == "done"
+    with kb.connect() as conn:
+        removed_run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_approval_runs WHERE approval_id = ?",
+            (removed["id"],),
+        ).fetchone()[0]
+    assert removed_run_count == 0
 
     second_task = json.loads(run_slash("create 'reset target' --assignee worker --json"))
     second_task_id = second_task["id"]
@@ -2335,6 +2353,14 @@ def test_cli_approval_remove_and_reset(kanban_home):
     assert shown_after_reset["approvals"][0]["status"] == "requested"
     assert shown_after_reset["approvals"][0]["consecutive_failures"] == 0
     assert shown_after_reset["approvals"][0]["last_failure_error"] is None
+
+    requested_payload = json.loads(run_slash(f"approval reset {reset_target['id']} --json"))
+    shown_after_requested_reset = json.loads(run_slash(f"show {second_task_id} --json"))
+
+    assert requested_payload["approval"]["id"] == reset_target["id"]
+    assert requested_payload["approval"]["status"] == "requested"
+    assert requested_payload["task_status"] == "approving"
+    assert shown_after_requested_reset["approvals"][0]["status"] == "requested"
 
 
 
@@ -2440,6 +2466,30 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     assert [row["status"] for row in reject_show["approvals"]] == ["requested", "requested"]
     assert reject_show["comments"][-1]["author"] == "approver"
     assert reject_show["comments"][-1]["body"] == "needs changes"
+
+    reopen_task = json.loads(run_slash("create 'reopen target' --assignee worker --json"))
+    reopen_task_id = reopen_task["id"]
+    reopen_human = json.loads(run_slash(f"approval add {reopen_task_id} --human --json"))
+    json.loads(run_slash(f"approval add {reopen_task_id} --agent reviewer --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (reopen_task_id,))
+        conn.execute(
+            "UPDATE task_approvals SET status = 'rejected', updated_at = ? WHERE id = ?",
+            (7_250, reopen_human["id"]),
+        )
+
+    reopen_payload = json.loads(
+        run_slash(f"approval approve {reopen_human['id']} --comment 're-opened and approved' --json")
+    )
+    reopen_show = json.loads(run_slash(f"show {reopen_task_id} --json"))
+
+    assert reopen_payload["approval"]["id"] == reopen_human["id"]
+    assert reopen_payload["approval"]["status"] == "approved"
+    assert reopen_payload["task_status"] == "approving"
+    assert reopen_payload["aggregate_status"] == "approving"
+    assert reopen_show["task"]["status"] == "approving"
+    assert reopen_show["comments"][-1]["body"] == "re-opened and approved"
 
 
 
