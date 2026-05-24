@@ -44,6 +44,10 @@ def _approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
     }
 
 
+def approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
+    return _approval_to_dict(approval)
+
+
 def _format_approval_target(approval: kb.Approval) -> str:
     if approval.approver_type == "human":
         return "human"
@@ -61,6 +65,10 @@ def _format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> st
     if approval.comment_id is not None:
         bits.append(f"comment=#{approval.comment_id}")
     return "  " + "  ".join(bits)
+
+
+def format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> str:
+    return _format_approval_line(approval, include_task_id=include_task_id)
 
 
 def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, Any]:
@@ -197,6 +205,10 @@ def _dispatch_approval(args: argparse.Namespace) -> int:
         return _cmd_approval_reset(args)
     print(f"kanban approval: unknown action {sub!r}", file=sys.stderr)
     return 2
+
+
+def dispatch_approval_command(args: argparse.Namespace) -> int:
+    return _dispatch_approval(args)
 
 
 def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
