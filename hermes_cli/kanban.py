@@ -2099,11 +2099,23 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    from hermes_cli.config import load_config
+
+    kanban_cfg = (load_config().get("kanban") or {})
+    raw_max_approval_spawn = kanban_cfg.get("max_approval_spawn", 2)
+    try:
+        max_approval_spawn = int(raw_max_approval_spawn)
+    except (TypeError, ValueError):
+        max_approval_spawn = 2
+    if max_approval_spawn < 1:
+        max_approval_spawn = 2
+
     with kb.connect() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=args.max,
+            max_approval_spawn=max_approval_spawn,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
         )
     if getattr(args, "json", False):
@@ -2117,6 +2129,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
+            ],
+            "approval_spawned": [
+                {"approval_id": approval_id, "approver_profile": profile, "task_id": task_id}
+                for (approval_id, profile, task_id) in res.approval_spawned
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
@@ -2140,6 +2156,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if res.approval_spawned:
+        print(f"Approval spawned: {len(res.approval_spawned)}")
+        for approval_id, profile, task_id in res.approval_spawned:
+            tag = " (dry)" if args.dry_run else ""
+            print(f"  - approval {approval_id}  ->  {profile or '-'}  for {task_id}{tag}")
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     if res.skipped_nonspawnable:

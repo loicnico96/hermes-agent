@@ -4206,6 +4206,8 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    approval_spawned: list[tuple[int, str, str]] = field(default_factory=list)
+    """List of ``(approval_id, approver_profile, task_id)`` triples."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -5201,13 +5203,21 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def has_spawnable_approvals(conn: sqlite3.Connection) -> bool:
+    """Return True iff at least one runnable agent approval is spawnable."""
+    rows = list_runnable_task_approvals(conn, limit=50)
+    return any(bool(row.approver_profile) for row in rows)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    approval_spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_approval_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -5220,10 +5230,14 @@ def dispatch_once(
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      4. For each ready/review task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
+      5. For each runnable approval row, atomically claim and call
+         ``approval_spawn_fn(approval, workspace_path, board) -> Optional[int]``.
+         The return value (if any) is recorded on both the live approval row
+         and its current ``task_approval_runs`` row.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
     failures the task is auto-blocked with the last error as its reason —
@@ -5237,7 +5251,8 @@ def dispatch_once(
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
 
-    ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
+    ``spawn_fn`` defaults to ``_default_spawn`` and ``approval_spawn_fn``
+    defaults to ``_spawn_approval_worker``. Tests pass stubs.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
@@ -5502,6 +5517,91 @@ def dispatch_once(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    running_approval_count = 0
+    if max_approval_spawn is not None:
+        running_approval_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM task_approvals WHERE status = 'running'"
+            ).fetchone()[0]
+        )
+
+    approval_spawned = 0
+    approval_rows = list_runnable_task_approvals(conn)
+    for approval in approval_rows:
+        if (
+            max_approval_spawn is not None
+            and running_approval_count + approval_spawned >= max_approval_spawn
+        ):
+            break
+        if dry_run:
+            result.approval_spawned.append(
+                (approval.id, approval.approver_profile or "", approval.task_id)
+            )
+            continue
+        claimed_approval = claim_task_approval(
+            conn,
+            approval.id,
+            ttl_seconds=ttl_seconds,
+        )
+        if claimed_approval is None:
+            continue
+        task = get_task(conn, claimed_approval.task_id)
+        if task is None:
+            _record_approval_runtime_failure(
+                conn,
+                claimed_approval.id,
+                error=f"task {claimed_approval.task_id} disappeared before spawn",
+                outcome="spawn_failed",
+            )
+            continue
+        try:
+            workspace = resolve_workspace(task, board=board)
+        except Exception as exc:
+            _record_approval_runtime_failure(
+                conn,
+                claimed_approval.id,
+                error=f"workspace: {exc}",
+                outcome="spawn_failed",
+            )
+            continue
+        set_workspace_path(conn, task.id, str(workspace))
+        _spawn_approval = (
+            approval_spawn_fn if approval_spawn_fn is not None else _spawn_approval_worker
+        )
+        try:
+            import inspect
+            try:
+                sig = inspect.signature(_spawn_approval)
+                if "board" in sig.parameters:
+                    pid = _spawn_approval(claimed_approval, str(workspace), board=board)
+                else:
+                    pid = _spawn_approval(claimed_approval, str(workspace))
+            except (TypeError, ValueError):
+                pid = _spawn_approval(claimed_approval, str(workspace))
+            if pid:
+                run_id = claimed_approval.current_run_id
+                if run_id is None:
+                    raise RuntimeError(
+                        f"approval {claimed_approval.id} missing current_run_id after claim"
+                    )
+                set_task_approval_worker_pid(
+                    conn,
+                    claimed_approval.id,
+                    int(pid),
+                    run_id=run_id,
+                )
+            result.approval_spawned.append(
+                (claimed_approval.id, claimed_approval.approver_profile or "", claimed_approval.task_id)
+            )
+            approval_spawned += 1
+        except Exception as exc:
+            _record_approval_runtime_failure(
+                conn,
+                claimed_approval.id,
+                error=str(exc),
+                outcome="spawn_failed",
+            )
     return result
 
 
@@ -5703,39 +5803,131 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
-def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
-    """True if the bundled ``kanban-worker`` skill resolves for the home the
-    spawned worker will run under.
+def _skill_available(skill_name: str, hermes_home: Optional[str]) -> bool:
+    """True if ``skill_name`` resolves for the home the spawned worker uses.
 
-    The dispatcher injects ``--skills kanban-worker`` into every worker. When
-    the worker activates a profile (``hermes -p <name>``), its ``SKILLS_DIR``
-    becomes ``<profile_home>/skills`` — which on many profiles does NOT contain
-    the bundled skill (it ships in the *default* root home, not every
-    profile-scoped skills dir). Preloading a missing skill is fatal at CLI
-    startup (``ValueError: Unknown skill(s): kanban-worker``), aborting the
-    worker before the agent loop runs. Gate the flag on actual resolvability;
-    the kanban lifecycle contract is still injected via ``KANBAN_GUIDANCE``, so
-    omitting the flag only drops the supplementary pattern library.
+    Preloading an unknown skill is fatal at CLI startup. Dispatcher-side spawn
+    helpers therefore gate optional default skills on actual resolvability under
+    the target profile's ``HERMES_HOME``.
     """
     from pathlib import Path as _Path
 
-    # An unset HERMES_HOME means the worker falls back to the default root
-    # home (``~/.hermes``), which ships the bundled skill.
     base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    skills_root = base / "skills"
-    if not skills_root.is_dir():
-        return False
-    # Canonical bundled location first (cheap), then a bounded scan for
-    # profiles that have it nested elsewhere.
-    if (skills_root / "devops" / "kanban-worker" / "SKILL.md").is_file():
-        return True
-    try:
-        for skill_md in skills_root.rglob("kanban-worker/SKILL.md"):
-            if skill_md.is_file():
-                return True
-    except OSError:
-        pass
+    candidate_roots = [base / "skills", _Path(__file__).resolve().parents[1] / "skills"]
+    for skills_root in candidate_roots:
+        if not skills_root.is_dir():
+            continue
+        canonical = skills_root / "devops" / skill_name / "SKILL.md"
+        if canonical.is_file():
+            return True
+        try:
+            for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
+                if skill_md.is_file():
+                    return True
+        except OSError:
+            continue
     return False
+
+
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """True if the bundled ``kanban-worker`` skill resolves for the target home."""
+    return _skill_available("kanban-worker", hermes_home)
+
+
+KANBAN_APPROVER_DEFAULT_SKILL = "kanban_approver"
+_APPROVAL_DECISION_KEYS = frozenset({"decision", "comment"})
+KANBAN_APPROVAL_RUNTIME_CONTRACT = "\n".join([
+    "You are acting as an autonomous Kanban approval worker.",
+    "Return exactly one JSON object and nothing else.",
+    "The JSON object must contain:",
+    '- "decision": one of "approved", "rejected", or "escalated".',
+    '- Optional "comment": a string.',
+    "Do not mutate approval rows directly.",
+    "Malformed, extra, or contradictory output is treated as failure.",
+])
+
+
+@dataclass(frozen=True)
+class ApprovalWorkerDecision:
+    decision: str
+    comment: Optional[str] = None
+
+
+def parse_approval_worker_response(response_text: str) -> ApprovalWorkerDecision:
+    """Validate the approval worker's final response.
+
+    The contract is intentionally strict: the entire response must be one JSON
+    object with exactly the supported keys so downstream approval application
+    never has to guess which of several conflicting statements is authoritative.
+    """
+    text = (response_text or "").strip()
+    if not text:
+        raise ValueError("approval worker response must be a JSON object, got empty output")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("approval worker response must be valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("approval worker response must be a JSON object")
+    unknown_keys = sorted(set(payload) - _APPROVAL_DECISION_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            "approval worker response contains unsupported keys: "
+            + ", ".join(unknown_keys)
+        )
+    if "decision" not in payload:
+        raise ValueError("approval worker response must include decision")
+    decision = payload["decision"]
+    if not isinstance(decision, str):
+        raise ValueError("approval worker decision must be a string")
+    normalized_decision = decision.strip().lower()
+    if normalized_decision not in DECISION_APPROVAL_STATUSES:
+        raise ValueError(
+            "approval worker decision must be one of "
+            + ", ".join(sorted(DECISION_APPROVAL_STATUSES))
+        )
+    comment = payload.get("comment")
+    if comment is not None and not isinstance(comment, str):
+        raise ValueError("approval worker comment must be a string when provided")
+    normalized_comment = comment.strip() if isinstance(comment, str) else None
+    return ApprovalWorkerDecision(
+        decision=normalized_decision,
+        comment=normalized_comment or None,
+    )
+
+
+def _approval_worker_skill_names(
+    approval: Approval,
+    *,
+    hermes_home: Optional[str],
+) -> list[str]:
+    if approval.approver_skill:
+        return [approval.approver_skill]
+    if _skill_available(KANBAN_APPROVER_DEFAULT_SKILL, hermes_home):
+        return [KANBAN_APPROVER_DEFAULT_SKILL]
+    return []
+
+
+def _build_approval_worker_prompt(
+    conn: sqlite3.Connection,
+    approval: Approval,
+) -> str:
+    """Return a task-centric approval prompt with the narrow runtime contract."""
+    task_context = build_worker_context(conn, approval.task_id).strip()
+    return "\n\n".join([
+        (
+            f"Review kanban task {approval.task_id} as approval row {approval.id}. "
+            f"Approver profile: {approval.approver_profile or '(unknown)'}."
+        ),
+        KANBAN_APPROVAL_RUNTIME_CONTRACT,
+        "Task context:",
+        task_context,
+        (
+            'Respond with JSON only, for example: '
+            '{"decision":"approved"} or '
+            '{"decision":"rejected","comment":"..."}.'
+        ),
+    ])
 
 
 def _worker_terminal_timeout_env(
@@ -5932,6 +6124,139 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    return proc.pid
+
+
+def _record_approval_runtime_failure(
+    conn: sqlite3.Connection,
+    approval_id: int,
+    *,
+    error: str,
+    outcome: str,
+) -> None:
+    """Mark an in-flight approval attempt failed and requeue the row."""
+    effective_now = int(time.time())
+    approval = get_task_approval(conn, approval_id)
+    if approval is None or approval.current_run_id is None:
+        return
+    run_id = int(approval.current_run_id)
+    with write_txn(conn):
+        run_cur = conn.execute(
+            """
+            UPDATE task_approval_runs
+               SET status = ?,
+                   outcome = ?,
+                   error = ?,
+                   ended_at = ?
+             WHERE id = ?
+               AND approval_id = ?
+               AND status = 'running'
+            """,
+            (outcome, outcome, error[:500], effective_now, run_id, int(approval_id)),
+        )
+        if run_cur.rowcount != 1:
+            return
+        approval_cur = conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'requested',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_heartbeat_at = NULL,
+                   current_run_id = NULL,
+                   consecutive_failures = consecutive_failures + 1,
+                   last_failure_error = ?,
+                   updated_at = ?
+             WHERE id = ?
+               AND status = 'running'
+               AND current_run_id = ?
+            """,
+            (error[:500], effective_now, int(approval_id), run_id),
+        )
+        if approval_cur.rowcount != 1:
+            return
+        refreshed = get_task_approval(conn, approval_id)
+        if refreshed is not None:
+            _append_event(
+                conn,
+                refreshed.task_id,
+                "approval_failed",
+                {
+                    "approval_id": int(approval_id),
+                    "outcome": outcome,
+                    "error": error[:500],
+                },
+                run_id=run_id,
+            )
+
+
+def _spawn_approval_worker(
+    approval: Approval,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn a one-shot approval worker bound to a single approval row."""
+    import subprocess
+    if not approval.approver_profile:
+        raise ValueError(f"approval {approval.id} has no approver_profile")
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    profile_arg = normalize_profile_name(approval.approver_profile)
+    env = dict(os.environ)
+    env.pop("HERMES_KANBAN_TASK", None)
+    env.pop("HERMES_KANBAN_RUN_ID", None)
+    env.pop("HERMES_KANBAN_CLAIM_LOCK", None)
+    env["HERMES_KANBAN_APPROVAL_ID"] = str(approval.id)
+    env["HERMES_KANBAN_APPROVAL_TASK_ID"] = approval.task_id
+    if approval.current_run_id is not None:
+        env["HERMES_KANBAN_APPROVAL_RUN_ID"] = str(approval.current_run_id)
+    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_BOARD"] = _normalize_board_slug(board) or get_current_board()
+    env["HERMES_PROFILE"] = profile_arg
+    try:
+        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        pass
+
+    with contextlib.closing(connect(board=board)) as prompt_conn:
+        prompt = _build_approval_worker_prompt(prompt_conn, approval)
+
+    cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "--accept-hooks"]
+    for skill_name in _approval_worker_skill_names(
+        approval,
+        hermes_home=env.get("HERMES_HOME"),
+    ):
+        cmd.extend(["--skills", skill_name])
+    cmd.extend(["chat", "-q", prompt])
+
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"approval-{approval.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "`hermes` executable not found on PATH. "
+            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+        )
     return proc.pid
 
 

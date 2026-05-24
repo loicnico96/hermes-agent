@@ -5337,6 +5337,22 @@ class GatewayRunner:
         if max_spawn is not None:
             logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
+        raw_max_approval_spawn = kanban_cfg.get("max_approval_spawn", 2)
+        try:
+            max_approval_spawn = int(raw_max_approval_spawn)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.max_approval_spawn=%r; using default 2",
+                raw_max_approval_spawn,
+            )
+            max_approval_spawn = 2
+        if max_approval_spawn < 1:
+            logger.warning(
+                "kanban dispatcher: kanban.max_approval_spawn=%r is below 1; using default 2",
+                raw_max_approval_spawn,
+            )
+            max_approval_spawn = 2
+
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
         # out. When set, the dispatcher skips spawning when the board
@@ -5458,6 +5474,7 @@ class GatewayRunner:
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
+                    max_approval_spawn=max_approval_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
@@ -5528,6 +5545,8 @@ class GatewayRunner:
                     if _kb.has_spawnable_ready(conn):
                         return True
                     if _kb.has_spawnable_review(conn):
+                        return True
+                    if _kb.has_spawnable_approvals(conn):
                         return True
                 except Exception:
                     continue
