@@ -503,8 +503,12 @@ def test_remove_task_approval_recomputes_approving_parent_state(kanban_home):
         )
         removed_run = kb.create_task_approval_run(conn, approval_id=removed.id, status="running")
         conn.execute(
-            "UPDATE task_approvals SET current_run_id = ?, claim_lock = ?, updated_at = ? WHERE id = ?",
-            (removed_run.id, "lease-1", 7_500, removed.id),
+            "UPDATE task_approvals SET current_run_id = NULL, claim_lock = NULL, updated_at = ? WHERE id = ?",
+            (7_500, removed.id),
+        )
+        conn.execute(
+            "UPDATE task_approval_runs SET status = 'released', ended_at = ? WHERE id = ?",
+            (7_500, removed_run.id),
         )
         conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
 
@@ -552,6 +556,37 @@ def test_remove_task_approval_rejects_unknown_approval(kanban_home):
     with kb.connect() as conn:
         with pytest.raises(ValueError, match="unknown approval"):
             kb.remove_task_approval(conn, 999999)
+
+
+def test_remove_task_approval_rejects_actively_owned_rows(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute(
+            "UPDATE task_approvals SET current_run_id = ?, claim_lock = ?, updated_at = ? WHERE id = ?",
+            (run.id, "lease-1", 7_600, approval.id),
+        )
+
+        with pytest.raises(ValueError, match="cannot remove an actively owned approval"):
+            kb.remove_task_approval(conn, approval.id)
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_approval_runs WHERE approval_id = ?",
+            (approval.id,),
+        ).fetchone()[0]
+
+    assert refreshed is not None
+    assert refreshed.id == approval.id
+    assert refreshed.current_run_id == run.id
+    assert run_count == 1
 
 
 
@@ -752,6 +787,29 @@ def test_record_manual_task_approval_decision_enforces_human_and_approving_gate(
         conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (task_status, task_id))
 
         with pytest.raises(ValueError, match=message):
+            kb.record_manual_task_approval_decision(
+                conn,
+                approval_id=approval.id,
+                status="approved",
+            )
+
+
+@pytest.mark.parametrize("approval_status", ["running", "rejected", "escalated", "failed"])
+def test_record_manual_task_approval_decision_rejects_non_manual_source_statuses(
+    kanban_home,
+    approval_status,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="human",
+            status=approval_status,
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        with pytest.raises(ValueError, match="manual approval decisions only support statuses"):
             kb.record_manual_task_approval_decision(
                 conn,
                 approval_id=approval.id,
