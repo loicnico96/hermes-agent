@@ -114,15 +114,19 @@ from hermes_cli.kanban_approvals_db import (
     _validate_approval_status,
     _validate_task_comment_reference,
     _validate_terminal_approval_status,
+    claim_task_approval,
     create_task_approval,
     create_task_approval_run,
     get_task_approval,
+    heartbeat_task_approval,
     list_approvals,
+    list_runnable_task_approvals,
     list_task_approvals,
     record_manual_task_approval_decision,
     record_task_approval_decision,
     remove_task_approval,
     reset_task_approval,
+    set_task_approval_worker_pid,
 )
 
 _log = logging.getLogger(__name__)
