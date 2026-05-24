@@ -2000,6 +2000,9 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Separate live concurrency cap for approval workers. Intentionally
+        # isolated from the normal task-worker scheduler budget.
+        "max_approval_spawn": 2,
         # Respawn guard toggles. These defer re-spawn for specific "probably
         # don't launch another worker yet" conditions without fully blocking
         # the task. Shared-PR sequential lanes may want active_pr=false.
