@@ -2248,6 +2248,14 @@ def list_task_approvals(
 
 
 _OPERATOR_RESETTABLE_APPROVAL_STATUSES = {"running", "approved", "rejected", "escalated", "failed"}
+_MANUAL_DECISION_SOURCE_STATUSES = {"requested", "approved"}
+
+
+def _approval_is_actively_owned(approval: Approval) -> bool:
+    return approval.status == "running" or any(
+        marker is not None
+        for marker in (approval.current_run_id, approval.claim_lock, approval.claim_expires, approval.worker_pid)
+    )
 
 
 def record_manual_task_approval_decision(
@@ -2278,6 +2286,11 @@ def record_manual_task_approval_decision(
         assert task is not None
         if task.status != "approving":
             raise ValueError("parent task must be approving")
+        if approval.status not in _MANUAL_DECISION_SOURCE_STATUSES:
+            raise ValueError(
+                "manual approval decisions only support statuses "
+                f"{sorted(_MANUAL_DECISION_SOURCE_STATUSES)}"
+            )
 
         comment_id = None
         if comment is not None:
@@ -2333,6 +2346,8 @@ def remove_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval
 
         task = get_task(conn, approval.task_id)
         assert task is not None
+        if _approval_is_actively_owned(approval):
+            raise ValueError("cannot remove an actively owned approval")
 
         conn.execute("DELETE FROM task_approval_runs WHERE approval_id = ?", (approval.id,))
         deleted = conn.execute("DELETE FROM task_approvals WHERE id = ?", (approval.id,))

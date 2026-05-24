@@ -2268,17 +2268,28 @@ def test_cli_approval_add_list_and_show(kanban_home):
         run_slash(f"approval add {task_id} --agent reviewer --skill security-review --json")
     )
 
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
+            (7_050, agent_approval["id"]),
+        )
+
     board_rows = json.loads(run_slash("approval list --json"))
     task_rows = json.loads(run_slash(f"approval list --task {task_id} --json"))
+    approved_rows = json.loads(run_slash("approval list --status approved --json"))
+    human_rows = json.loads(run_slash("approval list --type human --json"))
     shown = run_slash(f"show {task_id}")
     shown_json = json.loads(run_slash(f"show {task_id} --json"))
 
     assert [row["id"] for row in board_rows] == [human_approval["id"], agent_approval["id"]]
     assert [row["id"] for row in task_rows] == [human_approval["id"], agent_approval["id"]]
+    assert [row["id"] for row in approved_rows] == [agent_approval["id"]]
+    assert [row["id"] for row in human_rows] == [human_approval["id"]]
     assert "Approvals (2):" in shown
     assert "human" in shown
     assert "agent @reviewer skill=security-review" in shown
     assert [row["id"] for row in shown_json["approvals"]] == [human_approval["id"], agent_approval["id"]]
+    assert "approval_runs" not in shown_json
 
 
 
