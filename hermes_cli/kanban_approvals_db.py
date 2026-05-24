@@ -364,6 +364,243 @@ def list_task_approvals(
     )
 
 
+def list_runnable_task_approvals(
+    conn: sqlite3.Connection,
+    *,
+    limit: Optional[int] = None,
+) -> list[Approval]:
+    """Return approval rows currently eligible for autonomous execution."""
+    query = """
+        SELECT a.*
+          FROM task_approvals a
+          JOIN tasks t ON t.id = a.task_id
+         WHERE a.approver_type = 'agent'
+           AND a.status = 'requested'
+           AND a.approver_profile IS NOT NULL
+           AND a.claim_lock IS NULL
+           AND t.status = 'approving'
+           AND t.status != 'archived'
+         ORDER BY a.created_at ASC, a.id ASC
+    """
+    params: list[object] = []
+    if limit is not None:
+        query += " LIMIT ?"
+        params.append(int(limit))
+    rows = conn.execute(query, params).fetchall()
+    return [Approval.from_row(row) for row in rows]
+
+
+def claim_task_approval(
+    conn: sqlite3.Connection,
+    approval_id: int,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+    now: Optional[int] = None,
+) -> Optional[Approval]:
+    """Atomically transition one runnable approval row into a live run."""
+    effective_now = int(time.time()) if now is None else int(now)
+    claim_lock = claimer or kb._claimer_id()
+    claim_expires = effective_now + kb._resolve_claim_ttl_seconds(ttl_seconds)
+
+    with kb.write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   claim_lock = ?,
+                   claim_expires = ?,
+                   last_heartbeat_at = ?,
+                   updated_at = ?
+             WHERE id = ?
+               AND approver_type = 'agent'
+               AND status = 'requested'
+               AND approver_profile IS NOT NULL
+               AND claim_lock IS NULL
+               AND EXISTS (
+                    SELECT 1
+                      FROM tasks t
+                     WHERE t.id = task_approvals.task_id
+                       AND t.status = 'approving'
+                       AND t.status != 'archived'
+               )
+            """,
+            (
+                claim_lock,
+                claim_expires,
+                effective_now,
+                effective_now,
+                int(approval_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+
+        approval = get_task_approval(conn, approval_id)
+        assert approval is not None
+        run_cur = conn.execute(
+            """
+            INSERT INTO task_approval_runs (
+                approval_id, task_id, profile, status, claim_lock, claim_expires,
+                worker_pid, last_heartbeat_at, started_at, ended_at, outcome,
+                comment_id, error
+            ) VALUES (?, ?, ?, 'running', ?, ?, NULL, ?, ?, NULL, NULL, NULL, NULL)
+            """,
+            (
+                approval.id,
+                approval.task_id,
+                approval.approver_profile,
+                claim_lock,
+                claim_expires,
+                effective_now,
+                effective_now,
+            ),
+        )
+        run_id = run_cur.lastrowid
+        assert run_id is not None
+        conn.execute(
+            "UPDATE task_approvals SET current_run_id = ? WHERE id = ?",
+            (int(run_id), approval.id),
+        )
+        kb._append_event(
+            conn,
+            approval.task_id,
+            "approval_claimed",
+            {
+                "approval_id": approval.id,
+                "lock": claim_lock,
+                "expires": claim_expires,
+                "run_id": int(run_id),
+                "approver_profile": approval.approver_profile,
+            },
+            run_id=int(run_id),
+        )
+        claimed = get_task_approval(conn, approval.id)
+        assert claimed is not None
+        return claimed
+
+
+def heartbeat_task_approval(
+    conn: sqlite3.Connection,
+    approval_id: int,
+    *,
+    note: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    ttl_seconds: Optional[int] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Touch approval heartbeat state and extend the live claim TTL."""
+    effective_now = int(time.time()) if now is None else int(now)
+    claim_expires = effective_now + kb._resolve_claim_ttl_seconds(ttl_seconds)
+
+    with kb.write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                """
+                UPDATE task_approvals
+                   SET last_heartbeat_at = ?,
+                       claim_expires = ?,
+                       updated_at = ?
+                 WHERE id = ?
+                   AND status = 'running'
+                """,
+                (effective_now, claim_expires, effective_now, int(approval_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE task_approvals
+                   SET last_heartbeat_at = ?,
+                       claim_expires = ?,
+                       updated_at = ?
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                """,
+                (
+                    effective_now,
+                    claim_expires,
+                    effective_now,
+                    int(approval_id),
+                    int(expected_run_id),
+                ),
+            )
+        if cur.rowcount != 1:
+            return False
+
+        approval = get_task_approval(conn, approval_id)
+        assert approval is not None
+        run_id = int(expected_run_id) if expected_run_id is not None else approval.current_run_id
+        if run_id is not None:
+            conn.execute(
+                """
+                UPDATE task_approval_runs
+                   SET last_heartbeat_at = ?,
+                       claim_expires = ?
+                 WHERE id = ?
+                   AND status = 'running'
+                """,
+                (effective_now, claim_expires, run_id),
+            )
+        payload: dict[str, object] = {"approval_id": approval.id}
+        if note:
+            payload["note"] = note
+        kb._append_event(
+            conn,
+            approval.task_id,
+            "approval_heartbeat",
+            payload,
+            run_id=run_id,
+        )
+    return True
+
+
+def set_task_approval_worker_pid(
+    conn: sqlite3.Connection,
+    approval_id: int,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Record the spawned approval worker pid on both live tables."""
+    with kb.write_txn(conn):
+        if expected_run_id is None:
+            cur = conn.execute(
+                "UPDATE task_approvals SET worker_pid = ? WHERE id = ? AND status = 'running'",
+                (int(pid), int(approval_id)),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE task_approvals
+                   SET worker_pid = ?
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND current_run_id = ?
+                """,
+                (int(pid), int(approval_id), int(expected_run_id)),
+            )
+        if cur.rowcount != 1:
+            return False
+
+        approval = get_task_approval(conn, approval_id)
+        assert approval is not None
+        run_id = int(expected_run_id) if expected_run_id is not None else approval.current_run_id
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_approval_runs SET worker_pid = ? WHERE id = ?",
+                (int(pid), run_id),
+            )
+        kb._append_event(
+            conn,
+            approval.task_id,
+            "approval_spawned",
+            {"approval_id": approval.id, "pid": int(pid)},
+            run_id=run_id,
+        )
+    return True
+
+
 def record_manual_task_approval_decision(
     conn: sqlite3.Connection,
     *,

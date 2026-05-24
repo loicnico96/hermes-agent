@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+import json
 from pathlib import Path
 import sqlite3
 
@@ -195,6 +196,211 @@ def test_list_approvals_supports_board_wide_filters(kanban_home):
     assert [approval.id for approval in all_rows] == [approval.id for approval in expected_all]
     assert [approval.id for approval in agent_rows] == [approval.id for approval in expected_agents]
     assert [approval.id for approval in running_rows] == [first_agent.id]
+
+
+def test_list_runnable_task_approvals_filters_to_requested_agents_on_approving_tasks(kanban_home):
+    with kb.connect() as conn:
+        runnable_task_id = kb.create_task(conn, title="runnable", assignee="ops")
+        blocked_task_id = kb.create_task(conn, title="blocked", assignee="ops")
+        archived_task_id = kb.create_task(conn, title="archived", assignee="ops")
+
+        runnable = kb.create_task_approval(
+            conn,
+            task_id=runnable_task_id,
+            approver_type="agent",
+            approver_profile="reviewer-a",
+            status="requested",
+        )
+        kb.create_task_approval(
+            conn,
+            task_id=runnable_task_id,
+            approver_type="human",
+            status="requested",
+        )
+        claimed = kb.create_task_approval(
+            conn,
+            task_id=runnable_task_id,
+            approver_type="agent",
+            approver_profile="reviewer-b",
+            status="requested",
+        )
+        wrong_status = kb.create_task_approval(
+            conn,
+            task_id=runnable_task_id,
+            approver_type="agent",
+            approver_profile="reviewer-c",
+            status="running",
+        )
+        wrong_task_status = kb.create_task_approval(
+            conn,
+            task_id=blocked_task_id,
+            approver_type="agent",
+            approver_profile="reviewer-d",
+            status="requested",
+        )
+        archived = kb.create_task_approval(
+            conn,
+            task_id=archived_task_id,
+            approver_type="agent",
+            approver_profile="reviewer-e",
+            status="requested",
+        )
+
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (runnable_task_id,))
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (blocked_task_id,))
+        conn.execute("UPDATE tasks SET status = 'archived' WHERE id = ?", (archived_task_id,))
+        conn.execute(
+            "UPDATE task_approvals SET claim_lock = ?, updated_at = ? WHERE id = ?",
+            ("lease-1", 1_500, claimed.id),
+        )
+
+        approvals = kb.list_runnable_task_approvals(conn)
+        limited = kb.list_runnable_task_approvals(conn, limit=1)
+
+    assert [approval.id for approval in approvals] == [runnable.id]
+    assert [approval.id for approval in limited] == [runnable.id]
+    assert claimed.id not in [approval.id for approval in approvals]
+    assert wrong_status.id not in [approval.id for approval in approvals]
+    assert wrong_task_status.id not in [approval.id for approval in approvals]
+    assert archived.id not in [approval.id for approval in approvals]
+
+
+def test_claim_task_approval_creates_live_run_and_claim_event(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="Reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        claimed = kb.claim_task_approval(
+            conn,
+            approval.id,
+            ttl_seconds=90,
+            claimer="dispatcher:123",
+            now=1_000,
+        )
+        run_row = conn.execute(
+            "SELECT * FROM task_approval_runs WHERE approval_id = ?",
+            (approval.id,),
+        ).fetchone()
+        event_row = conn.execute(
+            "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.claim_lock == "dispatcher:123"
+    assert claimed.claim_expires == 1_090
+    assert claimed.last_heartbeat_at == 1_000
+    assert claimed.current_run_id is not None
+    assert run_row is not None
+    assert run_row["id"] == claimed.current_run_id
+    assert run_row["status"] == "running"
+    assert run_row["profile"] == "reviewer"
+    assert run_row["claim_lock"] == "dispatcher:123"
+    assert run_row["claim_expires"] == 1_090
+    assert run_row["last_heartbeat_at"] == 1_000
+    assert run_row["started_at"] == 1_000
+    assert event_row is not None
+    assert event_row["kind"] == "approval_claimed"
+    assert event_row["run_id"] == claimed.current_run_id
+    assert json.loads(event_row["payload"]) == {
+        "approval_id": approval.id,
+        "lock": "dispatcher:123",
+        "expires": 1090,
+        "run_id": claimed.current_run_id,
+        "approver_profile": "reviewer",
+    }
+
+
+def test_claim_task_approval_returns_none_when_row_is_not_runnable(kanban_home):
+    with kb.connect() as conn:
+        todo_task_id = kb.create_task(conn, title="todo target")
+        reviewing_task_id = kb.create_task(conn, title="review target")
+        todo_approval = kb.create_task_approval(
+            conn,
+            task_id=todo_task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        human_approval = kb.create_task_approval(
+            conn,
+            task_id=reviewing_task_id,
+            approver_type="human",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (reviewing_task_id,))
+
+        todo_claim = kb.claim_task_approval(conn, todo_approval.id, claimer="dispatcher:1", now=2_000)
+        human_claim = kb.claim_task_approval(conn, human_approval.id, claimer="dispatcher:1", now=2_000)
+        run_count = conn.execute("SELECT COUNT(*) AS count FROM task_approval_runs").fetchone()["count"]
+
+    assert todo_claim is None
+    assert human_claim is None
+    assert run_count == 0
+
+
+def test_task_approval_runtime_helpers_update_live_row_and_run_together(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(
+            conn,
+            approval.id,
+            ttl_seconds=60,
+            claimer="dispatcher:55",
+            now=500,
+        )
+        assert claimed is not None
+
+        assert kb.set_task_approval_worker_pid(conn, approval.id, 4321, expected_run_id=claimed.current_run_id)
+        assert kb.heartbeat_task_approval(
+            conn,
+            approval.id,
+            note="still reviewing",
+            expected_run_id=claimed.current_run_id,
+            ttl_seconds=120,
+            now=700,
+        )
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT worker_pid, last_heartbeat_at, claim_expires FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        event_rows = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+
+    assert refreshed is not None
+    assert refreshed.worker_pid == 4321
+    assert refreshed.last_heartbeat_at == 700
+    assert refreshed.claim_expires == 820
+    assert run_row is not None
+    assert run_row["worker_pid"] == 4321
+    assert run_row["last_heartbeat_at"] == 700
+    assert run_row["claim_expires"] == 820
+    assert [row["kind"] for row in event_rows[-2:]] == ["approval_spawned", "approval_heartbeat"]
+    assert json.loads(event_rows[-2]["payload"]) == {"approval_id": approval.id, "pid": 4321}
+    assert json.loads(event_rows[-1]["payload"]) == {
+        "approval_id": approval.id,
+        "note": "still reviewing",
+    }
 
 
 def test_create_task_approval_run_inserts_agent_runs(kanban_home):
