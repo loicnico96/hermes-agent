@@ -2115,9 +2115,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
-    # cap (#21582), and kanban.max_spawn as the per-tick spawn limit
-    # (#28805). Same semantics as the gateway dispatch path so behavior
-    # matches whether the user runs the CLI directly or relies on the
+    # cap (#21582), kanban.max_spawn as the per-tick spawn limit
+    # (#28805), and kanban.max_approval_spawn as the approval-worker cap.
+    # Same semantics as the gateway dispatch path so behavior matches
+    # whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
     try:
         from hermes_cli.config import load_config
@@ -2138,6 +2139,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        max_approval_spawn = _coerce_positive_int(_kanban_cfg.get("max_approval_spawn"))
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2148,12 +2150,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        max_approval_spawn = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
+            max_approval_spawn=max_approval_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
@@ -2170,6 +2174,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
+            ],
+            "approval_spawned": [
+                {"approval_id": approval_id, "approver_profile": profile, "task_id": task_id}
+                for (approval_id, profile, task_id) in res.approval_spawned
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
@@ -2198,6 +2206,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if res.approval_spawned:
+        print(f"Approval spawned: {len(res.approval_spawned)}")
+        for approval_id, profile, task_id in res.approval_spawned:
+            tag = " (dry)" if args.dry_run else ""
+            print(f"  - approval {approval_id}  ->  {profile or '-'}  for {task_id}{tag}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
