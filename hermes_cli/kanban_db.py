@@ -109,8 +109,7 @@ VALID_APPROVAL_STATUSES = {
     "escalated",
     "failed",
 }
-LIVE_APPROVAL_STATUSES = {"requested", "running"}
-TERMINAL_APPROVAL_STATUSES = VALID_APPROVAL_STATUSES - LIVE_APPROVAL_STATUSES
+TERMINAL_APPROVAL_STATUSES = VALID_APPROVAL_STATUSES - {"requested", "running"}
 DECISION_APPROVAL_STATUSES = {"approved", "rejected", "escalated"}
 VALID_APPROVAL_RUN_STATUSES = {
     "running",
@@ -2774,13 +2773,6 @@ def list_task_approvals(
         task_id=task_id,
         status=status,
         approver_type=approver_type,
-    )
-
-
-def _approval_is_actively_owned(approval: Approval) -> bool:
-    return approval.status == "running" or any(
-        marker is not None
-        for marker in (approval.current_run_id, approval.claim_lock, approval.claim_expires, approval.worker_pid)
     )
 
 
