@@ -254,6 +254,17 @@ KANBAN_GUIDANCE = (
     "cross-agent handoffs that outlive one API loop."
 )
 
+KANBAN_APPROVAL_GUIDANCE = (
+    "# Kanban approval worker contract\n"
+    "You are running as an autonomous approval worker for one Kanban approval row.\n"
+    "Return exactly one JSON object and nothing else.\n"
+    "Allowed schema:\n"
+    "- `decision`: `approved`, `rejected`, or `escalated`\n"
+    "- optional `comment`: string\n"
+    "Do not mutate approval rows directly. Malformed, extra, or contradictory output is failure.\n"
+    "Use the provided task-centric context to reason about the parent task; do not assume live approval-row visibility."
+)
+
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"
     "You MUST use your tools to take action — do not describe what you would do "

@@ -3624,6 +3624,124 @@ def test_dispatch_review_spawns_when_ready_empty(
     assert spawns[0] == t
 
 
+def test_dispatch_approval_dry_run_reports_runnable_rows(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        res = kb.dispatch_once(conn, dry_run=True, max_approval_spawn=2)
+        refreshed = kb.get_task_approval(conn, approval.id)
+
+    assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+
+
+def test_dispatch_approval_uses_separate_concurrency_cap(kanban_home):
+    spawned = []
+
+    def fake_approval_spawn(approval, workspace, board=None):
+        spawned.append((approval.id, workspace, board))
+        return 4242
+
+    with kb.connect() as conn:
+        busy_task = kb.create_task(conn, title="already running", assignee="worker")
+        kb.claim_task(conn, busy_task)
+
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        res = kb.dispatch_once(
+            conn,
+            max_spawn=0,
+            max_approval_spawn=1,
+            approval_spawn_fn=fake_approval_spawn,
+        )
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        assert refreshed is not None
+        run_row = conn.execute(
+            "SELECT worker_pid FROM task_approval_runs WHERE id = ?",
+            (refreshed.current_run_id,),
+        ).fetchone()
+
+    assert not res.spawned
+    assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
+    assert spawned and spawned[0][0] == approval.id
+    assert refreshed.status == "running"
+    assert refreshed.worker_pid == 4242
+    assert run_row is not None
+    assert run_row["worker_pid"] == 4242
+
+
+def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
+    def boom(approval, workspace, board=None):
+        raise RuntimeError("approval spawn failed")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        kb.dispatch_once(conn, approval_spawn_fn=boom, max_approval_spawn=1)
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, error FROM task_approval_runs WHERE approval_id = ? ORDER BY id DESC LIMIT 1",
+            (approval.id,),
+        ).fetchone()
+        event_row = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 1
+    assert refreshed.last_failure_error == "approval spawn failed"
+    assert run_row is not None
+    assert run_row["status"] == "spawn_failed"
+    assert run_row["outcome"] == "spawn_failed"
+    assert run_row["error"] == "approval spawn failed"
+    assert event_row is not None
+    assert event_row["kind"] == "approval_failed"
+    assert json.loads(event_row["payload"])["approval_id"] == approval.id
+
+
+def test_parse_approval_worker_response_enforces_exact_json_contract():
+    parsed = kb.parse_approval_worker_response('{"decision":"approved","comment":"looks good"}')
+    assert parsed == kb.ApprovalWorkerDecision(
+        decision="approved",
+        comment="looks good",
+    )
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        kb.parse_approval_worker_response("approved")
+    with pytest.raises(ValueError, match="unsupported keys"):
+        kb.parse_approval_worker_response('{"decision":"approved","reason":"extra"}')
+    with pytest.raises(ValueError, match="must be one of"):
+        kb.parse_approval_worker_response('{"decision":"failed"}')
+
+
 def test_has_spawnable_review_true(kanban_home):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
     with kb.connect() as conn:
