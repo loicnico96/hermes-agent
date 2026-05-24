@@ -366,13 +366,14 @@ def test_task_approval_runtime_helpers_update_live_row_and_run_together(kanban_h
             now=500,
         )
         assert claimed is not None
+        assert claimed.current_run_id is not None
 
-        assert kb.set_task_approval_worker_pid(conn, approval.id, 4321, expected_run_id=claimed.current_run_id)
+        assert kb.set_task_approval_worker_pid(conn, approval.id, 4321, run_id=claimed.current_run_id)
         assert kb.heartbeat_task_approval(
             conn,
             approval.id,
+            run_id=claimed.current_run_id,
             note="still reviewing",
-            expected_run_id=claimed.current_run_id,
             ttl_seconds=120,
             now=700,
         )
@@ -401,6 +402,58 @@ def test_task_approval_runtime_helpers_update_live_row_and_run_together(kanban_h
         "approval_id": approval.id,
         "note": "still reviewing",
     }
+
+
+def test_task_approval_runtime_helpers_require_matching_run_id(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(
+            conn,
+            approval.id,
+            ttl_seconds=60,
+            claimer="dispatcher:55",
+            now=500,
+        )
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+
+        assert not kb.set_task_approval_worker_pid(conn, approval.id, 4321, run_id=claimed.current_run_id + 1)
+        assert not kb.heartbeat_task_approval(
+            conn,
+            approval.id,
+            run_id=claimed.current_run_id + 1,
+            note="wrong run",
+            ttl_seconds=120,
+            now=700,
+        )
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT worker_pid, last_heartbeat_at, claim_expires FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        event_rows = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+
+    assert refreshed is not None
+    assert refreshed.worker_pid is None
+    assert refreshed.last_heartbeat_at == 500
+    assert refreshed.claim_expires == 560
+    assert run_row is not None
+    assert run_row["worker_pid"] is None
+    assert run_row["last_heartbeat_at"] == 500
+    assert run_row["claim_expires"] == 560
+    assert [row["kind"] for row in event_rows] == ["created", "approval_claimed"]
 
 
 def test_create_task_approval_run_inserts_agent_runs(kanban_home):
