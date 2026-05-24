@@ -53,10 +53,10 @@ Meaning:
 - independent from the existing task-worker concurrency cap
 
 Default for this slice:
-- if unset, use `kanban.max_spawn`
-- if set, use the explicit approval cap
+- default config value is `2`
+- do not fall back to `kanban.max_spawn`
 
-This keeps v1 configuration small while allowing approval/task separation.
+This keeps approval throughput isolated and predictable.
 
 ---
 
@@ -118,12 +118,13 @@ Approval workers are one-shot decision jobs, not general mutable workers.
 
 ### 5.1 Runtime contract
 
-The approval worker receives enough context to:
+The approval worker receives enough task-centric context to:
 - inspect the task
 - inspect relevant comments / task history / result summary
 - return exactly one decision plus optional comment text
 
 The approval worker does **not** receive approval-mutation tools.
+It also does not require direct injected visibility into live approval-row state; prior approval context should be discoverable through ordinary task comments/events.
 
 ### 5.2 Expected structured output
 
@@ -133,6 +134,8 @@ The runtime must require a final structured payload with:
 - `comment`: optional string
 
 Any other shape is invalid.
+
+The base runtime/system prompt for this slice should state the contract only. Default approval behavior should come from a default `kanban_approver` skill when no explicit approver skill is specified.
 
 ### 5.3 Output validation
 
@@ -182,9 +185,10 @@ For any valid decision:
 `decision = escalated`
 - set approval-row status to `escalated`
 - ensure at least one human approval row exists for the same task
+- if a human approval row already exists, reset it to `requested`
 - recompute task state
 
-If an existing human approval row already exists on the task, reuse it; do not create duplicate generic human rows.
+If an existing human approval row already exists on the task, reuse it by resetting it to `requested`; do not create duplicate generic human rows.
 The `escalated` row itself has opted out of the approval decision and remains only as audit/history plus the reason the human gate was assigned.
 
 ---
@@ -234,7 +238,7 @@ When a failure causes `consecutive_failures` to reach 3:
 4. mark the approval run terminal
 5. clear live claim fields
 6. ensure at least one human approval row exists for the same task
-7. reuse an existing human approval row when one already exists
+7. if a human approval row already exists, reset it to `requested`
 8. emit an approval-failed event
 9. recompute task state
 

@@ -1,6 +1,6 @@
 # Kanban Task Approvals — Master Spec
 
-Status: Draft (phased rollout; Phase 2 kernel semantics landed, Phase 3 CLI/manual workflows next)
+Status: Draft (phased rollout; Phase 2 kernel semantics and Phase 3 CLI/manual workflows landed, Phase 4 autonomous approval runtime next)
 Owner: Hermes Kanban
 Scope: Kanban DB, dispatcher/runtime, worker prompt contract, and CLI surface. Dashboard UI is out of scope.
 
@@ -222,6 +222,13 @@ The reset operation is used by:
 
 Agent approvers are not allowed to mutate approval rows directly.
 
+By default, autonomous approval workers should reason from task-centric context only:
+- task metadata/body/result summary,
+- task comments,
+- task events/history.
+
+They do not need direct injected visibility into the live approval-row set. Previous approval activity should be discoverable through ordinary task comments/events.
+
 The runtime must expect one strict structured final output with:
 
 - `decision`: one of `approved`, `rejected`, `escalated`
@@ -363,17 +370,18 @@ Rationale:
 
 ## 8) Worker prompt / runtime integration
 
-The implementation must update the approval-agent prompt path so the approval worker is instructed to do exactly one of:
-- approve
-- reject
-- escalate
+The implementation must update the approval-agent prompt path so the base runtime/system prompt states only the execution contract:
+- accepted structured output shape,
+- accepted decision values,
+- optional comment field,
+- no direct approval-row mutation,
+- malformed, extra, or contradictory output is treated as failure.
 
-The prompt must also instruct the agent that:
-- it can return optional comment text
-- it must not attempt direct approval-row mutation
-- malformed or extra output will be treated as failure
+The base prompt contract must not hardcode one approval policy or style of reasoning beyond the structure/authority boundary.
 
-This prompt contract belongs in runtime code / prompt builder, not only in tests.
+Phase 4 should also add a default `kanban_approver` skill that auto-loads only when the approval row does not specify an explicit approver skill. An explicit approver skill must override the default rather than stack on top of it automatically.
+
+This prompt/runtime contract belongs in runtime code / prompt builder, not only in tests. Concrete autonomous runtime details are specified in `04-autonomous-agent-approval-runtime.md`.
 
 ---
 
@@ -408,3 +416,4 @@ Requirements:
 DB migration details are specified in `01-db-and-migration.md`.
 Runtime/dispatcher details are specified in `02-runtime-and-dispatch.md`.
 Concrete Phase 3 CLI/manual workflow details are specified in `03-cli-and-manual-approval-workflows.md`.
+Concrete Phase 4 autonomous approval runtime details are specified in `04-autonomous-agent-approval-runtime.md`.
