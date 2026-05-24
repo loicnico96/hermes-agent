@@ -319,6 +319,53 @@ def test_record_task_approval_decision_treats_missing_approval_as_stale_noop(kan
     assert run_row["outcome"] is None
 
 
+
+def test_record_task_approval_decision_treats_missing_run_row_as_stale_noop(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   current_run_id = ?,
+                   claim_lock = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (run.id, "lease-1", 8_900, approval.id),
+        )
+        conn.execute("DELETE FROM task_approval_runs WHERE id = ?", (run.id,))
+
+        aggregate_status = kb.record_task_approval_decision(
+            conn,
+            approval_id=approval.id,
+            expected_run_id=run.id,
+            status="approved",
+            now=9_100,
+        )
+        refreshed = kb.get_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+
+    assert aggregate_status is None
+    assert refreshed is not None
+    assert refreshed.status == "running"
+    assert refreshed.current_run_id == run.id
+    assert refreshed.claim_lock == "lease-1"
+    assert refreshed.updated_at == 8_900
+    assert task is not None
+    assert task.status == "approving"
+
+
+
 def test_record_task_approval_decision_rejects_live_or_retry_statuses(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target")
@@ -436,8 +483,8 @@ def test_reset_task_approval_requires_parent_task_to_be_approving(kanban_home):
             kb.reset_task_approval(conn, approval.id)
 
 
-@pytest.mark.parametrize("status", ["running", "approved", "rejected", "escalated", "failed"])
-def test_reset_task_approval_accepts_only_live_operator_reset_statuses(kanban_home, monkeypatch, status):
+@pytest.mark.parametrize("status", ["requested", "running", "approved", "rejected", "escalated", "failed"])
+def test_reset_task_approval_accepts_any_existing_status(kanban_home, monkeypatch, status):
     monkeypatch.setattr(kb.time, "time", lambda: 8_000)
 
     with kb.connect() as conn:
@@ -460,8 +507,9 @@ def test_reset_task_approval_accepts_only_live_operator_reset_statuses(kanban_ho
     assert task.status == "approving"
 
 
+def test_reset_task_approval_is_noop_for_requested_rows(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_100)
 
-def test_reset_task_approval_rejects_requested_rows(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target")
         approval = kb.create_task_approval(
@@ -473,8 +521,10 @@ def test_reset_task_approval_rejects_requested_rows(kanban_home):
         )
         conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
 
-        with pytest.raises(ValueError, match="reset only supports statuses"):
-            kb.reset_task_approval(conn, approval.id)
+        reset = kb.reset_task_approval(conn, approval.id)
+
+    assert reset.status == "requested"
+    assert reset.updated_at == 8_100
 
 
 
@@ -558,7 +608,7 @@ def test_remove_task_approval_rejects_unknown_approval(kanban_home):
             kb.remove_task_approval(conn, 999999)
 
 
-def test_remove_task_approval_rejects_actively_owned_rows(kanban_home):
+def test_remove_task_approval_allows_actively_owned_rows_and_deletes_run_rows(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
         approval = kb.create_task_approval(
@@ -574,8 +624,7 @@ def test_remove_task_approval_rejects_actively_owned_rows(kanban_home):
             (run.id, "lease-1", 7_600, approval.id),
         )
 
-        with pytest.raises(ValueError, match="cannot remove an actively owned approval"):
-            kb.remove_task_approval(conn, approval.id)
+        deleted = kb.remove_task_approval(conn, approval.id)
 
         refreshed = kb.get_task_approval(conn, approval.id)
         run_count = conn.execute(
@@ -583,10 +632,54 @@ def test_remove_task_approval_rejects_actively_owned_rows(kanban_home):
             (approval.id,),
         ).fetchone()[0]
 
-    assert refreshed is not None
-    assert refreshed.id == approval.id
-    assert refreshed.current_run_id == run.id
-    assert run_count == 1
+    assert deleted.id == approval.id
+    assert refreshed is None
+    assert run_count == 0
+
+
+def test_record_manual_task_approval_decision_allows_valid_human_runtime_states(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_950)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        human = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="human",
+            status="rejected",
+        )
+        agent = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+
+        aggregate_status = kb.record_manual_task_approval_decision(
+            conn,
+            approval_id=human.id,
+            status="approved",
+            comment="re-opened and approved",
+            comment_author="reviewer",
+        )
+
+        task = kb.get_task(conn, task_id)
+        refreshed_human = kb.get_task_approval(conn, human.id)
+        refreshed_agent = kb.get_task_approval(conn, agent.id)
+        comments = kb.list_comments(conn, task_id)
+
+    assert aggregate_status == "approving"
+    assert task is not None
+    assert task.status == "approving"
+    assert refreshed_human is not None
+    assert refreshed_human.status == "approved"
+    assert refreshed_human.comment_id == comments[0].id
+    assert refreshed_human.updated_at == 8_950
+    assert refreshed_agent is not None
+    assert refreshed_agent.status == "requested"
+    assert [comment.body for comment in comments] == ["re-opened and approved"]
 
 
 
@@ -792,30 +885,6 @@ def test_record_manual_task_approval_decision_enforces_human_and_approving_gate(
                 approval_id=approval.id,
                 status="approved",
             )
-
-
-@pytest.mark.parametrize("approval_status", ["running", "rejected", "escalated", "failed"])
-def test_record_manual_task_approval_decision_rejects_non_manual_source_statuses(
-    kanban_home,
-    approval_status,
-):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="approval target", assignee="ops")
-        approval = kb.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="human",
-            status=approval_status,
-        )
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
-
-        with pytest.raises(ValueError, match="manual approval decisions only support statuses"):
-            kb.record_manual_task_approval_decision(
-                conn,
-                approval_id=approval.id,
-                status="approved",
-            )
-
 
 
 def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home, monkeypatch):

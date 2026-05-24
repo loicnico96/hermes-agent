@@ -223,7 +223,8 @@ Optional flags:
 
 Rules:
 - valid only when the parent task is currently `approving`,
-- valid for rows in `running`, `approved`, `rejected`, `escalated`, or `failed`,
+- valid for any existing approval row state,
+- resetting an already-`requested` row is an allowed no-op,
 - reuses the first-class kernel reset operation,
 - does not recompute task status; with the task still in `approving` and the row reset to `requested`, the aggregate necessarily remains `approving`.
 - resetting a `running` row does not require eagerly terminating the already-spawned agent process; any later result from that old run is stale/discarded because the row no longer remains in the owned `running` state for that run.
@@ -280,7 +281,7 @@ If Phase 3 adds a dedicated helper for human decisions, it must:
 
 1. load the approval row,
 2. validate that it is a human row,
-3. validate that the row is currently in the narrow manual-decision source set (`requested` or `approved`),
+3. validate only that the parent task is currently `approving`,
 4. optionally append a task comment and capture `comment_id`,
 5. update the approval row status transactionally,
 6. clear live mutable row fields exactly when the reset/decision semantics require it,
@@ -295,10 +296,11 @@ If Phase 3 adds `remove_task_approval(...)`, it must:
 
 1. remove exactly one approval row,
 2. reject unknown approval ids,
-3. reject removal of an actively owned/running approval row,
+3. eagerly remove the approval row even when a worker currently owns it,
 4. recompute the parent task state transactionally when needed,
 5. preserve task comments and event history,
-6. leave future dispatcher-specific reclaim/cancel behavior out of scope.
+6. silently discard late worker results when the approval row and/or approval-run row no longer exists,
+7. leave future dispatcher-specific reclaim/cancel behavior out of scope.
 
 ---
 
