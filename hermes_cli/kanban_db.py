@@ -139,7 +139,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "approving", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "approval", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
@@ -3737,7 +3737,7 @@ def complete_task(
         # Successful worker completion owns the fresh-result reset boundary.
         # If approvals are attached, the new task result must enter a fresh
         # approval cycle instead of reusing stale approval state.
-        next_status = "approving" if list_task_approvals(conn, task_id) else "done"
+        next_status = "approval" if list_task_approvals(conn, task_id) else "done"
 
         if expected_run_id is None:
             cur = conn.execute(
@@ -3772,7 +3772,7 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
-        if next_status == "approving":
+        if next_status == "approval":
             _prepare_task_approvals_for_new_completion_cycle(conn, task_id)
         run_id = _end_run(
             conn, task_id,
@@ -3797,30 +3797,39 @@ def complete_task(
         # full summary stays on the run row.
         ev_summary = (summary if summary is not None else result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
-        completed_payload: dict = {
-            "result_len": len(result) if result else 0,
-            "summary": ev_summary or None,
-            "task_status": next_status,
-        }
-        if verified_cards:
-            completed_payload["verified_cards"] = verified_cards
-        # Carry artifact paths in the event payload so the gateway
-        # notifier can upload them as native attachments alongside the
-        # completion message. Workers pass these via
-        # ``kanban_complete(artifacts=[...])`` which stashes the list in
-        # ``metadata["artifacts"]`` — we promote it onto the event so
-        # consumers don't have to fetch the run row to find it.
-        if isinstance(metadata, dict):
-            md_artifacts = metadata.get("artifacts")
-            if isinstance(md_artifacts, (list, tuple)):
-                cleaned_artifacts = [
-                    str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
-                ]
-                if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
+        event_kind = "awaiting_approval" if next_status == "approval" else "completed"
+        if event_kind == "awaiting_approval":
+            event_payload: dict = {
+                "task_status": next_status,
+                "run_id": run_id,
+            }
+        else:
+            event_payload = {
+                "result_len": len(result) if result else 0,
+                "summary": ev_summary or None,
+                "task_status": next_status,
+            }
+            if verified_cards:
+                event_payload["verified_cards"] = verified_cards
+            # Carry artifact paths in the event payload so the gateway
+            # notifier can upload them as native attachments alongside the
+            # completion message. Workers pass these via
+            # ``kanban_complete(artifacts=[...])`` which stashes the list in
+            # ``metadata["artifacts"]`` — we promote it onto the event so
+            # consumers don't have to fetch the run row to find it.
+            if isinstance(metadata, dict):
+                md_artifacts = metadata.get("artifacts")
+                if isinstance(md_artifacts, (list, tuple)):
+                    cleaned_artifacts = [
+                        str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
+                    ]
+                    if cleaned_artifacts:
+                        event_payload["artifacts"] = cleaned_artifacts
         _append_event(
-            conn, task_id, "completed",
-            completed_payload,
+            conn,
+            task_id,
+            event_kind,
+            event_payload,
             run_id=run_id,
         )
     # Prose-scan the summary + result for t_<hex> references that do
