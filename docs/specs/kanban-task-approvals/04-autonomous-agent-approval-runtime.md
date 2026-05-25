@@ -1,6 +1,6 @@
 # Kanban Task Approvals — Autonomous Agent Approval Runtime Spec
 
-Status: Draft
+Status: Draft (Phase 4 runtime slice landed on the branch/PR lane; Phase 5 semantic/runtime cleanup for status naming, event payloads, and worker/approver tool surfaces is specified in `05-approval-event-and-worker-surface-hardening.md`)
 Depends on:
 - `docs/specs/kanban-task-approvals/00-master-spec.md`
 - `docs/specs/kanban-task-approvals/01-db-and-migration.md`
@@ -16,7 +16,7 @@ Scope: concrete Phase 4 runtime slice for dispatcher-managed autonomous agent ap
 
 Make agent approvals actually execute.
 
-After this phase, an attached agent approval row on a task in `approving` must be able to:
+After this phase, an attached agent approval row on a task in `approval` must be able to:
 
 1. become runnable through the dispatcher,
 2. be claimed atomically,
@@ -139,7 +139,7 @@ An approval row is runnable iff all of the following are true:
 1. `approver_type = 'agent'`,
 2. `status = 'requested'`,
 3. `approver_profile IS NOT NULL`,
-4. the parent task exists and `tasks.status = 'approving'`,
+4. the parent task exists and `tasks.status = 'approval'`,
 5. `claim_lock IS NULL`,
 6. the parent task is not archived.
 
@@ -475,7 +475,7 @@ Focused test placement is expected in the existing approval DB/dispatcher/runtim
 
 Phase 4 is complete only if all of the following hold:
 
-1. a task in `approving` with a runnable agent approval row is picked up automatically by the dispatcher,
+1. a task in `approval` with a runnable agent approval row is picked up automatically by the dispatcher,
 2. approval rows are claimed atomically before process spawn,
 3. approval workers return exactly one structured decision payload or fail,
 4. valid decisions mutate approval state only through kernel-owned helpers,

@@ -1,6 +1,6 @@
 # Kanban Task Approvals — CLI and Manual Approval Workflows Spec
 
-Status: Draft
+Status: Draft (Phase 3 manual workflow slice landed on the branch/PR lane; Phase 5 renames task status to `approval` and switches human `approve` / `reject` to task-centric addressing in `05-approval-event-and-worker-surface-hardening.md`)
 Depends on:
 - `docs/specs/kanban-task-approvals/00-master-spec.md`
 - `docs/specs/kanban-task-approvals/01-db-and-migration.md`
@@ -123,7 +123,7 @@ Rules:
 - duplicate agent approvals for the same `(profile, skill)` pair are forbidden.
 
 Rationale:
-- a task already in `approving` keeps its current task status,
+- a task already in `approval` keeps its current task status,
 - a task still in pre-completion execution (`todo`, `ready`, `running`, `blocked`, `scheduled`) simply gains a future gate that will matter on completion.
 
 ### 4.2 `hermes kanban approval list`
@@ -160,8 +160,8 @@ Optional flags:
 Rules:
 - removing a missing approval is invalid,
 - removal must be transactional,
-- removal must recompute parent task state when the parent task is currently `approving`,
-- if removing the last approval row leaves an `approving` task with no live approvals, the task moves to `done`,
+- removal must recompute parent task state when the parent task is currently `approval`,
+- if removing the last approval row leaves an `approval` task with no live approvals, the task moves to `done`,
 - Phase 3 does **not** implement the future special-case human-gate cleanup for `escalated` / `failed` dependency graphs because that flow depends on Phase 4 escalation wiring not yet being live.
 
 Phase 3 removal semantics therefore operate only on the approval row being removed plus aggregate recomputation from the remaining rows.
@@ -171,16 +171,17 @@ Phase 3 removal semantics therefore operate only on the approval row being remov
 Record a manual human approval decision.
 
 ```bash
-hermes kanban approval approve <approval_id> [--comment "..."]
+hermes kanban approval approve <task_id> [--comment "..."]
 ```
 
 Optional flags:
 - `--json`
 
 Rules:
-- valid only for human approval rows,
-- valid only when the parent task is currently `approving`,
-- manual human decisions do not add a separate requested-only precondition; while a valid human approval row remains attached to a parent task in `approving`, the decision is allowed through the shared kernel path,
+- valid only when the task has exactly one human approval row,
+- valid only when the parent task is currently `approval`,
+- the CLI resolves the single human approval row for the task internally rather than requiring the operator to pass `approval_id`,
+- manual human decisions do not add a separate requested-only precondition; while a valid human approval row remains attached to a parent task in `approval`, the decision is allowed through the shared kernel path,
 - `--comment` appends a task comment and stores the resulting `comment_id`,
 - the command must use the same kernel decision path as other approval decisions rather than directly updating the row in CLI code,
 - task state is recomputed transactionally.
@@ -194,20 +195,21 @@ Implementation note:
 Record a manual human rejection decision.
 
 ```bash
-hermes kanban approval reject <approval_id> [--comment "..."]
+hermes kanban approval reject <task_id> [--comment "..."]
 ```
 
 Optional flags:
 - `--json`
 
 Rules:
-- valid only for human approval rows,
-- valid only when the parent task is currently `approving`,
-- manual human decisions do not add a separate requested-only precondition; while a valid human approval row remains attached to a parent task in `approving`, the decision is allowed through the shared kernel path,
+- valid only when the task has exactly one human approval row,
+- valid only when the parent task is currently `approval`,
+- the CLI resolves the single human approval row for the task internally rather than requiring the operator to pass `approval_id`,
+- manual human decisions do not add a separate requested-only precondition; while a valid human approval row remains attached to a parent task in `approval`, the decision is allowed through the shared kernel path,
 - `--comment` appends a task comment and stores the resulting `comment_id`,
 - the command must trigger the same authoritative rejection-cycle semantics already implemented in Phase 2:
   - rejection recorded first,
-  - task returns from `approving` to `todo`,
+  - task returns from `approval` to `todo`,
   - attached approval rows reset to `requested` in the same transaction.
 
 ### 4.6 `hermes kanban approval reset`
@@ -222,11 +224,11 @@ Optional flags:
 - `--json`
 
 Rules:
-- valid only when the parent task is currently `approving`,
+- valid only when the parent task is currently `approval`,
 - valid for any existing approval row state,
 - resetting an already-`requested` row is an allowed no-op,
 - reuses the first-class kernel reset operation,
-- does not recompute task status; with the task still in `approving` and the row reset to `requested`, the aggregate necessarily remains `approving`.
+- does not recompute task status; with the task still in `approval` and the row reset to `requested`, the aggregate necessarily remains `approval`.
 - resetting a `running` row does not require eagerly terminating the already-spawned agent process; any later result from that old run is stale/discarded because the row no longer remains in the owned `running` state for that run.
 
 In this phase, reset is an explicit operator tool. It is not a substitute for dispatcher reclaim logic.
@@ -279,9 +281,9 @@ The distinction is:
 
 If Phase 3 adds a dedicated helper for human decisions, it must:
 
-1. load the approval row,
+1. resolve the single human approval row for the task,
 2. validate that it is a human row,
-3. validate only that the parent task is currently `approving`,
+3. validate only that the parent task is currently `approval`,
 4. optionally append a task comment and capture `comment_id`,
 5. update the approval row status transactionally,
 6. clear live mutable row fields exactly when the reset/decision semantics require it,
@@ -370,10 +372,10 @@ Phase 3 is complete only if all of the following hold:
 3. Duplicate approval-gate invariants are enforced through the CLI with clear errors.
 4. `hermes kanban show <task_id>` exposes attached approvals in both text and JSON output.
 5. `hermes kanban approval list` can filter by task, status, and type.
-6. A human can approve a human approval row from the CLI and the parent task reaches `done` when the aggregate becomes satisfied.
-7. A human can reject a human approval row from the CLI and the parent task returns to `todo` with approval rows reset to `requested` in the same transaction.
-8. Removing the last approval row from an `approving` task moves the task to `done`.
-9. Resetting a non-running approval row through the CLI is allowed only while the parent task is `approving`, returns the row to `requested`, and leaves the parent task in `approving` without needing a separate recompute step.
+6. A human can approve a task-centric human approval from the CLI and the parent task reaches `done` when the aggregate becomes satisfied.
+7. A human can reject a task-centric human approval from the CLI and the parent task returns to `todo` with approval rows reset to `requested` in the same transaction.
+8. Removing the last approval row from an `approval` task moves the task to `done`.
+9. Resetting a non-running approval row through the CLI is allowed only while the parent task is `approval`, returns the row to `requested`, and leaves the parent task in `approval` without needing a separate recompute step.
 10. Manual CLI decisions do not fabricate approval-run rows.
 11. CLI code does not duplicate aggregate-lifecycle logic already owned by `kanban_db.py`.
 12. Boards with no approval usage keep their existing behavior.
