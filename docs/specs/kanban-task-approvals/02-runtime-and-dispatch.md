@@ -1,6 +1,6 @@
 # Kanban Task Approvals — Runtime and Dispatch Spec
 
-Status: Draft (no code changes yet)
+Status: Draft (historical pre-Phase-4 runtime draft; canonical Phase 4 runtime semantics now live in `04-autonomous-agent-approval-runtime.md`, and Phase 5 event/status/tool-surface cleanup is specified in `05-approval-event-and-worker-surface-hardening.md`)
 Depends on:
 - `docs/specs/kanban-task-approvals/00-master-spec.md`
 - `docs/specs/kanban-task-approvals/01-db-and-migration.md`
@@ -67,7 +67,7 @@ An approval row is runnable iff all of the following are true:
 1. `approver_type = 'agent'`
 2. `status = 'requested'`
 3. `approver_profile IS NOT NULL`
-4. the parent task exists and `tasks.status = 'approving'`
+4. the parent task exists and `tasks.status = 'approval'`
 5. `claim_lock IS NULL`
 6. the parent task is not archived
 
@@ -290,12 +290,12 @@ Keep the initial CLI surface small.
 
 ## 9) Parent-task interactions
 
-### 9.1 Task leaves `approving`
+### 9.1 Task leaves `approval`
 
-If a task leaves `approving` because one approval rejected and the aggregate resolver returned the task to `todo`, any other in-flight approval workers for that task are now stale relative to current task state.
+If a task leaves `approval` because one approval rejected and the aggregate resolver returned the task to `todo`, any other in-flight approval workers for that task are now stale relative to current task state.
 
 Required behavior:
-- a recorded rejection keeps the task in `approving` while any approval row is still `running`; once no row remains `running`, that rejection immediately drives the authoritative rejection-cycle path
+- a recorded rejection keeps the task in `approval` while any approval row is still `running`; once no row remains `running`, that rejection immediately drives the authoritative rejection-cycle path
 - late valid results must not re-advance the task incorrectly
 - result-application code must re-check task/approval row state before mutating
 - if the approval row is no longer in a state compatible with the returned result, the result is discarded at the business-state layer even if the worker process only finished later
@@ -334,30 +334,30 @@ Spawning remains dispatcher-owned.
 
 ## 11) Event names
 
-Use these exact event kinds in this slice.
+Use these exact task/approval lifecycle event kinds after the Phase 5 cleanup.
+
+### Task lifecycle
+- `awaiting_approval`
+- `completed`
 
 ### Approval-row lifecycle
 - `approval_requested`
 - `approval_removed`
 - `approval_decided`
-- `approval_reset`
 - `approval_failed`
 
 ### Approval-run lifecycle
 - `approval_claimed`
-- `approval_claim_extended`
-- `approval_spawn_failed`
-- `approval_timed_out`
-- `approval_crashed`
-- `approval_reclaimed`
-- `approval_invalid_output`
+- run-health/failure events may remain separate implementation details, but they must not reuse `completed` for the task handoff into approval
 
 Payload requirements:
-- always include `approval_id`
-- include `approval_run_id` for run events
-- include `decision` for `approval_decided`
-- include `comment_id` when a comment was written
-- include concise error text for failure events
+- `awaiting_approval` includes `task_status = approval` and the completed parent-task `run_id`
+- `approval_requested` includes approval identity plus approver type/profile/skill, and `requested_by_approval_id` only for escalation-driven human-gate requests
+- `approval_removed` includes approval identity plus approver type/profile/skill
+- `approval_decided` includes `decision`, optional `comment_id`, and optional `approval_run_id` for agent decisions
+- `completed` is reserved for real movement to `done`
+
+The exact payload contracts are specified in `05-approval-event-and-worker-surface-hardening.md`.
 
 ---
 

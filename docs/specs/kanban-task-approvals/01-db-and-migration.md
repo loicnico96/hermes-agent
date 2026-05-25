@@ -1,6 +1,6 @@
 # Kanban Task Approvals — DB and Migration Spec
 
-Status: Draft (no code changes yet)
+Status: Draft (schema/rule contract updated for the canonical `approval` task status; Phase 5 event/tool-surface cleanup is specified in `05-approval-event-and-worker-surface-hardening.md`)
 Depends on: `docs/specs/kanban-task-approvals/00-master-spec.md`
 Scope: SQLite schema, migration strategy, row ownership, and cleanup rules.
 
@@ -27,7 +27,7 @@ The current Kanban schema explicitly manages child-row deletion in application c
 
 ### 2.1 `tasks.status` expansion
 
-Extend task status validation to allow `approving`.
+Extend task status validation to allow `approval`.
 
 New task status set for this slice:
 - `triage`
@@ -37,7 +37,7 @@ New task status set for this slice:
 - `running`
 - `blocked`
 - `review`
-- `approving`
+- `approval`
 - `done`
 - `archived`
 
@@ -162,7 +162,7 @@ Implementation requirements:
 - create `task_approvals` if missing
 - create `task_approval_runs` if missing
 - add any new indexes with `IF NOT EXISTS`
-- expand task-status validation in Python code to accept `approving`
+- expand task-status validation in Python code to accept `approval`
 
 No backfill is required because existing boards have no approval rows.
 
@@ -201,7 +201,7 @@ Consequences:
 - approvals do not outlive the task
 - approval runs do not outlive the task
 - there is no standalone approval retention policy in this slice
-- approval rows are reset whenever the task moves to a status other than `approving`, `done`, or `archived`
+- approval rows are reset whenever the task moves to a status other than `approval`, `done`, or `archived`
 
 ### 5.2 Task archival
 
@@ -289,9 +289,9 @@ A migration is correct only if all of the following hold:
 1. Existing boards initialize successfully with zero approval rows.
 2. Existing non-approval task behavior is unchanged.
 3. New boards get both approval tables and indexes on first init.
-4. `tasks.status='approving'` is accepted by validation and persistence.
+4. `tasks.status='approval'` is accepted by validation and persistence.
 5. Permanent deletion of an archived task removes all approval rows and approval runs for that task.
 6. No migration code attempts to infer or backfill approvals from legacy review/block conventions.
 7. The kernel enforces the one-human-per-task invariant.
 8. The kernel enforces the one-agent-`(profile, skill)`-per-task invariant.
-9. Approval rows are reset whenever a task moves to a status other than `approving`, `done`, or `archived`.
+9. Approval rows are reset whenever a task moves to a status other than `approval`, `done`, or `archived`.
