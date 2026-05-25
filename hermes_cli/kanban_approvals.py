@@ -11,6 +11,25 @@ from typing import Any
 from hermes_cli import kanban_db as kb
 
 
+def _approval_run_to_dict(run: kb.ApprovalRun) -> dict[str, Any]:
+    return {
+        "id": run.id,
+        "approval_id": run.approval_id,
+        "task_id": run.task_id,
+        "profile": run.profile,
+        "status": run.status,
+        "claim_lock": run.claim_lock,
+        "claim_expires": run.claim_expires,
+        "worker_pid": run.worker_pid,
+        "last_heartbeat_at": run.last_heartbeat_at,
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+        "outcome": run.outcome,
+        "comment_id": run.comment_id,
+        "error": run.error,
+    }
+
+
 def _profile_author() -> str:
     for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
         value = os.environ.get(env)
@@ -48,6 +67,10 @@ def approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
     return _approval_to_dict(approval)
 
 
+def approval_run_to_dict(run: kb.ApprovalRun) -> dict[str, Any]:
+    return _approval_run_to_dict(run)
+
+
 def _format_approval_target(approval: kb.Approval) -> str:
     if approval.approver_type == "human":
         return "human"
@@ -69,6 +92,20 @@ def _format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> st
 
 def format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> str:
     return _format_approval_line(approval, include_task_id=include_task_id)
+
+
+def format_approval_run_line(run: kb.ApprovalRun) -> str:
+    elapsed = (max(0, run.ended_at - run.started_at) if run.ended_at is not None else None)
+    elapsed_text = f"{elapsed}s" if elapsed is not None else "active"
+    outcome = run.outcome or run.status or "active"
+    bits = [
+        f"#{run.id}",
+        f"approval=#{run.approval_id}",
+        f"{outcome:12s}",
+        f"@{run.profile or '-'}",
+        elapsed_text,
+    ]
+    return "  " + "  ".join(bits)
 
 
 def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, Any]:

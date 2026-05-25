@@ -1459,6 +1459,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         approvals = kb.list_task_approvals(conn, args.task_id)
+        approval_runs = kb.list_task_approval_runs(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
         # ``tasks.result`` is left NULL unless the caller explicitly passed
@@ -1473,6 +1474,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "parents": parents,
             "children": children,
             "approvals": [approvals_cli.approval_to_dict(approval) for approval in approvals],
+            "approval_runs": [
+                approvals_cli.approval_run_to_dict(run) for run in approval_runs
+            ],
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1590,6 +1594,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"Approvals ({len(approvals)}):")
         for approval in approvals:
             print(approvals_cli.format_approval_line(approval, include_task_id=False))
+    if approval_runs:
+        print()
+        print(f"Approval runs ({len(approval_runs)}):")
+        for run in approval_runs:
+            print(approvals_cli.format_approval_run_line(run))
+            if run.error:
+                print(f"        ! {run.error.splitlines()[0][:160]}")
     if comments:
         print()
         print(f"Comments ({len(comments)}):")
