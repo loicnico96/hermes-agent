@@ -315,6 +315,7 @@ def get_tool_definitions(
             registry._generation,
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(os.environ.get("HERMES_KANBAN_APPROVAL_ID")),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)
