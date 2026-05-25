@@ -372,6 +372,48 @@ def list_task_approvals(
     )
 
 
+def list_approval_runs(
+    conn: sqlite3.Connection,
+    *,
+    task_id: Optional[str] = None,
+    approval_id: Optional[int] = None,
+    status: Optional[str] = None,
+) -> list[ApprovalRun]:
+    query = "SELECT * FROM task_approval_runs WHERE 1 = 1"
+    params: list[object] = []
+    if task_id is not None:
+        query += " AND task_id = ?"
+        params.append(task_id)
+    if approval_id is not None:
+        query += " AND approval_id = ?"
+        params.append(int(approval_id))
+    if status is not None:
+        query += " AND status = ?"
+        params.append(_validate_approval_run_status(status))
+
+    if task_id is None and approval_id is None:
+        query += " ORDER BY task_id ASC, started_at ASC, id ASC"
+    else:
+        query += " ORDER BY started_at ASC, id ASC"
+    rows = conn.execute(query, params).fetchall()
+    return [ApprovalRun.from_row(row) for row in rows]
+
+
+def list_task_approval_runs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approval_id: Optional[int] = None,
+    status: Optional[str] = None,
+) -> list[ApprovalRun]:
+    return list_approval_runs(
+        conn,
+        task_id=task_id,
+        approval_id=approval_id,
+        status=status,
+    )
+
+
 def list_runnable_task_approvals(
     conn: sqlite3.Connection,
     *,
