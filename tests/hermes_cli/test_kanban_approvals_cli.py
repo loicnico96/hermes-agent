@@ -51,7 +51,7 @@ def test_cli_approval_add_list_and_show(kanban_home):
     assert "human" in shown
     assert "agent @reviewer skill=security-review" in shown
     assert [row["id"] for row in shown_json["approvals"]] == [human_approval["id"], agent_approval["id"]]
-    assert "approval_runs" not in shown_json
+    assert shown_json["approval_runs"] == []
 
 
 
@@ -64,7 +64,7 @@ def test_cli_approval_remove_and_reset(kanban_home):
 
     with kb.connect() as conn:
         removed_run = kb.create_task_approval_run(conn, approval_id=removed["id"], status="running")
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
             UPDATE task_approvals
@@ -100,7 +100,7 @@ def test_cli_approval_remove_and_reset(kanban_home):
     reset_target = json.loads(run_slash(f"approval add {second_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (second_task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (second_task_id,))
         conn.execute(
             "UPDATE task_approvals SET status = 'failed', comment_id = 123, consecutive_failures = 2, last_failure_error = 'boom' WHERE id = ?",
             (reset_target["id"],),
@@ -110,8 +110,8 @@ def test_cli_approval_remove_and_reset(kanban_home):
     shown_after_reset = json.loads(run_slash(f"show {second_task_id} --json"))
 
     assert reset_payload["approval"]["id"] == reset_target["id"]
-    assert reset_payload["task_status"] == "approving"
-    assert shown_after_reset["task"]["status"] == "approving"
+    assert reset_payload["task_status"] == "approval"
+    assert shown_after_reset["task"]["status"] == "approval"
     assert shown_after_reset["approvals"][0]["status"] == "requested"
     assert shown_after_reset["approvals"][0]["consecutive_failures"] == 0
     assert shown_after_reset["approvals"][0]["last_failure_error"] is None
@@ -121,7 +121,7 @@ def test_cli_approval_remove_and_reset(kanban_home):
 
     assert requested_payload["approval"]["id"] == reset_target["id"]
     assert requested_payload["approval"]["status"] == "requested"
-    assert requested_payload["task_status"] == "approving"
+    assert requested_payload["task_status"] == "approval"
     assert shown_after_requested_reset["approvals"][0]["status"] == "requested"
 
 
@@ -134,7 +134,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     approve_gate = json.loads(run_slash(f"approval add {approve_task_id} --human --json"))
 
     with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (approve_task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (approve_task_id,))
 
     approve_payload = json.loads(
         run_slash(f"approval approve {approve_gate['id']} --comment 'looks good' --json")
@@ -156,7 +156,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     json.loads(run_slash(f"approval add {change_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (change_task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (change_task_id,))
 
     change_approve_payload = json.loads(
         run_slash(f"approval approve {change_human['id']} --comment 'initial yes' --json")
@@ -167,8 +167,8 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     change_show = json.loads(run_slash(f"show {change_task_id} --json"))
 
     assert change_approve_payload["approval"]["status"] == "approved"
-    assert change_approve_payload["task_status"] == "approving"
-    assert change_approve_payload["aggregate_status"] == "approving"
+    assert change_approve_payload["task_status"] == "approval"
+    assert change_approve_payload["aggregate_status"] == "approval"
     assert change_reject_payload["approval"]["id"] == change_human["id"]
     assert change_reject_payload["approval"]["status"] == "requested"
     assert change_reject_payload["task_status"] == "todo"
@@ -183,7 +183,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     json.loads(run_slash(f"approval add {reaffirm_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (reaffirm_task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (reaffirm_task_id,))
         conn.execute(
             "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
             (7_150, reaffirm_human["id"]),
@@ -196,9 +196,9 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     assert reaffirm_payload["approval"]["id"] == reaffirm_human["id"]
     assert reaffirm_payload["approval"]["status"] == "approved"
-    assert reaffirm_payload["task_status"] == "approving"
-    assert reaffirm_payload["aggregate_status"] == "approving"
-    assert reaffirm_show["task"]["status"] == "approving"
+    assert reaffirm_payload["task_status"] == "approval"
+    assert reaffirm_payload["aggregate_status"] == "approval"
+    assert reaffirm_show["task"]["status"] == "approval"
     assert reaffirm_show["approvals"][0]["comment_id"] is not None
     assert reaffirm_show["comments"][-1]["body"] == "still approved"
 
@@ -208,7 +208,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     reject_agent = json.loads(run_slash(f"approval add {reject_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (reject_task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (reject_task_id,))
         conn.execute(
             "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
             (7_200, reject_agent["id"]),
@@ -235,7 +235,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     json.loads(run_slash(f"approval add {reopen_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (reopen_task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (reopen_task_id,))
         conn.execute(
             "UPDATE task_approvals SET status = 'rejected', updated_at = ? WHERE id = ?",
             (7_250, reopen_human["id"]),
@@ -248,7 +248,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     assert reopen_payload["approval"]["id"] == reopen_human["id"]
     assert reopen_payload["approval"]["status"] == "approved"
-    assert reopen_payload["task_status"] == "approving"
-    assert reopen_payload["aggregate_status"] == "approving"
-    assert reopen_show["task"]["status"] == "approving"
+    assert reopen_payload["task_status"] == "approval"
+    assert reopen_payload["aggregate_status"] == "approval"
+    assert reopen_show["task"]["status"] == "approval"
     assert reopen_show["comments"][-1]["body"] == "re-opened and approved"
