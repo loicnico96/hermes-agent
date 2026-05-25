@@ -934,19 +934,6 @@ def record_task_approval_failure(
         if task is None or task.status != "approving":
             return None
 
-        run_row = conn.execute(
-            """
-            SELECT id
-              FROM task_approval_runs
-             WHERE id = ?
-               AND approval_id = ?
-               AND status = 'running'
-            """,
-            (int(expected_run_id), int(approval_id)),
-        ).fetchone()
-        if run_row is None:
-            return None
-
         failures = int(approval.consecutive_failures) + 1
         next_status = "failed" if failures >= APPROVAL_FAILURE_LIMIT else "requested"
 
