@@ -61,6 +61,58 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_approval_worker_tools_visible_with_approval_env(monkeypatch, tmp_path):
+    """Approval workers get a narrow review surface, including heartbeat."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_ID", "7")
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_RUN_ID", "11")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    kanban = {n for n in names if n and n.startswith("kanban_")}
+    expected = {
+        "kanban_show", "kanban_heartbeat", "kanban_approval",
+    }
+    assert kanban == expected, f"expected {expected}, got {kanban}"
+
+
+def test_approval_worker_schema_does_not_reuse_normal_worker_cache(monkeypatch, tmp_path):
+    """Schema caching must distinguish task-worker vs approval-worker mode."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.delenv("HERMES_KANBAN_APPROVAL_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_APPROVAL_RUN_ID", raising=False)
+
+    import tools.kanban_tools  # ensure registered
+    from model_tools import _clear_tool_defs_cache, get_tool_definitions
+    from tools.registry import invalidate_check_fn_cache
+
+    invalidate_check_fn_cache()
+    _clear_tool_defs_cache()
+    worker_schema = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+    worker_names = {s["function"].get("name") for s in worker_schema if "function" in s}
+    assert "kanban_complete" in worker_names
+    assert "kanban_approval" not in worker_names
+
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_ID", "7")
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_RUN_ID", "11")
+    invalidate_check_fn_cache()
+    approval_schema = get_tool_definitions(enabled_toolsets=["terminal"], quiet_mode=True)
+    approval_names = {s["function"].get("name") for s in approval_schema if "function" in s}
+    assert "kanban_approval" in approval_names
+    assert "kanban_complete" not in approval_names
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.
@@ -169,6 +221,47 @@ def worker_env(monkeypatch, tmp_path):
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     return tid
+
+
+@pytest.fixture
+def approval_env(monkeypatch, tmp_path):
+    """Simulate being an approval worker bound to one running approval row."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="approval-target", assignee="test-worker")
+        conn.execute("UPDATE tasks SET status='approval' WHERE id=?", (tid,))
+        approval = kb.create_task_approval(
+            conn,
+            task_id=tid,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        claimed = kb.claim_task_approval(conn, approval.id, claimer=f"{kb._claimer_id()}:test")
+        assert claimed is not None
+        approval_id = approval.id
+        approval_run_id = claimed.current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_ID", str(approval_id))
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_RUN_ID", str(approval_run_id))
+    return {
+        "task_id": tid,
+        "approval_id": approval_id,
+        "approval_run_id": approval_run_id,
+    }
 
 
 def test_show_defaults_to_env_task_id(worker_env):
@@ -684,6 +777,49 @@ def test_heartbeat_extends_claim_expires(worker_env):
         f"claim_expires={after} is suspiciously close to now={now}; "
         f"expected at least now + {kb.DEFAULT_CLAIM_TTL_SECONDS // 2}"
     )
+
+
+def test_approval_happy_path(approval_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_approval({
+        "decision": "approved",
+        "comment": "looks good",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["task_id"] == approval_env["task_id"]
+    assert d["approval_id"] == approval_env["approval_id"]
+    assert d["approval_run_id"] == approval_env["approval_run_id"]
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        approval = kb.get_task_approval(conn, approval_env["approval_id"])
+        task = kb.get_task(conn, approval_env["task_id"])
+        comments = kb.list_comments(conn, approval_env["task_id"])
+        assert approval is not None
+        assert approval.status == "approved"
+        assert task is not None
+        assert task.status == "done"
+        assert comments[-1].author == "reviewer"
+        assert comments[-1].body == "looks good"
+    finally:
+        conn.close()
+
+
+def test_approval_requires_decision(approval_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_approval({"comment": "missing decision"})
+    assert "decision" in json.loads(out).get("error", "")
+
+
+def test_approval_requires_approval_env(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    monkeypatch.delenv("HERMES_KANBAN_APPROVAL_ID", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_APPROVAL_RUN_ID", raising=False)
+    out = kt._handle_approval({"decision": "approved"})
+    err = json.loads(out).get("error", "")
+    assert "HERMES_KANBAN_APPROVAL_ID" in err or "approval" in err
 
 
 def test_comment_happy_path(worker_env):
@@ -1237,6 +1373,30 @@ def test_kanban_guidance_prompt_size_bounded(monkeypatch, tmp_path):
     assert 1_500 < len(KANBAN_GUIDANCE) < 4_096, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars — too short (missing?) or too long"
     )
+
+
+def test_approval_worker_prompt_uses_kanban_approval(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_ID", "7")
+    monkeypatch.setenv("HERMES_KANBAN_APPROVAL_RUN_ID", "11")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path as _P
+    monkeypatch.setattr(_P, "home", lambda: tmp_path)
+
+    from run_agent import AIAgent
+    a = AIAgent(
+        api_key="test",
+        base_url="https://openrouter.ai/api/v1",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    prompt = a._build_system_prompt()
+    assert "kanban_approval" in prompt
+    assert "raw JSON object" not in prompt
+    assert "kanban_heartbeat" in prompt
 
 
 # ---------------------------------------------------------------------------
