@@ -1956,28 +1956,55 @@ def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
 
 
 def test_respawn_guard_recent_success(kanban_home):
-    """A completed run within the guard window triggers recent_success."""
+    """A recent task-level completed event triggers recent_success."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="already-done", assignee="alice")
         now = int(time.time())
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, now - 120, now - 60),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, now - 60),
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "recent_success"
 
 
+def test_respawn_guard_approval_handoff_not_counted_as_recent_success(kanban_home):
+    """An approval handoff should not trip recent_success until final task completion.
+
+    Approval handoff closes the worker run with outcome='completed' so the
+    attempt history reflects a successful worker execution, but the task-level
+    lifecycle is only at awaiting_approval until a real completed event is
+    emitted later. The respawn guard should key off the task-level completed
+    event, not the worker-level completed run.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs-approval", assignee="alice")
+        claim = kb.claim_task(conn, t)
+        assert claim is not None
+        kb.create_task_approval(conn, task_id=t, approver_type="human")
+        assert kb.complete_task(conn, t, result="done") is True
+
+        latest = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert latest is not None
+        assert latest["kind"] == "awaiting_approval"
+
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
-    """A completed run outside the guard window does not block re-spawn."""
+    """A completed event outside the guard window does not block re-spawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="old-done", assignee="alice")
         old_end = int(time.time()) - kb._RESPAWN_GUARD_SUCCESS_WINDOW - 60
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, old_end - 300, old_end),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, old_end),
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
@@ -2058,7 +2085,7 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
 def test_dispatch_respawn_guard_skips_recent_success(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with a recent completed run."""
+    """dispatch_once skips (but does not block) a task with a recent completed event."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2068,9 +2095,9 @@ def test_dispatch_respawn_guard_skips_recent_success(
         t = kb.create_task(conn, title="recent-winner", assignee="alice")
         now = int(time.time())
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, now - 300, now - 60),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, now - 60),
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
@@ -2149,19 +2176,17 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
         t = kb.create_task(conn, title="event-check", assignee="alice")
         now = int(time.time())
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, now - 300, now - 60),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, now - 60),
         )
         kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
         events = kb.list_events(conn, t)
 
     kinds = [e.kind for e in events]
     assert "respawn_guarded" in kinds
-    guarded_evt = next(e for e in events if e.kind == "respawn_guarded")
-    # Event.payload is already parsed as a dict by list_events.
-    assert isinstance(guarded_evt.payload, dict)
-    assert guarded_evt.payload.get("reason") == "recent_success"
+    guarded = [e for e in events if e.kind == "respawn_guarded"]
+    assert guarded[-1].payload == {"reason": "recent_success"}
 
 
 # ---------------------------------------------------------------------------
