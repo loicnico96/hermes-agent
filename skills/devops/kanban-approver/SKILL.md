@@ -1,5 +1,5 @@
 ---
-name: kanban_approver
+name: kanban-approver
 description: "Default approval guidance for autonomous Kanban approval workers."
 version: 1.0.0
 author: Hermes Agent
