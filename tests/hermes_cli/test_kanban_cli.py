@@ -139,6 +139,41 @@ def test_run_slash_show_includes_comments(kanban_home):
     assert "performance section" in show
 
 
+def test_run_slash_show_surfaces_approval_runs(kanban_home):
+    out = kc.run_slash("create 'needs approval'")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
+    with kb.connect() as conn:
+        approval = kb.create_task_approval(
+            conn,
+            task_id=tid,
+            approver_type="agent",
+            approver_profile="coder",
+            approver_skill="hermes-agent",
+        )
+        kb.create_task_approval_run(
+            conn,
+            approval_id=approval.id,
+            profile="coder",
+            status="timed_out",
+            started_at=100,
+            ended_at=112,
+            outcome="timed_out",
+            error="worker exceeded runtime budget",
+        )
+    show = kc.run_slash(f"show {tid}")
+    assert "Approval runs (1):" in show
+    assert f"approval=#{approval.id}" in show
+    assert "worker exceeded runtime budget" in show
+
+    payload = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert payload["approvals"][0]["id"] == approval.id
+    assert payload["approval_runs"][0]["approval_id"] == approval.id
+    assert payload["approval_runs"][0]["outcome"] == "timed_out"
+
+
 def test_run_slash_comment_max_len_trims_long_body(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
