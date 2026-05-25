@@ -818,11 +818,20 @@ def test_reset_task_approval_is_noop_for_requested_rows(kanban_home, monkeypatch
             status="requested",
         )
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        requested_events_before = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'approval_requested'",
+            (task_id,),
+        ).fetchone()[0]
 
         reset = kb.reset_task_approval(conn, approval.id)
+        requested_events_after = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'approval_requested'",
+            (task_id,),
+        ).fetchone()[0]
 
     assert reset.status == "requested"
-    assert reset.updated_at == 8_100
+    assert reset.updated_at == approval.updated_at
+    assert requested_events_after == requested_events_before
 
 
 
@@ -1331,6 +1340,19 @@ def test_apply_task_approval_aggregate_transition_marks_approval_task_done_when_
             status="approved",
         )
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        kb._append_event(
+            conn,
+            task_id,
+            "awaiting_approval",
+            {
+                "result_len": 12,
+                "summary": "fresh summary",
+                "task_status": "approval",
+                "verified_cards": ["t_child1234"],
+                "artifacts": ["/tmp/report.txt"],
+            },
+            run_id=77,
+        )
 
         with kb.write_txn(conn):
             aggregate_status = kb._apply_task_approval_aggregate_transition(
@@ -1343,6 +1365,10 @@ def test_apply_task_approval_aggregate_transition_marks_approval_task_done_when_
         task = kb.get_task(conn, task_id)
         refreshed_agent = kb.get_task_approval(conn, agent.id)
         refreshed_human = kb.get_task_approval(conn, human.id)
+        completed_event = conn.execute(
+            "SELECT run_id, payload FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
 
     assert aggregate_status == "done"
     assert task is not None
@@ -1351,6 +1377,15 @@ def test_apply_task_approval_aggregate_transition_marks_approval_task_done_when_
     assert refreshed_agent.status == "escalated"
     assert refreshed_human is not None
     assert refreshed_human.status == "approved"
+    assert completed_event is not None
+    assert completed_event["run_id"] == 77
+    assert json.loads(completed_event["payload"]) == {
+        "result_len": 12,
+        "summary": "fresh summary",
+        "task_status": "done",
+        "verified_cards": ["t_child1234"],
+        "artifacts": ["/tmp/report.txt"],
+    }
 
 
 
