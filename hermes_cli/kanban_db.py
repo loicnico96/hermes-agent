@@ -5969,9 +5969,15 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ticks of recovery first.
 
     ``"recent_success"``
-        A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
-        seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning.
+        A task-level ``completed`` event exists within
+        ``_RESPAWN_GUARD_SUCCESS_WINDOW`` seconds. Useful work already
+        succeeded for this task; wait for human review rather than
+        immediately re-spawning. This intentionally keys off the task
+        event log rather than ``task_runs.outcome='completed'`` because
+        approval handoff closes the worker run as completed while the
+        task lifecycle is still only at ``awaiting_approval`` until the
+        final approval replay emits a true task-level ``completed``
+        event.
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
@@ -6034,11 +6040,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
-    # 3. Completed run within guard window — proof of recent success.
+    now = int(time.time())
+
+    # 3. Recent task-level completed event — proof of recent success.
+    # Do NOT key this off ``task_runs.outcome='completed'``: approval
+    # handoff closes the worker run as completed before the task is truly
+    # finalized, so a run-level check would incorrectly suppress retries
+    # while the task is only in ``awaiting_approval``.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     if conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'completed' AND created_at >= ?",
         (task_id, cutoff),
     ).fetchone():
         return "recent_success"
