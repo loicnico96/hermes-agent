@@ -3765,17 +3765,25 @@ def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
     assert json.loads(event_row["payload"])["approval_id"] == approval.id
 
 
-def test_parse_approval_worker_response_enforces_exact_json_contract():
+def test_parse_approval_worker_response_requires_core_contract_fields():
     parsed = kb.parse_approval_worker_response('{"decision":"approved","comment":"looks good"}')
     assert parsed == kb.ApprovalWorkerDecision(
         decision="approved",
         comment="looks good",
     )
 
+    parsed_with_extra_keys = kb.parse_approval_worker_response(
+        '{"decision":"approved","comment":"looks good","reason":"extra"}'
+    )
+    assert parsed_with_extra_keys == kb.ApprovalWorkerDecision(
+        decision="approved",
+        comment="looks good",
+    )
+
     with pytest.raises(ValueError, match="valid JSON"):
         kb.parse_approval_worker_response("approved")
-    with pytest.raises(ValueError, match="unsupported keys"):
-        kb.parse_approval_worker_response('{"decision":"approved","reason":"extra"}')
+    with pytest.raises(ValueError, match="must include decision"):
+        kb.parse_approval_worker_response('{"comment":"missing decision"}')
     with pytest.raises(ValueError, match="must be one of"):
         kb.parse_approval_worker_response('{"decision":"failed"}')
 
