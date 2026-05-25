@@ -3727,6 +3727,105 @@ def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
     assert json.loads(event_row["payload"])["approval_id"] == approval.id
 
 
+def test_detect_crashed_approval_workers_applies_clean_exit_decision(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        host = kb._claimer_id().split(':', 1)[0]
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        conn.execute(
+            "UPDATE task_approvals SET worker_pid = ? WHERE id = ?",
+            (43210, approval.id),
+        )
+        conn.execute(
+            "UPDATE task_approval_runs SET worker_pid = ? WHERE id = ?",
+            (43210, run_id),
+        )
+        log_path = kb.worker_logs_dir() / f"approval-{approval.id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text('{"decision":"approved","comment":"looks good"}\n', encoding="utf-8")
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        kb._record_worker_exit(43210, 0)
+
+        failed = kb.detect_crashed_approval_workers(conn)
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        run_row = conn.execute(
+            "SELECT status, outcome, comment_id, error FROM task_approval_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+
+    assert failed == []
+    assert task is not None
+    assert task.status == "done"
+    assert refreshed is not None
+    assert refreshed.status == "approved"
+    assert len(comments) == 1
+    assert comments[0].body == "looks good"
+    assert run_row is not None
+    assert run_row["status"] == "approved"
+    assert run_row["outcome"] == "approved"
+    assert run_row["comment_id"] == comments[0].id
+    assert run_row["error"] is None
+
+
+def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        host = kb._claimer_id().split(':', 1)[0]
+        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        conn.execute(
+            "UPDATE task_approvals SET worker_pid = ?, claim_expires = ? WHERE id = ?",
+            (99999, 999, approval.id),
+        )
+        conn.execute(
+            "UPDATE task_approval_runs SET worker_pid = ?, claim_expires = ? WHERE id = ?",
+            (99999, 999, run_id),
+        )
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_approval_claims(conn)
+
+        refreshed = kb.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, error FROM task_approval_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+
+    assert reclaimed == 1
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 1
+    assert refreshed.last_failure_error == f"stale approval claim lock={host}:lease"
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["error"] == f"stale approval claim lock={host}:lease"
+
+
 def test_parse_approval_worker_response_requires_core_contract_fields():
     parsed = kb.parse_approval_worker_response('{"decision":"approved","comment":"looks good"}')
     assert parsed == kb.ApprovalWorkerDecision(
