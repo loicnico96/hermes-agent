@@ -5446,18 +5446,7 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
     return _skill_available("kanban-worker", hermes_home)
 
 
-KANBAN_APPROVER_DEFAULT_SKILL = "kanban_approver"
-_APPROVAL_DECISION_KEYS = frozenset({"decision", "comment"})
-KANBAN_APPROVAL_RUNTIME_CONTRACT = "\n".join([
-    "You are acting as an autonomous Kanban approval worker.",
-    "Return exactly one JSON object and nothing else.",
-    "The JSON object must contain:",
-    '- "decision": one of "approved", "rejected", or "escalated".',
-    '- Optional "comment": a string.',
-    "Do not mutate approval rows directly.",
-    "Malformed, extra, or contradictory output is treated as failure.",
-])
-
+KANBAN_APPROVER_DEFAULT_SKILL = "kanban-approver"
 
 @dataclass(frozen=True)
 class ApprovalWorkerDecision:
@@ -5481,12 +5470,6 @@ def parse_approval_worker_response(response_text: str) -> ApprovalWorkerDecision
         raise ValueError("approval worker response must be valid JSON") from exc
     if not isinstance(payload, dict):
         raise ValueError("approval worker response must be a JSON object")
-    unknown_keys = sorted(set(payload) - _APPROVAL_DECISION_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            "approval worker response contains unsupported keys: "
-            + ", ".join(unknown_keys)
-        )
     if "decision" not in payload:
         raise ValueError("approval worker response must include decision")
     decision = payload["decision"]
@@ -5518,29 +5501,6 @@ def _approval_worker_skill_names(
     if _skill_available(KANBAN_APPROVER_DEFAULT_SKILL, hermes_home):
         return [KANBAN_APPROVER_DEFAULT_SKILL]
     return []
-
-
-def _build_approval_worker_prompt(
-    conn: sqlite3.Connection,
-    approval: Approval,
-) -> str:
-    """Return a task-centric approval prompt with the narrow runtime contract."""
-    task_context = build_worker_context(conn, approval.task_id).strip()
-    return "\n\n".join([
-        (
-            f"Review kanban task {approval.task_id} as approval row {approval.id}. "
-            f"Approver profile: {approval.approver_profile or '(unknown)'}."
-        ),
-        KANBAN_APPROVAL_RUNTIME_CONTRACT,
-        "Task context:",
-        task_context,
-        (
-            'Respond with JSON only, for example: '
-            '{"decision":"approved"} or '
-            '{"decision":"rejected","comment":"..."}.'
-        ),
-    ])
-
 
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
@@ -5816,13 +5776,14 @@ def _spawn_approval_worker(
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
+    prompt = f"review kanban task {approval.task_id}"
+
     profile_arg = normalize_profile_name(approval.approver_profile)
     env = dict(os.environ)
-    env.pop("HERMES_KANBAN_TASK", None)
     env.pop("HERMES_KANBAN_RUN_ID", None)
     env.pop("HERMES_KANBAN_CLAIM_LOCK", None)
     env["HERMES_KANBAN_APPROVAL_ID"] = str(approval.id)
-    env["HERMES_KANBAN_APPROVAL_TASK_ID"] = approval.task_id
+    env["HERMES_KANBAN_TASK"] = approval.task_id
     if approval.current_run_id is not None:
         env["HERMES_KANBAN_APPROVAL_RUN_ID"] = str(approval.current_run_id)
     env["HERMES_KANBAN_WORKSPACE"] = workspace
@@ -5834,9 +5795,6 @@ def _spawn_approval_worker(
         env["HERMES_HOME"] = resolve_profile_env(profile_arg)
     except FileNotFoundError:
         pass
-
-    with contextlib.closing(connect(board=board)) as prompt_conn:
-        prompt = _build_approval_worker_prompt(prompt_conn, approval)
 
     cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "--accept-hooks"]
     for skill_name in _approval_worker_skill_names(

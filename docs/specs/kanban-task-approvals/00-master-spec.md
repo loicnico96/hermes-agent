@@ -379,7 +379,7 @@ The implementation must update the approval-agent prompt path so the base runtim
 
 The base prompt contract must not hardcode one approval policy or style of reasoning beyond the structure/authority boundary.
 
-Phase 4 should also add a default `kanban_approver` skill that auto-loads only when the approval row does not specify an explicit approver skill. An explicit approver skill must override the default rather than stack on top of it automatically.
+Phase 4 should also add a default `kanban-approver` skill that auto-loads only when the approval row does not specify an explicit approver skill. An explicit approver skill must override the default rather than stack on top of it automatically.
 
 This prompt/runtime contract belongs in runtime code / prompt builder, not only in tests. Concrete autonomous runtime details are specified in `04-autonomous-agent-approval-runtime.md`.
 
