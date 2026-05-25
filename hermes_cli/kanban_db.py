@@ -5569,6 +5569,8 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    env.pop("HERMES_KANBAN_APPROVAL_ID", None)
+    env.pop("HERMES_KANBAN_APPROVAL_RUN_ID", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -5779,37 +5781,17 @@ def detect_crashed_approval_workers(
         run_id = int(row["current_run_id"])
         kind, code = _classify_worker_exit(pid)
         if kind == "clean_exit":
-            try:
-                response_text = _read_last_nonempty_log_line(
-                    _approval_log_path(approval_id, board=board)
-                )
-                decision = parse_approval_worker_response(response_text)
-                comment_id = None
-                if decision.comment:
-                    comment_id = add_comment(
-                        conn,
-                        row["task_id"],
-                        row["approver_profile"] or "approver",
-                        decision.comment,
-                    )
-                aggregate_status = record_task_approval_decision(
-                    conn,
-                    approval_id=approval_id,
-                    expected_run_id=run_id,
-                    status=decision.decision,
-                    comment_id=comment_id,
-                )
-                if aggregate_status is None:
-                    continue
-            except Exception as exc:
-                record_task_approval_failure(
-                    conn,
-                    approval_id=approval_id,
-                    expected_run_id=run_id,
-                    outcome="failed",
-                    error=f"invalid approval worker output: {exc}",
-                )
-                failed.append(approval_id)
+            record_task_approval_failure(
+                conn,
+                approval_id=approval_id,
+                expected_run_id=run_id,
+                outcome="failed",
+                error=(
+                    "approval worker exited cleanly (rc=0) without calling "
+                    "kanban_approval — protocol violation"
+                ),
+            )
+            failed.append(approval_id)
             continue
 
         if kind == "nonzero_exit":

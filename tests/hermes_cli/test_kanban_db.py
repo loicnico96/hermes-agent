@@ -2155,6 +2155,46 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
+    def test_dispatcher_spawn_clears_approval_env(self, tmp_path, monkeypatch):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setenv("HERMES_KANBAN_APPROVAL_ID", "77")
+        monkeypatch.setenv("HERMES_KANBAN_APPROVAL_RUN_ID", "88")
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_dispatch_env",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name="wt/t_dispatch_env",
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        env = captured["env"]
+        assert "HERMES_KANBAN_APPROVAL_ID" not in env
+        assert "HERMES_KANBAN_APPROVAL_RUN_ID" not in env
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
@@ -3063,7 +3103,9 @@ def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
     assert json.loads(event_row["payload"])["approval_id"] == approval.id
 
 
-def test_detect_crashed_approval_workers_applies_clean_exit_decision(kanban_home, monkeypatch):
+def test_detect_crashed_approval_workers_clean_exit_without_tool_call_is_protocol_failure(
+    kanban_home, monkeypatch,
+):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="needs approval", assignee="worker")
         approval = kb.create_task_approval(
@@ -3086,9 +3128,6 @@ def test_detect_crashed_approval_workers_applies_clean_exit_decision(kanban_home
             "UPDATE task_approval_runs SET worker_pid = ? WHERE id = ?",
             (43210, run_id),
         )
-        log_path = kb.worker_logs_dir() / f"approval-{approval.id}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text('{"decision":"approved","comment":"looks good"}\n', encoding="utf-8")
 
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         kb._record_worker_exit(43210, 0)
@@ -3103,18 +3142,19 @@ def test_detect_crashed_approval_workers_applies_clean_exit_decision(kanban_home
             (run_id,),
         ).fetchone()
 
-    assert failed == []
+    assert failed == [approval.id]
     assert task is not None
-    assert task.status == "done"
+    assert task.status == "approval"
     assert refreshed is not None
-    assert refreshed.status == "approved"
-    assert len(comments) == 1
-    assert comments[0].body == "looks good"
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 1
+    assert len(comments) == 0
     assert run_row is not None
-    assert run_row["status"] == "approved"
-    assert run_row["outcome"] == "approved"
-    assert run_row["comment_id"] == comments[0].id
-    assert run_row["error"] is None
+    assert run_row["status"] == "failed"
+    assert run_row["outcome"] == "failed"
+    assert run_row["comment_id"] is None
+    assert "kanban_approval" in (run_row["error"] or "")
 
 
 def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monkeypatch):
@@ -3160,29 +3200,6 @@ def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monke
     assert run_row["status"] == "reclaimed"
     assert run_row["outcome"] == "reclaimed"
     assert run_row["error"] == f"stale approval claim lock={host}:lease"
-
-
-def test_parse_approval_worker_response_requires_core_contract_fields():
-    parsed = kb.parse_approval_worker_response('{"decision":"approved","comment":"looks good"}')
-    assert parsed == kb.ApprovalWorkerDecision(
-        decision="approved",
-        comment="looks good",
-    )
-
-    parsed_with_extra_keys = kb.parse_approval_worker_response(
-        '{"decision":"approved","comment":"looks good","reason":"extra"}'
-    )
-    assert parsed_with_extra_keys == kb.ApprovalWorkerDecision(
-        decision="approved",
-        comment="looks good",
-    )
-
-    with pytest.raises(ValueError, match="valid JSON"):
-        kb.parse_approval_worker_response("approved")
-    with pytest.raises(ValueError, match="must include decision"):
-        kb.parse_approval_worker_response('{"comment":"missing decision"}')
-    with pytest.raises(ValueError, match="must be one of"):
-        kb.parse_approval_worker_response('{"decision":"failed"}')
 
 
 def test_has_spawnable_review_true(kanban_home):
