@@ -210,12 +210,12 @@ Rationale:
 - users must be able to control approval behavior through skills or explicit approver configuration,
 - the runtime should enforce structure and authority boundaries, not encode one canonical approval personality.
 
-### 6.2 Default `kanban_approver` skill
+### 6.2 Default `kanban-approver` skill
 
-Phase 4 should add a default `kanban_approver` skill for approval workers.
+Phase 4 should add a default `kanban-approver` skill for approval workers.
 
 Rules:
-- when an agent approval row does **not** specify an explicit auto-loaded skill, the runtime auto-loads `kanban_approver`,
+- when an agent approval row does **not** specify an explicit auto-loaded skill, the runtime auto-loads `kanban-approver`,
 - when the approval row does specify an explicit skill, that explicit skill wins and the default is not auto-added on top,
 - the default skill should provide sane approval guidance, but the runtime contract must remain valid even without relying on skill-specific wording.
 
@@ -465,7 +465,7 @@ Phase 4 is complete only if tests cover all of the following:
 11. crash/timeout/stale reclaim paths,
 12. late/stale result discard when ownership changed,
 13. approval workers not depending on injected approval-row context,
-14. default `kanban_approver` skill autoload only when no explicit skill is specified.
+14. default `kanban-approver` skill autoload only when no explicit skill is specified.
 
 Focused test placement is expected in the existing approval DB/dispatcher/runtime test files rather than one giant new end-to-end suite.
 

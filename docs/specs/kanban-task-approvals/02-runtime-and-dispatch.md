@@ -135,7 +135,7 @@ The runtime must require a final structured payload with:
 
 Any other shape is invalid.
 
-The base runtime/system prompt for this slice should state the contract only. Default approval behavior should come from a default `kanban_approver` skill when no explicit approver skill is specified.
+The base runtime/system prompt for this slice should state the contract only. Default approval behavior should come from a default `kanban-approver` skill when no explicit approver skill is specified.
 
 ### 5.3 Output validation
 
