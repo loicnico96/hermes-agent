@@ -268,12 +268,12 @@ KANBAN_APPROVAL_GUIDANCE = (
     "}\n"
     "\n"
     "DECISIONS:\n"
-    "- \"approve\": The task was fulfilled according to its instructions and did not introduce unforeseen risks or scope. "
+    "- \"approved\": The task was fulfilled according to its instructions and did not introduce unforeseen risks or scope. "
     "It can be marked Done without human intervention. "
     "You MAY include a brief summary of what you checked and non-blocking observations.\n"
-    "- \"reject\": The task has clear violations to its instructions, which can be resolved without human intervention. "
+    "- \"rejected\": The task has clear violations to its instructions, which can be resolved without human intervention. "
     "You MUST provide concrete, unambiguous directives for the worker to follow.\n"
-    "- \"escalate\": The task introduced unforeseen risks or scope, which require human decision or clarification. "
+    "- \"escalated\": The task introduced unforeseen risks or scope, which require human decision or clarification. "
     "You MUST provide context for the human operator to make the final informed decision.\n"
     "\n"
     "IMPORTANT RULES:\n"
@@ -285,7 +285,7 @@ KANBAN_APPROVAL_GUIDANCE = (
     "- You MAY create temporary files with unique names if necessary.\n"
     "- You MUST clean up your temporary changes before returning.\n"
     "- Do NOT restate or re-summarize the worker output in the comment.\n"
-    "- If unsure, choose \"escalate\"."
+    "- If unsure, choose \"escalated\"."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
