@@ -208,6 +208,51 @@ def _validate_task_comment_reference(
     return normalized_comment_id
 
 
+def _approval_identity_payload(approval: Approval) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "approval_id": approval.id,
+        "approver_type": approval.approver_type,
+    }
+    if approval.approver_profile is not None:
+        payload["approver_profile"] = approval.approver_profile
+    if approval.approver_skill is not None:
+        payload["approver_skill"] = approval.approver_skill
+    return payload
+
+
+def _emit_approval_requested(
+    conn: sqlite3.Connection,
+    approval: Approval,
+    *,
+    requested_by_approval_id: Optional[int] = None,
+) -> None:
+    payload = _approval_identity_payload(approval)
+    if requested_by_approval_id is not None:
+        payload["requested_by_approval_id"] = int(requested_by_approval_id)
+    kb._append_event(conn, approval.task_id, "approval_requested", payload)
+
+
+def _emit_approval_removed(conn: sqlite3.Connection, approval: Approval) -> None:
+    kb._append_event(conn, approval.task_id, "approval_removed", _approval_identity_payload(approval))
+
+
+def _emit_approval_decided(
+    conn: sqlite3.Connection,
+    approval: Approval,
+    *,
+    decision: str,
+    comment_id: Optional[int] = None,
+    approval_run_id: Optional[int] = None,
+) -> None:
+    payload = _approval_identity_payload(approval)
+    payload["decision"] = decision
+    if comment_id is not None:
+        payload["comment_id"] = int(comment_id)
+    if approval_run_id is not None:
+        payload["approval_run_id"] = int(approval_run_id)
+    kb._append_event(conn, approval.task_id, "approval_decided", payload, run_id=approval_run_id)
+
+
 def _approval_exists(
     conn: sqlite3.Connection,
     *,
@@ -315,6 +360,8 @@ def create_task_approval(
         assert approval_id is not None
         approval = get_task_approval(conn, approval_id)
         assert approval is not None
+        if approval.status == "requested":
+            _emit_approval_requested(conn, approval)
         return approval
 
 
@@ -428,7 +475,7 @@ def list_runnable_task_approvals(
            AND a.status = 'requested'
            AND a.approver_profile IS NOT NULL
            AND a.claim_lock IS NULL
-           AND t.status = 'approving'
+           AND t.status = 'approval'
            AND t.status != 'archived'
          ORDER BY a.created_at ASC, a.id ASC
     """
@@ -471,7 +518,7 @@ def claim_task_approval(
                     SELECT 1
                       FROM tasks t
                      WHERE t.id = task_approvals.task_id
-                       AND t.status = 'approving'
+                       AND t.status = 'approval'
                        AND t.status != 'archived'
                )
             """,
@@ -664,8 +711,8 @@ def record_manual_task_approval_decision(
             raise ValueError("manual approval decisions require a human approval")
         task = kb.get_task(conn, approval.task_id)
         assert task is not None
-        if task.status != "approving":
-            raise ValueError("parent task must be approving")
+        if task.status != "approval":
+            raise ValueError("parent task must be in approval status")
         comment_id = None
         if comment is not None:
             effective_author = kb._normalize_optional_text(comment_author)
@@ -703,6 +750,15 @@ def record_manual_task_approval_decision(
         )
         assert cur.rowcount == 1
 
+        updated_approval = get_task_approval(conn, approval_id)
+        assert updated_approval is not None
+        _emit_approval_decided(
+            conn,
+            updated_approval,
+            decision=normalized_status,
+            comment_id=comment_id,
+        )
+
         approvals = list_task_approvals(conn, approval.task_id)
         return _apply_task_approval_aggregate_transition(
             conn,
@@ -724,7 +780,9 @@ def remove_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval
         deleted = conn.execute("DELETE FROM task_approvals WHERE id = ?", (approval.id,))
         assert deleted.rowcount == 1
 
-        if task.status == "approving":
+        _emit_approval_removed(conn, approval)
+
+        if task.status == "approval":
             remaining = list_task_approvals(conn, approval.task_id)
             _apply_task_approval_aggregate_transition(
                 conn,
@@ -745,14 +803,16 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
 
         task = kb.get_task(conn, approval.task_id)
         assert task is not None
-        if task.status != "approving":
-            raise ValueError("parent task must be approving")
+        if task.status != "approval":
+            raise ValueError("parent task must be approval")
 
         cur = _reset_task_approval_row(conn, approval_id=int(approval_id), now=now)
         assert cur.rowcount == 1
 
         approval = get_task_approval(conn, approval_id)
         assert approval is not None
+        if approval.status == "requested":
+            _emit_approval_requested(conn, approval)
         return approval
 
 
@@ -808,7 +868,14 @@ def _prepare_task_approvals_for_new_completion_cycle(
     conn: sqlite3.Connection,
     task_id: str,
 ) -> None:
+    approvals_before = list_task_approvals(conn, task_id)
     _reset_task_approvals_for_task(conn, task_id)
+    for prior in approvals_before:
+        if prior.status == "requested":
+            continue
+        refreshed = get_task_approval(conn, prior.id)
+        if refreshed is not None and refreshed.status == "requested":
+            _emit_approval_requested(conn, refreshed)
 
 
 def _compute_task_approval_aggregate_status(
@@ -816,11 +883,11 @@ def _compute_task_approval_aggregate_status(
 ) -> str:
     statuses = {approval.status for approval in approvals}
     if "running" in statuses:
-        return "approving"
+        return "approval"
     if "rejected" in statuses:
         return "todo"
     if "requested" in statuses:
-        return "approving"
+        return "approval"
     return "done"
 
 
@@ -840,7 +907,7 @@ def _apply_task_approval_aggregate_transition(
             UPDATE tasks
                SET status = 'todo'
              WHERE id = ?
-               AND status = 'approving'
+               AND status = 'approval'
             """,
             (task_id,),
         )
@@ -849,15 +916,22 @@ def _apply_task_approval_aggregate_transition(
         return aggregate_status
 
     if aggregate_status == "done":
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE tasks
                SET status = 'done'
              WHERE id = ?
-               AND status = 'approving'
+               AND status = 'approval'
             """,
             (task_id,),
         )
+        if cur.rowcount == 1:
+            kb._append_event(
+                conn,
+                task_id,
+                "completed",
+                {"task_status": "done"},
+            )
 
     return aggregate_status
 
@@ -874,7 +948,7 @@ def _finalize_task_approval_result_if_owned(
 ) -> Optional[str]:
     effective_now = int(time.time()) if now is None else int(now)
     task = kb.get_task(conn, approval.task_id)
-    if task is None or task.status != "approving":
+    if task is None or task.status != "approval":
         return None
 
     finalized = _finalize_task_approval_row_if_owned(
@@ -889,7 +963,12 @@ def _finalize_task_approval_result_if_owned(
         return None
 
     if status == "escalated":
-        _ensure_requested_human_approval(conn, approval.task_id, now=effective_now)
+        _ensure_requested_human_approval(
+            conn,
+            approval.task_id,
+            now=effective_now,
+            requested_by_approval_id=approval.id,
+        )
 
     approvals = list_task_approvals(conn, approval.task_id)
     return _apply_task_approval_aggregate_transition(
@@ -905,6 +984,7 @@ def _ensure_requested_human_approval(
     task_id: str,
     *,
     now: Optional[int] = None,
+    requested_by_approval_id: Optional[int] = None,
 ) -> Approval:
     effective_now = int(time.time()) if now is None else int(now)
     row = conn.execute(
@@ -934,13 +1014,27 @@ def _ensure_requested_human_approval(
         assert approval_id is not None
         created = get_task_approval(conn, int(approval_id))
         assert created is not None
+        _emit_approval_requested(
+            conn,
+            created,
+            requested_by_approval_id=requested_by_approval_id,
+        )
         return created
 
     approval = Approval.from_row(row)
+    if approval.status == "requested":
+        refreshed = get_task_approval(conn, approval.id)
+        assert refreshed is not None
+        return refreshed
     cur = _reset_task_approval_row(conn, approval_id=approval.id, now=effective_now)
     assert cur.rowcount == 1
     refreshed = get_task_approval(conn, approval.id)
     assert refreshed is not None
+    _emit_approval_requested(
+        conn,
+        refreshed,
+        requested_by_approval_id=requested_by_approval_id,
+    )
     return refreshed
 
 
@@ -973,7 +1067,7 @@ def record_task_approval_failure(
             return None
 
         task = kb.get_task(conn, approval.task_id)
-        if task is None or task.status != "approving":
+        if task is None or task.status != "approval":
             return None
 
         failures = int(approval.consecutive_failures) + 1
@@ -1101,6 +1195,16 @@ def record_task_approval_decision(
         )
         if aggregate_status is None:
             return None
+
+        finalized_approval = get_task_approval(conn, approval_id)
+        assert finalized_approval is not None
+        _emit_approval_decided(
+            conn,
+            finalized_approval,
+            decision=normalized_status,
+            comment_id=comment_id,
+            approval_run_id=expected_run_id,
+        )
 
         run_cur = conn.execute(
             """

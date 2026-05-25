@@ -39,7 +39,7 @@ _STATUS_ICONS = {
     "running":   "●",
     "scheduled": "⏱",
     "blocked":   "⊘",
-    "approving": "☑",
+    "approval":  "☑",
     "done":      "✓",
     "archived":  "—",
 }
