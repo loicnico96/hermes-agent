@@ -495,6 +495,43 @@ def test_create_task_approval_run_inserts_agent_runs(kanban_home):
     assert run.comment_id == comment_id
 
 
+def test_list_task_approval_runs_filters_by_task_and_approval(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        other_task_id = kb.create_task(conn, title="other target")
+        first = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        second = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="coder",
+        )
+        foreign = kb.create_task_approval(
+            conn,
+            task_id=other_task_id,
+            approver_type="agent",
+            approver_profile="ops",
+        )
+
+        run1 = kb.create_task_approval_run(conn, approval_id=first.id, status="running", started_at=10)
+        run2 = kb.create_task_approval_run(conn, approval_id=first.id, status="timed_out", started_at=20)
+        run3 = kb.create_task_approval_run(conn, approval_id=second.id, status="approved", started_at=30)
+        kb.create_task_approval_run(conn, approval_id=foreign.id, status="failed", started_at=40)
+
+        task_runs = kb.list_task_approval_runs(conn, task_id)
+        first_runs = kb.list_task_approval_runs(conn, task_id, approval_id=first.id)
+        timed_out = kb.list_approval_runs(conn, status="timed_out")
+
+    assert [run.id for run in task_runs] == [run1.id, run2.id, run3.id]
+    assert [run.id for run in first_runs] == [run1.id, run2.id]
+    assert [run.id for run in timed_out] == [run2.id]
+
+
 @pytest.mark.parametrize(
     ("setup", "kwargs", "message"),
     [
