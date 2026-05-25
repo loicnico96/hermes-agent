@@ -31,6 +31,14 @@ VALID_APPROVAL_RUN_STATUSES = {
     "reclaimed",
     "spawn_failed",
 }
+APPROVAL_FAILURE_LIMIT = 3
+FAILURE_APPROVAL_RUN_STATUSES = {
+    "failed",
+    "crashed",
+    "timed_out",
+    "reclaimed",
+    "spawn_failed",
+}
 
 
 @dataclass
@@ -823,6 +831,10 @@ def _finalize_task_approval_result_if_owned(
     now: Optional[int] = None,
 ) -> Optional[str]:
     effective_now = int(time.time()) if now is None else int(now)
+    task = kb.get_task(conn, approval.task_id)
+    if task is None or task.status != "approving":
+        return None
+
     finalized = _finalize_task_approval_row_if_owned(
         conn,
         approval_id=approval_id,
@@ -833,6 +845,10 @@ def _finalize_task_approval_result_if_owned(
     )
     if not finalized:
         return None
+
+    if status == "escalated":
+        _ensure_requested_human_approval(conn, approval.task_id, now=effective_now)
+
     approvals = list_task_approvals(conn, approval.task_id)
     return _apply_task_approval_aggregate_transition(
         conn,
@@ -840,6 +856,178 @@ def _finalize_task_approval_result_if_owned(
         approvals=approvals,
         now=effective_now,
     )
+
+
+def _ensure_requested_human_approval(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: Optional[int] = None,
+) -> Approval:
+    effective_now = int(time.time()) if now is None else int(now)
+    row = conn.execute(
+        """
+        SELECT *
+          FROM task_approvals
+         WHERE task_id = ?
+           AND approver_type = 'human'
+         ORDER BY id ASC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        cur = conn.execute(
+            """
+            INSERT INTO task_approvals (
+                task_id, approver_type, approver_profile, approver_skill,
+                status, comment_id, claim_lock, claim_expires, worker_pid,
+                last_heartbeat_at, current_run_id, consecutive_failures,
+                last_failure_error, created_at, updated_at
+            ) VALUES (?, 'human', NULL, NULL, 'requested', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, ?, ?)
+            """,
+            (task_id, effective_now, effective_now),
+        )
+        approval_id = cur.lastrowid
+        assert approval_id is not None
+        created = get_task_approval(conn, int(approval_id))
+        assert created is not None
+        return created
+
+    approval = Approval.from_row(row)
+    cur = _reset_task_approval_row(conn, approval_id=approval.id, now=effective_now)
+    assert cur.rowcount == 1
+    refreshed = get_task_approval(conn, approval.id)
+    assert refreshed is not None
+    return refreshed
+
+
+def _validate_approval_failure_run_status(value: str) -> str:
+    normalized = _validate_approval_run_status(value)
+    if normalized not in FAILURE_APPROVAL_RUN_STATUSES:
+        raise ValueError(
+            "approval failure run status must be one of "
+            + ", ".join(sorted(FAILURE_APPROVAL_RUN_STATUSES))
+        )
+    return normalized
+
+
+def record_task_approval_failure(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: int,
+    expected_run_id: int,
+    outcome: str,
+    error: str,
+    now: Optional[int] = None,
+) -> Optional[str]:
+    normalized_outcome = _validate_approval_failure_run_status(outcome)
+    normalized_error = (error or "approval worker failed").strip()[:500]
+    effective_now = int(time.time()) if now is None else int(now)
+
+    with kb.write_txn(conn):
+        approval = get_task_approval(conn, approval_id)
+        if approval is None:
+            return None
+
+        task = kb.get_task(conn, approval.task_id)
+        if task is None or task.status != "approving":
+            return None
+
+        run_row = conn.execute(
+            """
+            SELECT id
+              FROM task_approval_runs
+             WHERE id = ?
+               AND approval_id = ?
+               AND status = 'running'
+            """,
+            (int(expected_run_id), int(approval_id)),
+        ).fetchone()
+        if run_row is None:
+            return None
+
+        failures = int(approval.consecutive_failures) + 1
+        next_status = "failed" if failures >= APPROVAL_FAILURE_LIMIT else "requested"
+
+        run_cur = conn.execute(
+            """
+            UPDATE task_approval_runs
+               SET status = ?,
+                   ended_at = ?,
+                   outcome = ?,
+                   comment_id = NULL,
+                   error = ?
+             WHERE id = ?
+               AND approval_id = ?
+               AND status = 'running'
+            """,
+            (
+                normalized_outcome,
+                effective_now,
+                normalized_outcome,
+                normalized_error,
+                int(expected_run_id),
+                int(approval_id),
+            ),
+        )
+        if run_cur.rowcount != 1:
+            return None
+
+        approval_cur = conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = ?,
+                   comment_id = NULL,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   last_heartbeat_at = NULL,
+                   current_run_id = NULL,
+                   consecutive_failures = ?,
+                   last_failure_error = ?,
+                   updated_at = ?
+             WHERE id = ?
+               AND status = 'running'
+               AND current_run_id = ?
+            """,
+            (
+                next_status,
+                failures,
+                normalized_error,
+                effective_now,
+                int(approval_id),
+                int(expected_run_id),
+            ),
+        )
+        if approval_cur.rowcount != 1:
+            return None
+
+        if next_status == "failed":
+            _ensure_requested_human_approval(conn, approval.task_id, now=effective_now)
+            approvals = list_task_approvals(conn, approval.task_id)
+            _apply_task_approval_aggregate_transition(
+                conn,
+                approval.task_id,
+                approvals=approvals,
+                now=effective_now,
+            )
+
+        kb._append_event(
+            conn,
+            approval.task_id,
+            "approval_failed",
+            {
+                "approval_id": int(approval_id),
+                "outcome": normalized_outcome,
+                "error": normalized_error,
+                "failures": failures,
+                "status": next_status,
+                "failure_limit": APPROVAL_FAILURE_LIMIT,
+            },
+            run_id=int(expected_run_id),
+        )
+        return next_status
 
 
 def record_task_approval_decision(
