@@ -799,7 +799,7 @@ def test_complete_records_result(kanban_home):
         ("agent", {"approver_profile": "reviewer"}, "failed"),
     ],
 )
-def test_complete_task_with_approvals_resets_rows_and_enters_approving(
+def test_complete_task_with_approvals_resets_rows_and_enters_approval(
     kanban_home,
     approver_type,
     approval_kwargs,
@@ -857,12 +857,12 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approving(
             (claimed_task.current_run_id,),
         ).fetchone()
         completed_event = conn.execute(
-            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'completed' ORDER BY id DESC LIMIT 1",
+            "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? AND kind IN ('awaiting_approval', 'completed') ORDER BY id DESC LIMIT 1",
             (task_id,),
         ).fetchone()
 
     assert task is not None
-    assert task.status == "approving"
+    assert task.status == "approval"
     assert task.result == "fresh result"
     assert task.completed_at is not None
 
@@ -883,8 +883,10 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approving(
     assert closed_run["summary"] == "fresh summary"
 
     assert completed_event is not None
+    assert completed_event["kind"] == "awaiting_approval"
+    assert completed_event["run_id"] == claimed_task.current_run_id
     payload = json.loads(completed_event["payload"])
-    assert payload["task_status"] == "approving"
+    assert payload == {"task_status": "approval", "run_id": claimed_task.current_run_id}
 
 
 def test_block_then_unblock(kanban_home):
@@ -3114,7 +3116,7 @@ def test_dispatch_approval_dry_run_reports_runnable_rows(kanban_home):
             approver_type="agent",
             approver_profile="reviewer",
         )
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         res = kb.dispatch_once(conn, dry_run=True, max_approval_spawn=2)
         refreshed = kb.get_task_approval(conn, approval.id)
@@ -3143,7 +3145,7 @@ def test_dispatch_approval_uses_separate_concurrency_cap(kanban_home):
             approver_type="agent",
             approver_profile="reviewer",
         )
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         res = kb.dispatch_once(
             conn,
@@ -3180,7 +3182,7 @@ def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
             approver_type="agent",
             approver_profile="reviewer",
         )
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         kb.dispatch_once(conn, approval_spawn_fn=boom, max_approval_spawn=1)
 
@@ -3218,7 +3220,7 @@ def test_detect_crashed_approval_workers_applies_clean_exit_decision(kanban_home
             approver_profile="reviewer",
         )
         host = kb._claimer_id().split(':', 1)[0]
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         claimed = kb.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
         assert claimed is not None
         run_id = claimed.current_run_id
@@ -3272,7 +3274,7 @@ def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monke
             approver_profile="reviewer",
         )
         host = kb._claimer_id().split(':', 1)[0]
-        conn.execute("UPDATE tasks SET status = 'approving' WHERE id = ?", (task_id,))
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         claimed = kb.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
         assert claimed is not None
         run_id = claimed.current_run_id
@@ -3374,22 +3376,22 @@ def test_review_status_in_valid_statuses():
     assert "review" in kb.VALID_STATUSES
 
 
-def test_approving_status_round_trips_through_task_reads(kanban_home):
+def test_approval_status_round_trips_through_task_reads(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="needs approval", assignee="alice")
-        _set_task_status(conn, task_id, "approving")
+        _set_task_status(conn, task_id, "approval")
 
         task = kb.get_task(conn, task_id)
-        filtered = kb.list_tasks(conn, status="approving")
+        filtered = kb.list_tasks(conn, status="approval")
 
     assert task is not None
-    assert task.status == "approving"
+    assert task.status == "approval"
     assert [item.id for item in filtered] == [task_id]
 
 
-def test_approving_status_in_valid_statuses():
-    """'approving' is a valid task status."""
-    assert "approving" in kb.VALID_STATUSES
+def test_approval_status_in_valid_statuses():
+    """'approval' is a valid task status."""
+    assert "approval" in kb.VALID_STATUSES
 
 
 def test_dispatch_review_does_not_claim_ready_tasks(
