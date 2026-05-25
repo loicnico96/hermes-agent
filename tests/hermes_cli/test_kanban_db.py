@@ -1202,7 +1202,11 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
     assert completed_event["kind"] == "awaiting_approval"
     assert completed_event["run_id"] == claimed_task.current_run_id
     payload = json.loads(completed_event["payload"])
-    assert payload == {"task_status": "approval", "run_id": claimed_task.current_run_id}
+    assert payload == {
+        "result_len": len("fresh result"),
+        "summary": "fresh summary",
+        "task_status": "approval",
+    }
 
 
 def test_block_then_unblock(kanban_home):

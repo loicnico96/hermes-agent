@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -805,6 +806,8 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         assert task is not None
         if task.status != "approval":
             raise ValueError("parent task must be approval")
+        if approval.status == "requested":
+            return approval
 
         cur = _reset_task_approval_row(conn, approval_id=int(approval_id), now=now)
         assert cur.rowcount == 1
@@ -926,11 +929,32 @@ def _apply_task_approval_aggregate_transition(
             (task_id,),
         )
         if cur.rowcount == 1:
+            handoff_event = conn.execute(
+                """
+                SELECT run_id, payload
+                  FROM task_events
+                 WHERE task_id = ?
+                   AND kind = 'awaiting_approval'
+                 ORDER BY id DESC
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            payload = {"task_status": "done"}
+            replay_run_id = None
+            if handoff_event is not None:
+                replay_run_id = handoff_event["run_id"]
+                if handoff_event["payload"]:
+                    decoded = json.loads(handoff_event["payload"])
+                    if isinstance(decoded, dict):
+                        payload = dict(decoded)
+                        payload["task_status"] = "done"
             kb._append_event(
                 conn,
                 task_id,
                 "completed",
-                {"task_status": "done"},
+                payload,
+                run_id=replay_run_id,
             )
 
     return aggregate_status
