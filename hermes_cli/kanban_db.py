@@ -124,6 +124,7 @@ from hermes_cli.kanban_approvals_db import (
     list_task_approvals,
     record_manual_task_approval_decision,
     record_task_approval_decision,
+    record_task_approval_failure,
     remove_task_approval,
     reset_task_approval,
     set_task_approval_worker_pid,
@@ -6201,9 +6202,11 @@ def dispatch_once(
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
+    release_stale_approval_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
+    detect_crashed_approval_workers(conn, board=board)
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
@@ -6222,6 +6225,7 @@ def dispatch_once(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    enforce_approval_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -7161,61 +7165,229 @@ def _record_approval_runtime_failure(
     error: str,
     outcome: str,
 ) -> None:
-    """Mark an in-flight approval attempt failed and requeue the row."""
-    effective_now = int(time.time())
+    """Mark an in-flight approval attempt failed through shared DB helpers."""
     approval = get_task_approval(conn, approval_id)
     if approval is None or approval.current_run_id is None:
         return
-    run_id = int(approval.current_run_id)
-    with write_txn(conn):
-        run_cur = conn.execute(
-            """
-            UPDATE task_approval_runs
-               SET status = ?,
-                   outcome = ?,
-                   error = ?,
-                   ended_at = ?
-             WHERE id = ?
-               AND approval_id = ?
-               AND status = 'running'
-            """,
-            (outcome, outcome, error[:500], effective_now, run_id, int(approval_id)),
+    record_task_approval_failure(
+        conn,
+        approval_id=approval_id,
+        expected_run_id=int(approval.current_run_id),
+        outcome=outcome,
+        error=error,
+    )
+
+
+def _approval_log_path(approval_id: int, *, board: Optional[str] = None) -> Path:
+    return worker_logs_dir(board=board) / f"approval-{int(approval_id)}.log"
+
+
+def _read_last_nonempty_log_line(path: Path) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise ValueError(f"unable to read approval log: {exc}") from exc
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    raise ValueError("approval worker log did not contain a final response")
+
+
+def detect_crashed_approval_workers(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[int]:
+    """Handle exited approval workers.
+
+    Clean exits are treated as decision delivery attempts: the dispatcher reads
+    the final log line, parses the structured response, and applies it through
+    the kernel-owned approval helpers. Non-zero exits, signals, and malformed
+    structured output are recorded as approval failures.
+    """
+    failed: list[int] = []
+    rows = conn.execute(
+        """
+        SELECT id, task_id, approver_profile, worker_pid, claim_lock, current_run_id
+          FROM task_approvals
+         WHERE status = 'running'
+           AND worker_pid IS NOT NULL
+           AND current_run_id IS NOT NULL
+        """
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        pid = int(row["worker_pid"])
+        if _pid_alive(pid):
+            continue
+
+        approval_id = int(row["id"])
+        run_id = int(row["current_run_id"])
+        kind, code = _classify_worker_exit(pid)
+        if kind == "clean_exit":
+            try:
+                response_text = _read_last_nonempty_log_line(
+                    _approval_log_path(approval_id, board=board)
+                )
+                decision = parse_approval_worker_response(response_text)
+                comment_id = None
+                if decision.comment:
+                    comment_id = add_comment(
+                        conn,
+                        row["task_id"],
+                        row["approver_profile"] or "approver",
+                        decision.comment,
+                    )
+                aggregate_status = record_task_approval_decision(
+                    conn,
+                    approval_id=approval_id,
+                    expected_run_id=run_id,
+                    status=decision.decision,
+                    comment_id=comment_id,
+                )
+                if aggregate_status is None:
+                    continue
+            except Exception as exc:
+                record_task_approval_failure(
+                    conn,
+                    approval_id=approval_id,
+                    expected_run_id=run_id,
+                    outcome="failed",
+                    error=f"invalid approval worker output: {exc}",
+                )
+                failed.append(approval_id)
+            continue
+
+        if kind == "nonzero_exit":
+            error_text = f"pid {pid} exited with code {code}"
+        elif kind == "signaled":
+            error_text = f"pid {pid} killed by signal {code}"
+        else:
+            error_text = f"pid {pid} not alive"
+        record_task_approval_failure(
+            conn,
+            approval_id=approval_id,
+            expected_run_id=run_id,
+            outcome="crashed",
+            error=error_text,
         )
-        if run_cur.rowcount != 1:
-            return
-        approval_cur = conn.execute(
-            """
-            UPDATE task_approvals
-               SET status = 'requested',
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL,
-                   last_heartbeat_at = NULL,
-                   current_run_id = NULL,
-                   consecutive_failures = consecutive_failures + 1,
-                   last_failure_error = ?,
-                   updated_at = ?
-             WHERE id = ?
-               AND status = 'running'
-               AND current_run_id = ?
-            """,
-            (error[:500], effective_now, int(approval_id), run_id),
+        failed.append(approval_id)
+    return failed
+
+
+def release_stale_approval_claims(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> int:
+    now = int(time.time())
+    reclaimed = 0
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        """
+        SELECT id, worker_pid, claim_lock, claim_expires, current_run_id
+          FROM task_approvals
+         WHERE status = 'running'
+           AND claim_expires IS NOT NULL
+           AND current_run_id IS NOT NULL
+           AND claim_expires < ?
+        """,
+        (now,),
+    ).fetchall()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        host_local = lock.startswith(host_prefix)
+        pid = row["worker_pid"]
+        if host_local and pid and _pid_alive(pid):
+            new_expires = now + _resolve_claim_ttl_seconds()
+            with write_txn(conn):
+                cur = conn.execute(
+                    """
+                    UPDATE task_approvals
+                       SET claim_expires = ?
+                     WHERE id = ?
+                       AND status = 'running'
+                       AND claim_lock IS ?
+                       AND claim_expires IS NOT NULL
+                       AND claim_expires < ?
+                    """,
+                    (new_expires, int(row["id"]), row["claim_lock"], now),
+                )
+                if cur.rowcount != 1:
+                    continue
+                conn.execute(
+                    "UPDATE task_approval_runs SET claim_expires = ? WHERE id = ?",
+                    (new_expires, int(row["current_run_id"])),
+                )
+            continue
+
+        _terminate_reclaimed_worker(pid, row["claim_lock"], signal_fn=signal_fn)
+        result = record_task_approval_failure(
+            conn,
+            approval_id=int(row["id"]),
+            expected_run_id=int(row["current_run_id"]),
+            outcome="reclaimed",
+            error=f"stale approval claim lock={row['claim_lock']}",
         )
-        if approval_cur.rowcount != 1:
-            return
-        refreshed = get_task_approval(conn, approval_id)
-        if refreshed is not None:
-            _append_event(
-                conn,
-                refreshed.task_id,
-                "approval_failed",
-                {
-                    "approval_id": int(approval_id),
-                    "outcome": outcome,
-                    "error": error[:500],
-                },
-                run_id=run_id,
-            )
+        if result is not None:
+            reclaimed += 1
+    return reclaimed
+
+
+def enforce_approval_max_runtime(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[int]:
+    import signal
+
+    timed_out: list[int] = []
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        """
+        SELECT a.id, a.task_id, a.worker_pid, a.claim_lock, a.current_run_id,
+               COALESCE(r.started_at, a.updated_at) AS active_started_at,
+               t.max_runtime_seconds
+          FROM task_approvals a
+          JOIN tasks t ON t.id = a.task_id
+          LEFT JOIN task_approval_runs r ON r.id = a.current_run_id
+         WHERE a.status = 'running'
+           AND a.worker_pid IS NOT NULL
+           AND a.current_run_id IS NOT NULL
+           AND t.max_runtime_seconds IS NOT NULL
+        """
+    ).fetchall()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        elapsed = now - int(row["active_started_at"])
+        limit = int(row["max_runtime_seconds"])
+        if elapsed < limit:
+            continue
+
+        pid = int(row["worker_pid"])
+        kill = signal_fn if signal_fn is not None else (os.kill if hasattr(os, "kill") else None)
+        if kill is not None:
+            try:
+                kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+        result = record_task_approval_failure(
+            conn,
+            approval_id=int(row["id"]),
+            expected_run_id=int(row["current_run_id"]),
+            outcome="timed_out",
+            error=f"elapsed {elapsed}s > limit {limit}s",
+        )
+        if result is not None:
+            timed_out.append(int(row["id"]))
+    return timed_out
 
 
 def _spawn_approval_worker(
