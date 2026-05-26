@@ -1209,6 +1209,45 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
     }
 
 
+@pytest.mark.parametrize(
+    ("approval_specs", "expected"),
+    [
+        ([{"type": "human", "status": "rejected"}, {"type": "agent", "status": "running"}], "todo"),
+        ([{"type": "human", "status": "approved"}, {"type": "agent", "status": "rejected"}], "done"),
+        ([{"type": "human", "status": "requested"}, {"type": "agent", "status": "rejected"}], "approval"),
+        ([{"type": "agent", "status": "running"}, {"type": "agent", "status": "rejected"}], "approval"),
+        ([{"type": "agent", "status": "rejected"}, {"type": "agent", "status": "requested"}], "todo"),
+        ([{"type": "agent", "status": "requested"}, {"type": "agent", "status": "approved"}], "approval"),
+        ([{"type": "agent", "status": "approved"}], "done"),
+        ([], "done"),
+    ],
+)
+def test_compute_task_approval_aggregate_status_human_precedence(approval_specs, expected):
+    approvals = [
+        kb.Approval(
+            id=index + 1,
+            task_id="t_approval_order",
+            approver_type=spec["type"],
+            approver_profile=(f"agent-{index}" if spec["type"] == "agent" else None),
+            approver_skill=None,
+            status=spec["status"],
+            comment_id=None,
+            claim_lock=None,
+            claim_expires=None,
+            worker_pid=None,
+            last_heartbeat_at=None,
+            current_run_id=None,
+            consecutive_failures=0,
+            last_failure_error=None,
+            created_at=1000 + index,
+            updated_at=1000 + index,
+        )
+        for index, spec in enumerate(approval_specs)
+    ]
+
+    assert kb._compute_task_approval_aggregate_status(approvals) == expected
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
@@ -1563,6 +1602,205 @@ def _seed_approval_rows(conn, task_id: str) -> tuple[int, int]:
         (approval_id, task_id),
     )
     return approval_id, int(approval_run_cur.lastrowid)
+
+
+def test_apply_task_approval_aggregate_transition_done_reclaims_running_agents(
+    kanban_home, monkeypatch,
+):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval done", assignee="worker")
+        human = kb.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
+        running = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        requested = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="observer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(conn, running.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.set_task_approval_worker_pid(conn, running.id, 4321, run_id=claimed.current_run_id)
+
+        approvals = kb.list_task_approvals(conn, task_id)
+        aggregate = kb._apply_task_approval_aggregate_transition(conn, task_id, approvals=approvals)
+
+        task = kb.get_task(conn, task_id)
+        running_after = kb.get_task_approval(conn, running.id)
+        requested_after = kb.get_task_approval(conn, requested.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert aggregate == "done"
+    assert task is not None and task.status == "done"
+    assert running_after is not None and running_after.status == "cancelled"
+    assert running_after.worker_pid is None
+    assert running_after.current_run_id is None
+    assert requested_after is not None and requested_after.status == "requested"
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["worker_pid"] is None
+    assert run_row["ended_at"] is not None
+    assert killed == [(4321, claimed.claim_lock)]
+
+
+def test_apply_task_approval_aggregate_transition_todo_resets_all_approvals(
+    kanban_home, monkeypatch,
+):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval todo", assignee="worker")
+        running = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        terminal = kb.create_task_approval(conn, task_id=task_id, approver_type="human", status="rejected")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(conn, running.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.set_task_approval_worker_pid(conn, running.id, 9876, run_id=claimed.current_run_id)
+
+        approvals = kb.list_task_approvals(conn, task_id)
+        aggregate = kb._apply_task_approval_aggregate_transition(conn, task_id, approvals=approvals)
+
+        task = kb.get_task(conn, task_id)
+        running_after = kb.get_task_approval(conn, running.id)
+        terminal_after = kb.get_task_approval(conn, terminal.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert aggregate == "todo"
+    assert task is not None and task.status == "todo"
+    assert running_after is not None and running_after.status == "requested"
+    assert terminal_after is not None and terminal_after.status == "requested"
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["worker_pid"] is None
+    assert run_row["ended_at"] is not None
+    assert killed == [(9876, claimed.claim_lock)]
+
+
+def test_archive_task_reclaims_running_task_approvals(kanban_home, monkeypatch):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="archive approvals", assignee="worker")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(conn, approval.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.set_task_approval_worker_pid(conn, approval.id, 2468, run_id=claimed.current_run_id)
+
+        assert kb.archive_task(conn, task_id) is True
+
+        task = kb.get_task(conn, task_id)
+        approval_after = kb.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert task is not None and task.status == "archived"
+    assert approval_after is not None and approval_after.status == "cancelled"
+    assert run_row is not None and run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert killed == [(2468, claimed.claim_lock)]
+
+
+def test_delete_task_reclaims_running_task_approvals_before_deleting(kanban_home, monkeypatch):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="delete approvals", assignee="worker")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = kb.claim_task_approval(conn, approval.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.set_task_approval_worker_pid(conn, approval.id, 1357, run_id=claimed.current_run_id)
+
+        assert kb.delete_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id) is None
+
+    assert killed == [(1357, claimed.claim_lock)]
 
 
 def test_delete_archived_task_removes_related_rows(kanban_home):
