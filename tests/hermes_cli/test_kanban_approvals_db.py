@@ -777,7 +777,7 @@ def test_reset_task_approval_requires_parent_task_to_be_approval(kanban_home):
             status="approved",
         )
 
-        with pytest.raises(ValueError, match="parent task must be approval"):
+        with pytest.raises(ValueError, match="parent task must be in approval status"):
             kb.reset_task_approval(conn, approval.id)
 
 
@@ -2396,4 +2396,3 @@ def test_approval_run_from_row_parses_optional_fields():
         comment_id=15,
         error=None,
     )
-
