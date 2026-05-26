@@ -1601,13 +1601,6 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"Approvals ({len(approvals)}):")
         for approval in approvals:
             print(approvals_cli.format_approval_line(approval, include_task_id=False))
-    if approval_runs:
-        print()
-        print(f"Approval runs ({len(approval_runs)}):")
-        for run in approval_runs:
-            print(approvals_cli.format_approval_run_line(run))
-            if run.error:
-                print(f"        ! {run.error.splitlines()[0][:160]}")
     if comments:
         print()
         print(f"Comments ({len(comments)}):")
@@ -1635,6 +1628,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+    if approval_runs:
+        print()
+        print(f"Approval runs ({len(approval_runs)}):")
+        for run in approval_runs:
+            print(approvals_cli.format_approval_run_line(run))
+            if run.error:
+                print(f"        ! {run.error.splitlines()[0][:160]}")
     return 0
 
 
