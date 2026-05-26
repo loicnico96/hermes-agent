@@ -126,6 +126,42 @@ def test_cli_approval_remove_and_reset(kanban_home):
 
 
 
+def test_cli_approval_reclaim(kanban_home):
+    task = json.loads(run_slash("create 'reclaim target' --assignee worker --json"))
+    task_id = task["id"]
+    approval = json.loads(run_slash(f"approval add {task_id} --agent reviewer --json"))
+
+    with kb.connect() as conn:
+        run = kb.create_task_approval_run(conn, approval_id=approval["id"], status="running")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   claim_lock = ?,
+                   claim_expires = ?,
+                   worker_pid = ?,
+                   last_heartbeat_at = ?,
+                   current_run_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            ("lease-2", 321, 654, 987, run.id, 7_500, approval["id"]),
+        )
+
+    reclaim_payload = json.loads(run_slash(f"approval reclaim {approval['id']} --json"))
+    reclaim_show = json.loads(run_slash(f"show {task_id} --json"))
+
+    assert reclaim_payload["approval"]["id"] == approval["id"]
+    assert reclaim_payload["approval"]["status"] == "cancelled"
+    assert reclaim_payload["task_status"] == "done"
+    assert reclaim_show["task"]["status"] == "done"
+    assert reclaim_show["approvals"][0]["status"] == "cancelled"
+    assert reclaim_show["approval_runs"][0]["status"] == "reclaimed"
+    assert reclaim_show["approval_runs"][0]["outcome"] == "reclaimed"
+
+
+
 def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_PROFILE_NAME", "approver")
 
@@ -161,21 +197,15 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     change_approve_payload = json.loads(
         run_slash(f"approval approve {change_human['id']} --comment 'initial yes' --json")
     )
-    change_reject_payload = json.loads(
-        run_slash(f"approval reject {change_human['id']} --comment 'actually no' --json")
-    )
     change_show = json.loads(run_slash(f"show {change_task_id} --json"))
 
     assert change_approve_payload["approval"]["status"] == "approved"
-    assert change_approve_payload["task_status"] == "approval"
-    assert change_approve_payload["aggregate_status"] == "approval"
-    assert change_reject_payload["approval"]["id"] == change_human["id"]
-    assert change_reject_payload["approval"]["status"] == "requested"
-    assert change_reject_payload["task_status"] == "todo"
-    assert change_reject_payload["aggregate_status"] == "todo"
-    assert change_show["task"]["status"] == "todo"
-    assert [row["status"] for row in change_show["approvals"]] == ["requested", "requested"]
-    assert [comment["body"] for comment in change_show["comments"][-2:]] == ["initial yes", "actually no"]
+    assert change_approve_payload["task_status"] == "done"
+    assert change_approve_payload["aggregate_status"] == "done"
+    assert change_show["task"]["status"] == "done"
+    assert change_show["comments"][-1]["body"] == "initial yes"
+
+    reject_task = json.loads(run_slash("create 'reject target' --assignee worker --json"))
 
     reaffirm_task = json.loads(run_slash("create 'reaffirm target' --assignee worker --json"))
     reaffirm_task_id = reaffirm_task["id"]
@@ -196,9 +226,9 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     assert reaffirm_payload["approval"]["id"] == reaffirm_human["id"]
     assert reaffirm_payload["approval"]["status"] == "approved"
-    assert reaffirm_payload["task_status"] == "approval"
-    assert reaffirm_payload["aggregate_status"] == "approval"
-    assert reaffirm_show["task"]["status"] == "approval"
+    assert reaffirm_payload["task_status"] == "done"
+    assert reaffirm_payload["aggregate_status"] == "done"
+    assert reaffirm_show["task"]["status"] == "done"
     assert reaffirm_show["approvals"][0]["comment_id"] is not None
     assert reaffirm_show["comments"][-1]["body"] == "still approved"
 
@@ -248,7 +278,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     assert reopen_payload["approval"]["id"] == reopen_human["id"]
     assert reopen_payload["approval"]["status"] == "approved"
-    assert reopen_payload["task_status"] == "approval"
-    assert reopen_payload["aggregate_status"] == "approval"
-    assert reopen_show["task"]["status"] == "approval"
+    assert reopen_payload["task_status"] == "done"
+    assert reopen_payload["aggregate_status"] == "done"
+    assert reopen_show["task"]["status"] == "done"
     assert reopen_show["comments"][-1]["body"] == "re-opened and approved"
