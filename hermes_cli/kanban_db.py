@@ -105,8 +105,9 @@ from hermes_cli.kanban_approvals_db import (
     _finalize_task_approval_row_if_owned,
     _normalize_approval_profile,
     _prepare_task_approvals_for_new_completion_cycle,
+    _reclaim_running_task_approvals,
     _reset_task_approval_row,
-    _reset_task_approvals_for_task,
+    _reset_task_approvals,
     _validate_approval_decision_status,
     _validate_approval_identity,
     _validate_approval_run_status,
@@ -3937,6 +3938,7 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        _reclaim_running_task_approvals(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -4008,6 +4010,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         row = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
         if row is None:
             return False
+        _reclaim_running_task_approvals(conn, task_id)
         _delete_task_owned_rows(conn, task_id)
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     recompute_ready(conn)
