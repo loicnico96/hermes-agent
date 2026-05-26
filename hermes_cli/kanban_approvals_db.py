@@ -822,6 +822,33 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         return approval
 
 
+def reclaim_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
+    now = int(time.time())
+
+    with kb.write_txn(conn):
+        approval = get_task_approval(conn, approval_id)
+        if approval is None:
+            raise ValueError(f"unknown approval {approval_id}")
+
+        task = kb.get_task(conn, approval.task_id)
+        assert task is not None
+        if task.status != "approval":
+            raise ValueError("parent task must be approval")
+        if approval.approver_type != "agent" or approval.status != "running":
+            raise ValueError("reclaim requires a running agent approval")
+        _reclaim_running_approval(conn, approval=approval, now=now)
+        remaining = list_task_approvals(conn, approval.task_id)
+        _apply_task_approval_aggregate_transition(
+            conn,
+            approval.task_id,
+            approvals=remaining,
+            now=now,
+        )
+        reclaimed = get_task_approval(conn, approval_id)
+        assert reclaimed is not None
+        return reclaimed
+
+
 _TASK_APPROVAL_RESET_SET_SQL = """
 status = 'requested',
 comment_id = NULL,
