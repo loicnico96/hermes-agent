@@ -135,7 +135,7 @@ This phase is the semantic spine. Do not move on while any rule still depends on
 
 **Deliverables:**
 - new CLI namespace:
-  - `hermes kanban approval add`
+  - `hermes kanban approval request`
   - `hermes kanban approval list`
   - `hermes kanban approval remove`
   - `hermes kanban approval approve`
@@ -151,10 +151,10 @@ This phase is the semantic spine. Do not move on while any rule still depends on
 
 **Required tests:**
 - CLI parser/help tests
-- approval add/remove/list tests
+- approval request/remove/list tests
 - human approve/reject/reset tests
 - show output tests (`human` and `--json` modes)
-- done/archived-task add rejection tests
+- done/archived-task request rejection tests
 - invariant violation tests surfaced cleanly through CLI
 
 **Phase exit criteria:**

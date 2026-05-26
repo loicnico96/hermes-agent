@@ -117,7 +117,7 @@ def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, An
     }
 
 
-def _cmd_approval_add(args: argparse.Namespace) -> int:
+def _cmd_approval_request(args: argparse.Namespace) -> int:
     approver_type = "human" if getattr(args, "human", False) else "agent"
     if approver_type == "human" and getattr(args, "skill", None):
         raise ValueError("--skill is only valid with --agent")
@@ -135,7 +135,7 @@ def _cmd_approval_add(args: argparse.Namespace) -> int:
         print(json.dumps(_approval_to_dict(approval), indent=2, ensure_ascii=False))
     else:
         print(
-            f"Added approval #{approval.id} to {approval.task_id} "
+            f"Requested approval #{approval.id} on {approval.task_id} "
             f"({approval.status}, {_format_approval_target(approval)})"
         )
     return 0
@@ -241,10 +241,10 @@ def _cmd_approval_reclaim(args: argparse.Namespace) -> int:
 def _dispatch_approval(args: argparse.Namespace) -> int:
     sub = getattr(args, "approval_action", None)
     if not sub:
-        print("kanban approval: specify a subcommand (add, list, remove, approve, reject, reset, reclaim)", file=sys.stderr)
+        print("kanban approval: specify a subcommand (request, list, remove, approve, reject, reset, reclaim)", file=sys.stderr)
         return 2
-    if sub == "add":
-        return _cmd_approval_add(args)
+    if sub == "request":
+        return _cmd_approval_request(args)
     if sub == "list":
         return _cmd_approval_list(args)
     if sub == "remove":
@@ -272,13 +272,13 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
     )
     approval_sub = p_approval.add_subparsers(dest="approval_action")
 
-    p_approval_add = approval_sub.add_parser("add", help="Attach an approval row to a task")
-    p_approval_add.add_argument("task_id")
-    approval_identity = p_approval_add.add_mutually_exclusive_group(required=True)
+    p_approval_request = approval_sub.add_parser("request", help="Request an approval row on a task")
+    p_approval_request.add_argument("task_id")
+    approval_identity = p_approval_request.add_mutually_exclusive_group(required=True)
     approval_identity.add_argument("--human", action="store_true", help="Create a human approval gate")
     approval_identity.add_argument("--agent", metavar="PROFILE", help="Create an agent approval gate for this profile")
-    p_approval_add.add_argument("--skill", default=None, help="Optional skill name for an agent approval")
-    p_approval_add.add_argument("--json", action="store_true")
+    p_approval_request.add_argument("--skill", default=None, help="Optional skill name for an agent approval")
+    p_approval_request.add_argument("--json", action="store_true")
 
     p_approval_list = approval_sub.add_parser("list", help="List approval rows")
     p_approval_list.add_argument("--task", default=None, help="Restrict to one task id")

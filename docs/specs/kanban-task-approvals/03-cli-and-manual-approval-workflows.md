@@ -98,15 +98,15 @@ hermes kanban approval ...
 
 No top-level `hermes approval ...` alias is added.
 
-### 4.1 `hermes kanban approval add`
+### 4.1 `hermes kanban approval request`
 
 Create one approval row.
 
 Required forms:
 
 ```bash
-hermes kanban approval add <task_id> --human
-hermes kanban approval add <task_id> --agent <profile>
+hermes kanban approval request <task_id> --human
+hermes kanban approval request <task_id> --agent <profile>
 ```
 
 Optional flags:
@@ -257,7 +257,7 @@ This is the required inspection surface for Phase 3. Approval-run rows remain ru
 
 No approval flags are added to task creation in this phase.
 
-Approvals remain an explicit follow-up operation via `hermes kanban approval add`.
+Approvals remain an explicit follow-up operation via `hermes kanban approval request`.
 
 ### 5.3 Slash command behavior
 
