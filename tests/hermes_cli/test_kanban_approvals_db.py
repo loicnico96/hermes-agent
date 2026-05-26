@@ -842,6 +842,173 @@ def test_reset_task_approval_rejects_unknown_approval(kanban_home):
 
 
 
+def test_reclaim_task_approval_reclaims_running_agent_row(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_200)
+    killed: list[tuple[int | None, str | None]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   claim_lock = ?,
+                   claim_expires = ?,
+                   worker_pid = ?,
+                   last_heartbeat_at = ?,
+                   current_run_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            ("lease-1", 123, 456, 789, run.id, 8_100, approval.id),
+        )
+
+        reclaimed = kb.reclaim_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, ended_at, outcome, worker_pid FROM task_approval_runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
+
+    assert reclaimed.status == "cancelled"
+    assert reclaimed.worker_pid is None
+    assert reclaimed.current_run_id is None
+    assert reclaimed.updated_at == 8_200
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["ended_at"] == 8_200
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["worker_pid"] is None
+    assert killed == [(456, "lease-1")]
+
+
+
+def test_reclaim_task_approval_requires_running_agent_row(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target")
+        human = kb.create_task_approval(conn, task_id=task_id, approver_type="human")
+        agent = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+
+        with pytest.raises(ValueError, match="reclaim requires a running agent approval"):
+            kb.reclaim_task_approval(conn, human.id)
+        with pytest.raises(ValueError, match="reclaim requires a running agent approval"):
+            kb.reclaim_task_approval(conn, agent.id)
+
+
+
+def test_reclaim_task_approval_transitions_task_done_when_last_running_agent_is_reclaimed(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_300)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   claim_lock = ?,
+                   claim_expires = ?,
+                   worker_pid = ?,
+                   last_heartbeat_at = ?,
+                   current_run_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            ("lease-1", 123, 456, 789, run.id, 8_250, approval.id),
+        )
+
+        reclaimed = kb.reclaim_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+
+    assert reclaimed.status == "cancelled"
+    assert task is not None
+    assert task.status == "done"
+
+
+
+def test_reclaim_task_approval_transitions_task_todo_when_other_rejection_exists(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb.time, "time", lambda: 8_350)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        running = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        rejected = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer-2",
+            status="rejected",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=running.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   claim_lock = ?,
+                   claim_expires = ?,
+                   worker_pid = ?,
+                   last_heartbeat_at = ?,
+                   current_run_id = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            ("lease-2", 321, 654, 987, run.id, 8_325, running.id),
+        )
+
+        reclaimed = kb.reclaim_task_approval(conn, running.id)
+        task = kb.get_task(conn, task_id)
+        rejected_after = kb.get_task_approval(conn, rejected.id)
+
+    assert reclaimed.status == "requested"
+    assert task is not None
+    assert task.status == "todo"
+    assert rejected_after is not None
+    assert rejected_after.status == "requested"
+
+
+
 def test_remove_task_approval_recomputes_approval_parent_state(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")

@@ -125,6 +125,7 @@ from hermes_cli.kanban_approvals_db import (
     record_manual_task_approval_decision,
     record_task_approval_decision,
     record_task_approval_failure,
+    reclaim_task_approval,
     remove_task_approval,
     reset_task_approval,
     set_task_approval_worker_pid,
