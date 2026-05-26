@@ -21,13 +21,13 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def test_cli_approval_add_list_and_show(kanban_home):
+def test_cli_approval_request_list_and_show(kanban_home):
     task_data = json.loads(run_slash("create 'approval target' --assignee worker --json"))
     task_id = task_data["id"]
 
-    human_approval = json.loads(run_slash(f"approval add {task_id} --human --json"))
+    human_approval = json.loads(run_slash(f"approval request {task_id} --human --json"))
     agent_approval = json.loads(
-        run_slash(f"approval add {task_id} --agent reviewer --skill security-review --json")
+        run_slash(f"approval request {task_id} --agent reviewer --skill security-review --json")
     )
 
     with kb.connect() as conn:
@@ -59,8 +59,8 @@ def test_cli_approval_remove_and_reset(kanban_home):
     task_data = json.loads(run_slash("create 'approval target' --assignee worker --json"))
     task_id = task_data["id"]
 
-    removed = json.loads(run_slash(f"approval add {task_id} --agent reviewer --json"))
-    survivor = json.loads(run_slash(f"approval add {task_id} --human --json"))
+    removed = json.loads(run_slash(f"approval request {task_id} --agent reviewer --json"))
+    survivor = json.loads(run_slash(f"approval request {task_id} --human --json"))
 
     with kb.connect() as conn:
         removed_run = kb.create_task_approval_run(conn, approval_id=removed["id"], status="running")
@@ -97,7 +97,7 @@ def test_cli_approval_remove_and_reset(kanban_home):
 
     second_task = json.loads(run_slash("create 'reset target' --assignee worker --json"))
     second_task_id = second_task["id"]
-    reset_target = json.loads(run_slash(f"approval add {second_task_id} --agent reviewer --json"))
+    reset_target = json.loads(run_slash(f"approval request {second_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (second_task_id,))
@@ -129,7 +129,7 @@ def test_cli_approval_remove_and_reset(kanban_home):
 def test_cli_approval_reclaim(kanban_home):
     task = json.loads(run_slash("create 'reclaim target' --assignee worker --json"))
     task_id = task["id"]
-    approval = json.loads(run_slash(f"approval add {task_id} --agent reviewer --json"))
+    approval = json.loads(run_slash(f"approval request {task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
         run = kb.create_task_approval_run(conn, approval_id=approval["id"], status="running")
@@ -167,7 +167,7 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     approve_task = json.loads(run_slash("create 'approve target' --assignee worker --json"))
     approve_task_id = approve_task["id"]
-    approve_gate = json.loads(run_slash(f"approval add {approve_task_id} --human --json"))
+    approve_gate = json.loads(run_slash(f"approval request {approve_task_id} --human --json"))
 
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (approve_task_id,))
@@ -188,8 +188,8 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     change_task = json.loads(run_slash("create 'change target' --assignee worker --json"))
     change_task_id = change_task["id"]
-    change_human = json.loads(run_slash(f"approval add {change_task_id} --human --json"))
-    json.loads(run_slash(f"approval add {change_task_id} --agent reviewer --json"))
+    change_human = json.loads(run_slash(f"approval request {change_task_id} --human --json"))
+    json.loads(run_slash(f"approval request {change_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (change_task_id,))
@@ -209,8 +209,8 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     reaffirm_task = json.loads(run_slash("create 'reaffirm target' --assignee worker --json"))
     reaffirm_task_id = reaffirm_task["id"]
-    reaffirm_human = json.loads(run_slash(f"approval add {reaffirm_task_id} --human --json"))
-    json.loads(run_slash(f"approval add {reaffirm_task_id} --agent reviewer --json"))
+    reaffirm_human = json.loads(run_slash(f"approval request {reaffirm_task_id} --human --json"))
+    json.loads(run_slash(f"approval request {reaffirm_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (reaffirm_task_id,))
@@ -234,8 +234,8 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     reject_task = json.loads(run_slash("create 'reject target' --assignee worker --json"))
     reject_task_id = reject_task["id"]
-    reject_human = json.loads(run_slash(f"approval add {reject_task_id} --human --json"))
-    reject_agent = json.loads(run_slash(f"approval add {reject_task_id} --agent reviewer --json"))
+    reject_human = json.loads(run_slash(f"approval request {reject_task_id} --human --json"))
+    reject_agent = json.loads(run_slash(f"approval request {reject_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (reject_task_id,))
@@ -261,8 +261,8 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
 
     reopen_task = json.loads(run_slash("create 'reopen target' --assignee worker --json"))
     reopen_task_id = reopen_task["id"]
-    reopen_human = json.loads(run_slash(f"approval add {reopen_task_id} --human --json"))
-    json.loads(run_slash(f"approval add {reopen_task_id} --agent reviewer --json"))
+    reopen_human = json.loads(run_slash(f"approval request {reopen_task_id} --human --json"))
+    json.loads(run_slash(f"approval request {reopen_task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (reopen_task_id,))

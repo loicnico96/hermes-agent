@@ -320,7 +320,7 @@ Modify:
 ### `hermes_cli/kanban_approvals_db.py`
 Modify:
 - aggregate task-state helpers to use `approval`,
-- approval add/reset/remove/decision helpers so they emit `approval_requested`, `approval_removed`, and `approval_decided` with the exact payload contracts above,
+- approval request/reset/remove/decision helpers so they emit `approval_requested`, `approval_removed`, and `approval_decided` with the exact payload contracts above,
 - escalation reuse logic so `approval_requested` is emitted only when the human gate is newly requested/reset,
 - manual human decision resolution helpers so CLI can decide by task id.
 
