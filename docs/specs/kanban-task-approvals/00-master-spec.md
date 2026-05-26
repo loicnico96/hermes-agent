@@ -285,15 +285,15 @@ This group is the only new CLI namespace for approvals in this slice.
 
 ### 7.2 Commands
 
-#### `hermes kanban approval add`
+#### `hermes kanban approval request`
 
 Create one approval row.
 
 Required forms:
 
 ```bash
-hermes kanban approval add <task_id> --human
-hermes kanban approval add <task_id> --agent <profile>
+hermes kanban approval request <task_id> --human
+hermes kanban approval request <task_id> --agent <profile>
 ```
 
 Optional flags:
@@ -387,7 +387,7 @@ When `--json` is used, include approvals in the structured payload.
 #### `hermes kanban create`
 
 No approval flags are added to `create` in this slice.
-Approval attachment happens via `hermes kanban approval add`.
+Approval attachment happens via `hermes kanban approval request`.
 
 Rationale:
 - keeps the first CLI slice small and explicit

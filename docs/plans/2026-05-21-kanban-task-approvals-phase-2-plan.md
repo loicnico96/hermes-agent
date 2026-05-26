@@ -453,7 +453,7 @@ Phase 2 is complete only when all of the following are true:
 ## 8. Explicit deferrals to Phase 3+
 
 Do not pull these into Phase 2:
-- `hermes kanban approval add|list|remove|approve|reject|reset`
+- `hermes kanban approval request|list|remove|approve|reject|reset`
 - task-show approval rendering work
 - dispatcher-owned claiming or spawning of agent approvers
 - approval-run stale detection, heartbeat, timeout, or reclaim behavior beyond the narrow stale-result ownership guard described above
