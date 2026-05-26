@@ -223,10 +223,25 @@ def _cmd_approval_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_approval_reclaim(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        approval = kb.reclaim_task_approval(conn, args.approval_id)
+        payload = _approval_mutation_payload(conn, approval)
+
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Reclaimed approval #{approval.id} on {approval.task_id}; "
+            f"task status remains {payload['task_status']}"
+        )
+    return 0
+
+
 def _dispatch_approval(args: argparse.Namespace) -> int:
     sub = getattr(args, "approval_action", None)
     if not sub:
-        print("kanban approval: specify a subcommand (add, list, remove, approve, reject, reset)", file=sys.stderr)
+        print("kanban approval: specify a subcommand (add, list, remove, approve, reject, reset, reclaim)", file=sys.stderr)
         return 2
     if sub == "add":
         return _cmd_approval_add(args)
@@ -240,6 +255,8 @@ def _dispatch_approval(args: argparse.Namespace) -> int:
         return _cmd_approval_decide(args, status="rejected")
     if sub == "reset":
         return _cmd_approval_reset(args)
+    if sub == "reclaim":
+        return _cmd_approval_reclaim(args)
     print(f"kanban approval: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -297,5 +314,9 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
     p_approval_reset = approval_sub.add_parser("reset", help="Reset one approval row back to requested")
     p_approval_reset.add_argument("approval_id", type=int)
     p_approval_reset.add_argument("--json", action="store_true")
+
+    p_approval_reclaim = approval_sub.add_parser("reclaim", help="Reclaim one running agent approval and cancel it")
+    p_approval_reclaim.add_argument("approval_id", type=int)
+    p_approval_reclaim.add_argument("--json", action="store_true")
 
     return p_approval
