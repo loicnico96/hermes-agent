@@ -309,12 +309,12 @@ def test_claim_task_approval_creates_live_run_and_claim_event(kanban_home):
     assert run_row["started_at"] == 1_000
     assert event_row is not None
     assert event_row["kind"] == "approval_claimed"
-    assert event_row["run_id"] == claimed.current_run_id
+    assert event_row["run_id"] is None
     assert json.loads(event_row["payload"]) == {
         "approval_id": approval.id,
         "lock": "dispatcher:123",
         "expires": 1090,
-        "run_id": claimed.current_run_id,
+        "approval_run_id": claimed.current_run_id,
         "approver_profile": "reviewer",
     }
 
@@ -384,7 +384,7 @@ def test_task_approval_runtime_helpers_update_live_row_and_run_together(kanban_h
             (claimed.current_run_id,),
         ).fetchone()
         event_rows = conn.execute(
-            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id ASC",
+            "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? ORDER BY id ASC",
             (task_id,),
         ).fetchall()
 
@@ -397,10 +397,66 @@ def test_task_approval_runtime_helpers_update_live_row_and_run_together(kanban_h
     assert run_row["last_heartbeat_at"] == 700
     assert run_row["claim_expires"] == 820
     assert [row["kind"] for row in event_rows[-2:]] == ["approval_spawned", "approval_heartbeat"]
-    assert json.loads(event_rows[-2]["payload"]) == {"approval_id": approval.id, "pid": 4321}
+    assert event_rows[-2]["run_id"] is None
+    assert json.loads(event_rows[-2]["payload"]) == {
+        "approval_id": approval.id,
+        "approval_run_id": claimed.current_run_id,
+        "pid": 4321,
+    }
+    assert event_rows[-1]["run_id"] is None
     assert json.loads(event_rows[-1]["payload"]) == {
         "approval_id": approval.id,
+        "approval_run_id": claimed.current_run_id,
         "note": "still reviewing",
+    }
+
+
+def test_record_task_approval_decision_emits_approval_run_in_payload_but_not_task_event_run_id(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = kb.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   current_run_id = ?,
+                   claim_lock = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (run.id, "lease-1", 8_900, approval.id),
+        )
+
+        aggregate_status = kb.record_task_approval_decision(
+            conn,
+            approval_id=approval.id,
+            expected_run_id=run.id,
+            status="approved",
+            now=9_000,
+        )
+        event_row = conn.execute(
+            "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? AND kind = 'approval_decided' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert aggregate_status == "done"
+    assert event_row is not None
+    assert event_row["kind"] == "approval_decided"
+    assert event_row["run_id"] is None
+    assert json.loads(event_row["payload"]) == {
+        "approval_id": approval.id,
+        "approver_type": "agent",
+        "approver_profile": "reviewer",
+        "decision": "approved",
+        "approval_run_id": run.id,
     }
 
 
@@ -889,6 +945,10 @@ def test_reclaim_task_approval_reclaims_running_agent_row(kanban_home, monkeypat
             "SELECT status, ended_at, outcome, worker_pid FROM task_approval_runs WHERE id = ?",
             (run.id,),
         ).fetchone()
+        cancelled_event = conn.execute(
+            "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? AND kind = 'approval_cancelled' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
 
     assert reclaimed.status == "cancelled"
     assert reclaimed.worker_pid is None
@@ -899,6 +959,15 @@ def test_reclaim_task_approval_reclaims_running_agent_row(kanban_home, monkeypat
     assert run_row["ended_at"] == 8_200
     assert run_row["outcome"] == "reclaimed"
     assert run_row["worker_pid"] is None
+    assert cancelled_event is not None
+    assert cancelled_event["kind"] == "approval_cancelled"
+    assert cancelled_event["run_id"] is None
+    assert json.loads(cancelled_event["payload"]) == {
+        "approval_id": approval.id,
+        "approver_type": "agent",
+        "approver_profile": "reviewer",
+        "approval_run_id": run.id,
+    }
     assert killed == [(456, "lease-1")]
 
 
