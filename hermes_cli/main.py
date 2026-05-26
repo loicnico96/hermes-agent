@@ -10012,15 +10012,27 @@ def cmd_profile(args):
             print("No profiles found.")
             return
 
+        show_nickname = any((p.nickname or "").strip() for p in profiles)
+
         # Header
-        print(
-            f"\n {'Profile':<16} {'Model':<28} {'Gateway':<12} "
-            f"{'Alias':<12} {'Distribution'}"
-        )
-        print(
-            f" {'─' * 15}    {'─' * 27}    {'─' * 11}    "
-            f"{'─' * 11}    {'─' * 20}"
-        )
+        if show_nickname:
+            print(
+                f"\n {'Profile':<16} {'Nickname':<12} {'Model':<28} {'Gateway':<12} "
+                f"{'Alias':<12} {'Distribution'}"
+            )
+            print(
+                f" {'─' * 15}    {'─' * 11}    {'─' * 27}    {'─' * 11}    "
+                f"{'─' * 11}    {'─' * 20}"
+            )
+        else:
+            print(
+                f"\n {'Profile':<16} {'Model':<28} {'Gateway':<12} "
+                f"{'Alias':<12} {'Distribution'}"
+            )
+            print(
+                f" {'─' * 15}    {'─' * 27}    {'─' * 11}    "
+                f"{'─' * 11}    {'─' * 20}"
+            )
 
         for p in profiles:
             marker = (
@@ -10029,6 +10041,7 @@ def cmd_profile(args):
                 else "  "
             )
             name = p.name
+            nickname = (p.nickname or "—")[:11]
             model = (p.model or "—")[:26]
             gw = "running" if p.gateway_running else "stopped"
             alias = p.name if p.alias_path else "—"
@@ -10039,7 +10052,12 @@ def cmd_profile(args):
                 dist = dist[:30]
             else:
                 dist = "—"
-            print(f"{marker}{name:<15} {model:<28} {gw:<12} {alias:<12} {dist}")
+            if show_nickname:
+                print(
+                    f"{marker}{name:<15} {nickname:<12} {model:<28} {gw:<12} {alias:<12} {dist}"
+                )
+            else:
+                print(f"{marker}{name:<15} {model:<28} {gw:<12} {alias:<12} {dist}")
         print()
 
     elif action == "use":
@@ -10281,6 +10299,7 @@ def cmd_profile(args):
             _check_gateway_running,
             _count_skills,
             _read_distribution_meta,
+            read_profile_meta,
         )
 
         if not profile_exists(name):
@@ -10291,9 +10310,12 @@ def cmd_profile(args):
         gw = _check_gateway_running(profile_dir)
         skills = _count_skills(profile_dir)
         dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
+        meta = read_profile_meta(profile_dir)
         wrapper = _get_wrapper_dir() / name
 
         print(f"\nProfile: {name}")
+        if meta.get("nickname"):
+            print(f"Nickname: {meta['nickname']}")
         print(f"Path:    {profile_dir}")
         if model:
             print(f"Model:   {model}" + (f" ({provider})" if provider else ""))
