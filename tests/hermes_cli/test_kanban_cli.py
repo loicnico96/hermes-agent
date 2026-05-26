@@ -166,8 +166,9 @@ def test_run_slash_show_surfaces_approval_runs(kanban_home):
     show = kc.run_slash(f"show {tid}")
     assert "Approvals (1):" in show
     assert f"#{approval.id}" in show
-    assert "Approval runs (1):" not in show
-    assert "worker exceeded runtime budget" not in show
+    assert "Approval runs (1):" in show
+    assert "timed_out" in show
+    assert "worker exceeded runtime budget" in show
 
     payload = json.loads(kc.run_slash(f"show {tid} --json"))
     assert payload["approvals"][0]["id"] == approval.id
