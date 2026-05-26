@@ -109,6 +109,7 @@ So lane authors don't have to reimplement these:
 ## Related
 
 - [Kanban overview](./kanban) — the user-facing intro.
+- [Kanban task approvals](./kanban-approvals) — review gates, task `approval` state, and human-vs-agent precedence.
 - [Kanban tutorial](./kanban-tutorial) — walkthrough with the dashboard open.
 - [`kanban-worker`](https://github.com/NousResearch/hermes-agent/blob/main/skills/devops/kanban-worker/SKILL.md) — the skill the worker process loads.
 - [`kanban-orchestrator`](https://github.com/NousResearch/hermes-agent/blob/main/skills/devops/kanban-orchestrator/SKILL.md) — the orchestrator side.
