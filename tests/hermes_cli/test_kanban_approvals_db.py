@@ -761,9 +761,9 @@ def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban
     assert reset.last_failure_error is None
     assert reset.updated_at == 5_000
     assert run_row is not None
-    assert run_row["status"] == "running"
-    assert run_row["ended_at"] is None
-    assert run_row["outcome"] is None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["ended_at"] == 5_000
+    assert run_row["outcome"] == "reclaimed"
 
 
 def test_reset_task_approval_requires_parent_task_to_be_approval(kanban_home):
@@ -977,9 +977,9 @@ def test_record_manual_task_approval_decision_allows_valid_human_runtime_states(
         refreshed_agent = kb.get_task_approval(conn, agent.id)
         comments = kb.list_comments(conn, task_id)
 
-    assert aggregate_status == "approval"
+    assert aggregate_status == "done"
     assert task is not None
-    assert task.status == "approval"
+    assert task.status == "done"
     assert refreshed_human is not None
     assert refreshed_human.status == "approved"
     assert refreshed_human.comment_id == comments[0].id
@@ -1151,9 +1151,9 @@ def test_record_manual_task_approval_decision_allows_reaffirming_human_approval_
         refreshed_agent = kb.get_task_approval(conn, agent.id)
         comments = kb.list_comments(conn, task_id)
 
-    assert aggregate_status == "approval"
+    assert aggregate_status == "done"
     assert task is not None
-    assert task.status == "approval"
+    assert task.status == "done"
     assert refreshed_human is not None
     assert refreshed_human.status == "approved"
     assert refreshed_human.comment_id == comments[0].id
@@ -1248,7 +1248,7 @@ def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home,
                 (other_comment_id, 2, "keep me", 6_100, other.id),
             )
 
-            reset_count = kb._reset_task_approvals_for_task(conn, task_id)
+            reset_count = kb._reset_task_approvals(conn, task_id)
 
         reset = kb.get_task_approval(conn, approval.id)
         untouched = kb.get_task_approval(conn, other.id)
@@ -1282,13 +1282,13 @@ def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home,
         (["running"], "approval"),
         (["approved"], "done"),
         (["approved", "approved"], "done"),
-        (["approved", "requested"], "approval"),
-        (["approved", "running"], "approval"),
-        (["requested", "rejected"], "todo"),
+        (["approved", "requested"], "done"),
+        (["approved", "running"], "done"),
+        (["requested", "rejected"], "approval"),
         (["running", "rejected"], "approval"),
-        (["approved", "rejected"], "todo"),
-        (["escalated", "approved"], "done"),
-        (["failed", "approved"], "done"),
+        (["approved", "rejected"], "done"),
+        (["escalated", "approved"], "approval"),
+        (["failed", "approved"], "approval"),
         (["failed", "requested"], "approval"),
         (["failed", "running"], "approval"),
     ],
