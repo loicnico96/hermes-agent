@@ -806,7 +806,7 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         task = kb.get_task(conn, approval.task_id)
         assert task is not None
         if task.status != "approval":
-            raise ValueError("parent task must be approval")
+            raise ValueError("parent task must be in approval status")
         if approval.status == "requested":
             return approval
         if approval.approver_type == "agent" and approval.status == "running":
@@ -833,7 +833,7 @@ def reclaim_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approva
         task = kb.get_task(conn, approval.task_id)
         assert task is not None
         if task.status != "approval":
-            raise ValueError("parent task must be approval")
+            raise ValueError("parent task must be in approval status")
         if approval.approver_type != "agent" or approval.status != "running":
             raise ValueError("reclaim requires a running agent approval")
         _reclaim_running_approval(conn, approval=approval, now=now)
