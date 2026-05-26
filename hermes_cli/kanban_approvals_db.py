@@ -252,7 +252,19 @@ def _emit_approval_decided(
         payload["comment_id"] = int(comment_id)
     if approval_run_id is not None:
         payload["approval_run_id"] = int(approval_run_id)
-    kb._append_event(conn, approval.task_id, "approval_decided", payload, run_id=approval_run_id)
+    kb._append_event(conn, approval.task_id, "approval_decided", payload)
+
+
+def _emit_approval_cancelled(
+    conn: sqlite3.Connection,
+    approval: Approval,
+    *,
+    approval_run_id: Optional[int] = None,
+) -> None:
+    payload = _approval_identity_payload(approval)
+    if approval_run_id is not None:
+        payload["approval_run_id"] = int(approval_run_id)
+    kb._append_event(conn, approval.task_id, "approval_cancelled", payload)
 
 
 def _approval_exists(
@@ -569,10 +581,9 @@ def claim_task_approval(
                 "approval_id": approval.id,
                 "lock": claim_lock,
                 "expires": claim_expires,
-                "run_id": int(run_id),
+                "approval_run_id": int(run_id),
                 "approver_profile": approval.approver_profile,
             },
-            run_id=int(run_id),
         )
         claimed = get_task_approval(conn, approval.id)
         assert claimed is not None
@@ -631,7 +642,7 @@ def heartbeat_task_approval(
 
         approval = get_task_approval(conn, approval_id)
         assert approval is not None
-        payload: dict[str, object] = {"approval_id": approval.id}
+        payload: dict[str, object] = {"approval_id": approval.id, "approval_run_id": run_id}
         if note:
             payload["note"] = note
         kb._append_event(
@@ -639,7 +650,6 @@ def heartbeat_task_approval(
             approval.task_id,
             "approval_heartbeat",
             payload,
-            run_id=run_id,
         )
     return True
 
@@ -686,8 +696,7 @@ def set_task_approval_worker_pid(
             conn,
             approval.task_id,
             "approval_spawned",
-            {"approval_id": approval.id, "pid": int(pid)},
-            run_id=run_id,
+            {"approval_id": approval.id, "approval_run_id": run_id, "pid": int(pid)},
         )
     return True
 
@@ -889,12 +898,13 @@ def _reclaim_running_approval(
     if approval.approver_type != "agent" or approval.status != "running":
         return False
 
+    approval_run_id = approval.current_run_id
     kb._terminate_reclaimed_worker(
         approval.worker_pid,
         approval.claim_lock,
         signal_fn=signal_fn,
     )
-    if approval.current_run_id is not None:
+    if approval_run_id is not None:
         conn.execute(
             """
             UPDATE task_approval_runs
@@ -909,7 +919,7 @@ def _reclaim_running_approval(
                AND approval_id = ?
                AND status = 'running'
             """,
-            (now, int(approval.current_run_id), approval.id),
+            (now, int(approval_run_id), approval.id),
         )
     cur = conn.execute(
         """
@@ -930,7 +940,10 @@ def _reclaim_running_approval(
         """,
         (now, approval.id),
     )
-    return cur.rowcount == 1
+    if cur.rowcount == 1:
+        _emit_approval_cancelled(conn, approval, approval_run_id=approval_run_id)
+        return True
+    return False
 
 
 def _reclaim_running_task_approvals(
