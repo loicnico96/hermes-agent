@@ -1,6 +1,6 @@
 # Kanban tutorial
 
-A walkthrough of the four use-cases the Hermes Kanban system was designed for, with the dashboard open in a browser. If you haven't read the [Kanban overview](./kanban) yet, start there — this assumes you know what a task, run, assignee, and dispatcher are.
+A walkthrough of the four use-cases the Hermes Kanban system was designed for, with the dashboard open in a browser. If you haven't read the [Kanban overview](./kanban) yet, start there — this assumes you know what a task, run, assignee, and dispatcher are. If you specifically want durable review gates, human sign-off, or reviewer-lane semantics, see [Kanban task approvals](./kanban-approvals).
 
 ## Setup
 
