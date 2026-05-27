@@ -3336,7 +3336,7 @@ def test_create_task_with_explicit_workspace_ignores_board_default(kanban_home):
 
 
 def test_dispatch_max_in_progress_skips_when_at_limit(kanban_home, all_assignees_spawnable):
-    """When max_in_progress=N and N tasks are already running, spawn nothing."""
+    """When max_in_progress=N and N tasks are already running, spawn no workers."""
     spawns = []
 
     def fake_spawn(task, workspace):
@@ -3354,6 +3354,55 @@ def test_dispatch_max_in_progress_skips_when_at_limit(kanban_home, all_assignees
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=2)
 
     assert len(spawns) == 0, f"expected 0 spawns, got {len(spawns)}"
+
+
+def test_dispatch_max_in_progress_does_not_skip_approvals(
+    kanban_home, all_assignees_spawnable,
+):
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(("worker", task.id))
+
+    def fake_approval_spawn(approval, workspace, board=None):
+        spawns.append(("approval", approval.id))
+        return 4242
+
+    with kb.connect() as conn:
+        running_a = kb.create_task(conn, title="a", assignee="alice")
+        running_b = kb.create_task(conn, title="b", assignee="bob")
+        kb.claim_task(conn, running_a)
+        kb.claim_task(conn, running_b)
+
+        ready = kb.create_task(conn, title="c", assignee="alice")
+        task_id = kb.create_task(conn, title="needs approval", assignee="alice")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            approval_spawn_fn=fake_approval_spawn,
+            max_in_progress=2,
+            max_approvers=1,
+        )
+
+        ready_task = kb.get_task(conn, ready)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+
+    assert res.spawned == []
+    assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
+    assert spawns == [("approval", approval.id)]
+    assert ready_task is not None
+    assert ready_task.status == "ready"
+    assert refreshed is not None
+    assert refreshed.status == "running"
+    assert refreshed.worker_pid == 4242
 
 
 def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_spawnable):
@@ -3523,7 +3572,7 @@ def test_dispatch_approval_dry_run_reports_runnable_rows(kanban_home):
         )
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
-        res = kb.dispatch_once(conn, dry_run=True, max_approval_spawn=2)
+        res = kb.dispatch_once(conn, dry_run=True, max_approvers=2)
         refreshed = approvals_db.get_task_approval(conn, approval.id)
 
     assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
@@ -3555,7 +3604,7 @@ def test_dispatch_approval_uses_separate_concurrency_cap(kanban_home):
         res = kb.dispatch_once(
             conn,
             max_spawn=0,
-            max_approval_spawn=1,
+            max_approvers=1,
             approval_spawn_fn=fake_approval_spawn,
         )
 
@@ -3589,7 +3638,7 @@ def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
         )
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
-        kb.dispatch_once(conn, approval_spawn_fn=boom, max_approval_spawn=1)
+        kb.dispatch_once(conn, approval_spawn_fn=boom, max_approvers=1)
 
         refreshed = approvals_db.get_task_approval(conn, approval.id)
         run_row = conn.execute(

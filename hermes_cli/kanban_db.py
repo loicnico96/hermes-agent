@@ -111,6 +111,7 @@ _IS_WINDOWS = sys.platform == "win32"
 # ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` to raise the default claim window for
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+DEFAULT_MAX_CONCURRENT_APPROVERS = 2
 
 
 def _resolve_claim_ttl_seconds(ttl_seconds: Optional[int] = None) -> int:
@@ -5191,7 +5192,7 @@ def dispatch_once(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
-    max_approval_spawn: Optional[int] = None,
+    max_approvers: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -5312,11 +5313,15 @@ def dispatch_once(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
-            return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+            # Do not early-return here: max_in_progress is only a worker gate,
+            # and later unrelated dispatch work (such as spawning approvers)
+            # should still run this tick.
+            max_spawn = 0
+        else:
+            # Only spawn enough to reach the cap, respecting max_spawn too.
+            remaining = max_in_progress - in_progress
+            if max_spawn is None or max_spawn > remaining:
+                max_spawn = remaining
     spawned = 0
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
@@ -5496,7 +5501,7 @@ def dispatch_once(
                 result.auto_blocked.append(claimed.id)
 
     running_approval_count = 0
-    if max_approval_spawn is not None:
+    if max_approvers is not None:
         running_approval_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM task_approvals WHERE status = 'running'"
@@ -5507,8 +5512,8 @@ def dispatch_once(
     approval_rows = approvals_db.list_runnable_task_approvals(conn)
     for approval in approval_rows:
         if (
-            max_approval_spawn is not None
-            and running_approval_count + approval_spawned >= max_approval_spawn
+            max_approvers is not None
+            and running_approval_count + approval_spawned >= max_approvers
         ):
             break
         if dry_run:
@@ -5588,6 +5593,13 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+def get_max_approvers(kanban_cfg, *, override: Optional[str] = None) -> int:
+    raw = override if override is not None else (kanban_cfg or {}).get(
+        "max_approvers", DEFAULT_MAX_CONCURRENT_APPROVERS
+    )
+    return _positive_int(raw, DEFAULT_MAX_CONCURRENT_APPROVERS)
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
@@ -6298,7 +6310,7 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
-    max_approval_spawn: Optional[int] = None,
+    max_approvers: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
@@ -6336,7 +6348,7 @@ def run_daemon(
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
-                    max_approval_spawn=max_approval_spawn,
+                    max_approvers=max_approvers,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
