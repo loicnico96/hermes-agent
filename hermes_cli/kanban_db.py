@@ -89,6 +89,8 @@ from typing import Any, Iterable, Optional, Sequence
 
 from toolsets import get_toolset_names
 
+import hermes_cli.kanban_approvals_db as approvals_db
+
 _log = logging.getLogger(__name__)
 
 
@@ -7143,8 +7145,3 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
-
-# Import approval helpers after the kanban DB module body is defined to avoid
-# circular import initialization when approval-focused callers import
-# `kanban_approvals_db` first.
-import hermes_cli.kanban_approvals_db as approvals_db
