@@ -2145,7 +2145,7 @@ DEFAULT_CONFIG = {
         "failure_limit": 2,
         # Separate live concurrency cap for approval workers. Intentionally
         # isolated from the normal task-worker scheduler budget.
-        "max_approval_spawn": 2,
+        "max_approvers": 2,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.

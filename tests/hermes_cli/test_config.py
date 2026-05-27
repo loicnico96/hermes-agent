@@ -77,8 +77,8 @@ class TestLoadConfigDefaults:
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config = load_config()
 
-        assert config["kanban"]["max_approval_spawn"] == 2
-        assert config["kanban"]["max_approval_spawn"] != config["delegation"]["max_concurrent_children"]
+        assert config["kanban"]["max_approvers"] == 2
+        assert config["kanban"]["max_approvers"] != config["delegation"]["max_concurrent_children"]
 
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

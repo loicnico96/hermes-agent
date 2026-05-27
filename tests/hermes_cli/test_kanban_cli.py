@@ -216,7 +216,7 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
-def test_cmd_dispatch_uses_max_approvals_flag_over_config(monkeypatch):
+def test_cmd_dispatch_uses_max_approvers_flag_over_config(monkeypatch):
     calls = {}
 
     class DummyConn:
@@ -225,7 +225,7 @@ def test_cmd_dispatch_uses_max_approvals_flag_over_config(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approval_spawn': 7}})
+    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approvers': 7}})
     monkeypatch.setattr(kb, 'connect', lambda: DummyConn())
 
     class Result:
@@ -245,14 +245,14 @@ def test_cmd_dispatch_uses_max_approvals_flag_over_config(monkeypatch):
         return Result()
 
     monkeypatch.setattr(kb, 'dispatch_once', fake_dispatch_once)
-    args = argparse.Namespace(dry_run=True, max=3, max_approvals=5, failure_limit=2, json=True)
+    args = argparse.Namespace(dry_run=True, max=3, max_approvers=5, failure_limit=2, json=True)
 
     assert kc._cmd_dispatch(args) == 0
     assert calls['max_spawn'] == 3
-    assert calls['max_approval_spawn'] == 5
+    assert calls['max_approvers'] == 5
 
 
-def test_cmd_dispatch_max_approvals_falls_back_to_config(monkeypatch):
+def test_cmd_dispatch_max_approvers_falls_back_to_config(monkeypatch):
     calls = {}
 
     class DummyConn:
@@ -261,7 +261,7 @@ def test_cmd_dispatch_max_approvals_falls_back_to_config(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approval_spawn': 4}})
+    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approvers': 4}})
     monkeypatch.setattr(kb, 'connect', lambda: DummyConn())
 
     class Result:
@@ -281,11 +281,11 @@ def test_cmd_dispatch_max_approvals_falls_back_to_config(monkeypatch):
         return Result()
 
     monkeypatch.setattr(kb, 'dispatch_once', fake_dispatch_once)
-    args = argparse.Namespace(dry_run=True, max=None, max_approvals=None, failure_limit=2, json=True)
+    args = argparse.Namespace(dry_run=True, max=None, max_approvers=None, failure_limit=2, json=True)
 
     assert kc._cmd_dispatch(args) == 0
     assert calls['max_spawn'] is None
-    assert calls['max_approval_spawn'] == 4
+    assert calls['max_approvers'] == 4
 
 
 def test_run_slash_context_output_format(kanban_home):
