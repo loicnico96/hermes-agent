@@ -341,8 +341,44 @@ def test_notifier_formats_approval_decided_with_comment_and_transition(tmp_path,
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"✅ @coder Kanban {tid} approved — Approval outcome; task moved to done\n"
+        f"☑️ @coder Kanban {tid} approved — Approval outcome; task moved to done\n"
         "Looks good from agent review."
+    ]
+
+
+def test_notifier_formats_human_approved_with_green_check(tmp_path, monkeypatch):
+    db_path = tmp_path / "approval-decided-human.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_approval_subscription(title="Human approval outcome")
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (tid,))
+        comment_id = kb.add_comment(conn, tid, "reviewer", "Human approved after a quick pass.")
+        kb._append_event(
+            conn,
+            tid,
+            kind="approval_decided",
+            payload={
+                "approval_id": 8,
+                "approver_type": "human",
+                "decision": "approved",
+                "comment_id": comment_id,
+                "next_status": "done",
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [d["text"] for d in adapter.sent] == [
+        f"✅ Kanban {tid} approved — Human approval outcome; task moved to done\n"
+        "Human approved after a quick pass."
     ]
 
 
