@@ -186,6 +186,7 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_approvals_db as approvals_db
     return kb, kb.connect(board=board)
 
 
@@ -546,6 +547,7 @@ def _handle_complete(args: dict, **kw) -> str:
 
 def _handle_approval(args: dict, **kw) -> str:
     """Apply an approval-worker decision to the active approval row."""
+    from hermes_cli import kanban_approvals_db as approvals_db
     approval_mode_err = _require_approval_worker("kanban_approval")
     if approval_mode_err:
         return approval_mode_err
@@ -581,14 +583,14 @@ def _handle_approval(args: dict, **kw) -> str:
                     author=os.environ.get("HERMES_PROFILE") or "approver",
                     body=comment.strip(),
                 )
-            aggregate_status = kb.record_task_approval_decision(
+            aggregate_status = approvals_db.record_task_approval_decision(
                 conn,
                 approval_id=approval_id,
                 expected_run_id=run_id,
                 status=str(decision).strip().lower(),
                 comment_id=comment_id,
             )
-            approval = kb.get_task_approval(conn, approval_id)
+            approval = approvals_db.get_task_approval(conn, approval_id)
             return _ok(
                 task_id=task_id,
                 approval_id=approval_id,

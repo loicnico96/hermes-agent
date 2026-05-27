@@ -455,7 +455,7 @@ def test_complete_task_prepares_completion_cycle_only_when_approvals_exist(kanba
         assert kb.complete_task(conn, no_approval_task, result="done") is True
 
         approval_task = kb.create_task(conn, title="with approval", assignee="ops")
-        kb.create_task_approval(conn, task_id=approval_task, approver_type="human")
+        approvals_db.create_task_approval(conn, task_id=approval_task, approver_type="human")
         assert kb.complete_task(conn, approval_task, result="done") is True
 
     assert calls == [approval_task]
@@ -803,7 +803,7 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title=f"{approver_type} approval target", assignee="ops")
         comment_id = kb.add_comment(conn, task_id, "user", "stale decision")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type=approver_type,
@@ -812,7 +812,7 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
             **approval_kwargs,
         )
         run = (
-            kb.create_task_approval_run(conn, approval_id=approval.id, status="running")
+            approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
             if approver_type == "agent"
             else None
         )
@@ -846,7 +846,7 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
         assert kb.complete_task(conn, task_id, result="fresh result", summary="fresh summary") is True
 
         task = kb.get_task(conn, task_id)
-        refreshed_approval = kb.get_task_approval(conn, approval.id)
+        refreshed_approval = approvals_db.get_task_approval(conn, approval.id)
         closed_run = conn.execute(
             "SELECT status, outcome, summary FROM task_runs WHERE id = ?",
             (claimed_task.current_run_id,),
@@ -1159,15 +1159,15 @@ def test_apply_task_approval_aggregate_transition_done_reclaims_running_agents(
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval done", assignee="worker")
-        human = kb.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
-        running = kb.create_task_approval(
+        human = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
+        running = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
             approver_profile="reviewer",
             status="requested",
         )
-        requested = kb.create_task_approval(
+        requested = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -1175,16 +1175,16 @@ def test_apply_task_approval_aggregate_transition_done_reclaims_running_agents(
             status="requested",
         )
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, running.id)
+        claimed = approvals_db.claim_task_approval(conn, running.id)
         assert claimed is not None and claimed.current_run_id is not None
-        assert kb.set_task_approval_worker_pid(conn, running.id, 4321, run_id=claimed.current_run_id)
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 4321, run_id=claimed.current_run_id)
 
-        approvals = kb.list_task_approvals(conn, task_id)
+        approvals = approvals_db.list_task_approvals(conn, task_id)
         aggregate = approvals_db.apply_task_approval_aggregate_transition_in_txn(conn, task_id, approvals=approvals)
 
         task = kb.get_task(conn, task_id)
-        running_after = kb.get_task_approval(conn, running.id)
-        requested_after = kb.get_task_approval(conn, requested.id)
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        requested_after = approvals_db.get_task_approval(conn, requested.id)
         run_row = conn.execute(
             "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
             (claimed.current_run_id,),
@@ -1223,25 +1223,25 @@ def test_apply_task_approval_aggregate_transition_todo_resets_all_approvals(
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval todo", assignee="worker")
-        running = kb.create_task_approval(
+        running = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
             approver_profile="reviewer",
             status="requested",
         )
-        terminal = kb.create_task_approval(conn, task_id=task_id, approver_type="human", status="rejected")
+        terminal = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="rejected")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, running.id)
+        claimed = approvals_db.claim_task_approval(conn, running.id)
         assert claimed is not None and claimed.current_run_id is not None
-        assert kb.set_task_approval_worker_pid(conn, running.id, 9876, run_id=claimed.current_run_id)
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 9876, run_id=claimed.current_run_id)
 
-        approvals = kb.list_task_approvals(conn, task_id)
+        approvals = approvals_db.list_task_approvals(conn, task_id)
         aggregate = approvals_db.apply_task_approval_aggregate_transition_in_txn(conn, task_id, approvals=approvals)
 
         task = kb.get_task(conn, task_id)
-        running_after = kb.get_task_approval(conn, running.id)
-        terminal_after = kb.get_task_approval(conn, terminal.id)
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        terminal_after = approvals_db.get_task_approval(conn, terminal.id)
         run_row = conn.execute(
             "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
             (claimed.current_run_id,),
@@ -1279,23 +1279,23 @@ def test_block_like_todo_transition_reclaims_running_approval_and_resets_other_d
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval blocked-like reset", assignee="worker")
-        running = kb.create_task_approval(
+        running = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
             approver_profile="reviewer",
             status="requested",
         )
-        decided = kb.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
+        decided = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, running.id)
+        claimed = approvals_db.claim_task_approval(conn, running.id)
         assert claimed is not None and claimed.current_run_id is not None
-        assert kb.set_task_approval_worker_pid(conn, running.id, 6789, run_id=claimed.current_run_id)
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 6789, run_id=claimed.current_run_id)
 
         approvals_db.reset_task_approvals_in_txn(conn, task_id)
 
-        running_after = kb.get_task_approval(conn, running.id)
-        decided_after = kb.get_task_approval(conn, decided.id)
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        decided_after = approvals_db.get_task_approval(conn, decided.id)
         run_row = conn.execute(
             "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
             (claimed.current_run_id,),
@@ -1329,7 +1329,7 @@ def test_archive_task_reclaims_running_task_approvals(kanban_home, monkeypatch):
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="archive approvals", assignee="worker")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -1337,14 +1337,14 @@ def test_archive_task_reclaims_running_task_approvals(kanban_home, monkeypatch):
             status="requested",
         )
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, approval.id)
+        claimed = approvals_db.claim_task_approval(conn, approval.id)
         assert claimed is not None and claimed.current_run_id is not None
-        assert kb.set_task_approval_worker_pid(conn, approval.id, 2468, run_id=claimed.current_run_id)
+        assert approvals_db.set_task_approval_worker_pid(conn, approval.id, 2468, run_id=claimed.current_run_id)
 
         assert kb.archive_task(conn, task_id) is True
 
         task = kb.get_task(conn, task_id)
-        approval_after = kb.get_task_approval(conn, approval.id)
+        approval_after = approvals_db.get_task_approval(conn, approval.id)
         run_row = conn.execute(
             "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
             (claimed.current_run_id,),
@@ -1375,24 +1375,24 @@ def test_archive_task_reclaims_running_approval_and_preserves_other_decision(kan
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="archive decision preservation", assignee="worker")
-        running = kb.create_task_approval(
+        running = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
             approver_profile="reviewer",
             status="requested",
         )
-        decided = kb.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
+        decided = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, running.id)
+        claimed = approvals_db.claim_task_approval(conn, running.id)
         assert claimed is not None and claimed.current_run_id is not None
-        assert kb.set_task_approval_worker_pid(conn, running.id, 8642, run_id=claimed.current_run_id)
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 8642, run_id=claimed.current_run_id)
 
         assert kb.archive_task(conn, task_id) is True
 
         task = kb.get_task(conn, task_id)
-        running_after = kb.get_task_approval(conn, running.id)
-        decided_after = kb.get_task_approval(conn, decided.id)
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        decided_after = approvals_db.get_task_approval(conn, decided.id)
         run_row = conn.execute(
             "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
             (claimed.current_run_id,),
@@ -1424,7 +1424,7 @@ def test_delete_task_reclaims_running_task_approvals_before_deleting(kanban_home
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="delete approvals", assignee="worker")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -1432,9 +1432,9 @@ def test_delete_task_reclaims_running_task_approvals_before_deleting(kanban_home
             status="requested",
         )
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, approval.id)
+        claimed = approvals_db.claim_task_approval(conn, approval.id)
         assert claimed is not None and claimed.current_run_id is not None
-        assert kb.set_task_approval_worker_pid(conn, approval.id, 1357, run_id=claimed.current_run_id)
+        assert approvals_db.set_task_approval_worker_pid(conn, approval.id, 1357, run_id=claimed.current_run_id)
 
         assert kb.delete_task(conn, task_id) is True
         assert kb.get_task(conn, task_id) is None
@@ -1859,7 +1859,7 @@ def test_respawn_guard_approval_handoff_not_counted_as_recent_success(kanban_hom
         t = kb.create_task(conn, title="needs-approval", assignee="alice")
         claim = kb.claim_task(conn, t)
         assert claim is not None
-        kb.create_task_approval(conn, task_id=t, approver_type="human")
+        approvals_db.create_task_approval(conn, task_id=t, approver_type="human")
         assert kb.complete_task(conn, t, result="done") is True
 
         latest = conn.execute(
@@ -3515,7 +3515,7 @@ def test_dispatch_review_spawns_when_ready_empty(
 def test_dispatch_approval_dry_run_reports_runnable_rows(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="needs approval", assignee="worker")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -3524,7 +3524,7 @@ def test_dispatch_approval_dry_run_reports_runnable_rows(kanban_home):
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         res = kb.dispatch_once(conn, dry_run=True, max_approval_spawn=2)
-        refreshed = kb.get_task_approval(conn, approval.id)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
 
     assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
     assert refreshed is not None
@@ -3544,7 +3544,7 @@ def test_dispatch_approval_uses_separate_concurrency_cap(kanban_home):
         kb.claim_task(conn, busy_task)
 
         task_id = kb.create_task(conn, title="needs approval", assignee="worker")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -3559,7 +3559,7 @@ def test_dispatch_approval_uses_separate_concurrency_cap(kanban_home):
             approval_spawn_fn=fake_approval_spawn,
         )
 
-        refreshed = kb.get_task_approval(conn, approval.id)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
         assert refreshed is not None
         run_row = conn.execute(
             "SELECT worker_pid FROM task_approval_runs WHERE id = ?",
@@ -3581,7 +3581,7 @@ def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="needs approval", assignee="worker")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -3591,7 +3591,7 @@ def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
 
         kb.dispatch_once(conn, approval_spawn_fn=boom, max_approval_spawn=1)
 
-        refreshed = kb.get_task_approval(conn, approval.id)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
         run_row = conn.execute(
             "SELECT status, outcome, error FROM task_approval_runs WHERE approval_id = ? ORDER BY id DESC LIMIT 1",
             (approval.id,),
@@ -3620,7 +3620,7 @@ def test_detect_crashed_approval_workers_clean_exit_without_tool_call_is_protoco
 ):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="needs approval", assignee="worker")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -3628,7 +3628,7 @@ def test_detect_crashed_approval_workers_clean_exit_without_tool_call_is_protoco
         )
         host = kb._claimer_id().split(':', 1)[0]
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
+        claimed = approvals_db.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
         assert claimed is not None
         run_id = claimed.current_run_id
         assert run_id is not None
@@ -3646,7 +3646,7 @@ def test_detect_crashed_approval_workers_clean_exit_without_tool_call_is_protoco
 
         failed = kb.detect_crashed_approval_workers(conn)
 
-        refreshed = kb.get_task_approval(conn, approval.id)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
         task = kb.get_task(conn, task_id)
         comments = kb.list_comments(conn, task_id)
         run_row = conn.execute(
@@ -3672,7 +3672,7 @@ def test_detect_crashed_approval_workers_clean_exit_without_tool_call_is_protoco
 def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monkeypatch):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="needs approval", assignee="worker")
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=task_id,
             approver_type="agent",
@@ -3680,7 +3680,7 @@ def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monke
         )
         host = kb._claimer_id().split(':', 1)[0]
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
-        claimed = kb.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
+        claimed = approvals_db.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
         assert claimed is not None
         run_id = claimed.current_run_id
         assert run_id is not None
@@ -3696,7 +3696,7 @@ def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monke
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         reclaimed = kb.release_stale_approval_claims(conn)
 
-        refreshed = kb.get_task_approval(conn, approval.id)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
         run_row = conn.execute(
             "SELECT status, outcome, error FROM task_approval_runs WHERE id = ?",
             (run_id,),

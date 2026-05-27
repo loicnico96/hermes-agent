@@ -11,6 +11,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_approvals_db as approvals_db
 from hermes_cli import config as config_mod
 
 
@@ -146,14 +147,14 @@ def test_run_slash_show_surfaces_approval_runs(kanban_home):
     assert m is not None
     tid = m.group(1)
     with kb.connect() as conn:
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=tid,
             approver_type="agent",
             approver_profile="coder",
             approver_skill="hermes-agent",
         )
-        kb.create_task_approval_run(
+        approvals_db.create_task_approval_run(
             conn,
             approval_id=approval.id,
             profile="coder",
@@ -307,6 +308,7 @@ def test_run_slash_session_filter(kanban_home):
     """`hermes kanban list --session <id>` filters by the originating
     chat session id stamped on tasks created from inside an ACP loop."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         kb.create_task(
             conn, title="from sess-1 a", assignee="alice", session_id="sess-1"
@@ -332,6 +334,7 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         kb.create_task(
             conn, title="acp task", assignee="alice", session_id="acp-x"
@@ -436,6 +439,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import time
     import secrets
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_approvals_db as approvals_db
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)
@@ -474,6 +478,7 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     import time
     import secrets
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_approvals_db as approvals_db
 
     out1 = kc.run_slash("create 'switch model' --assignee orig")
     m = re.search(r"(t_[a-f0-9]+)", out1)

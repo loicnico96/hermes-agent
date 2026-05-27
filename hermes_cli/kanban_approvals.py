@@ -110,12 +110,13 @@ def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, An
 
 
 def _cmd_approval_request(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_approvals_db as approvals_db
     approver_type = "human" if getattr(args, "human", False) else "agent"
     if approver_type == "human" and getattr(args, "skill", None):
         raise ValueError("--skill is only valid with --agent")
 
     with kb.connect() as conn:
-        approval = kb.create_task_approval(
+        approval = approvals_db.create_task_approval(
             conn,
             task_id=args.task_id,
             approver_type=approver_type,
@@ -134,12 +135,13 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_list(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         task_id = getattr(args, "task", None)
         if task_id is not None and kb.get_task(conn, task_id) is None:
             print(f"no such task: {task_id}", file=sys.stderr)
             return 1
-        approvals = kb.list_approvals(
+        approvals = approvals_db.list_approvals(
             conn,
             task_id=task_id,
             status=getattr(args, "status", None),
@@ -161,8 +163,9 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_remove(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
-        approval = kb.remove_task_approval(conn, args.approval_id)
+        approval = approvals_db.remove_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
 
     if getattr(args, "json", False):
@@ -176,15 +179,16 @@ def _cmd_approval_remove(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
+    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
-        aggregate_status = kb.record_manual_task_approval_decision(
+        aggregate_status = approvals_db.record_manual_task_approval_decision(
             conn,
             approval_id=args.approval_id,
             status=status,
             comment=getattr(args, "comment", None),
             comment_author=_profile_author(),
         )
-        approval = kb.get_task_approval(conn, args.approval_id)
+        approval = approvals_db.get_task_approval(conn, args.approval_id)
         assert approval is not None
         payload = _approval_mutation_payload(conn, approval)
         payload["aggregate_status"] = aggregate_status
@@ -201,8 +205,9 @@ def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
 
 
 def _cmd_approval_reset(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
-        approval = kb.reset_task_approval(conn, args.approval_id)
+        approval = approvals_db.reset_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
 
     if getattr(args, "json", False):
@@ -216,8 +221,9 @@ def _cmd_approval_reset(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_reclaim(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
-        approval = kb.reclaim_task_approval(conn, args.approval_id)
+        approval = approvals_db.reclaim_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
 
     if getattr(args, "json", False):
@@ -258,6 +264,7 @@ def dispatch_approval_command(args: argparse.Namespace) -> int:
 
 
 def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
+    from hermes_cli import kanban_approvals_db as approvals_db
     p_approval = subparsers.add_parser(
         "approval",
         help="Manage task approval rows",
@@ -277,14 +284,14 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
     p_approval_list.add_argument(
         "--status",
         default=None,
-        choices=sorted(kb.VALID_APPROVAL_STATUSES),
+        choices=sorted(approvals_db.VALID_APPROVAL_STATUSES),
         help="Restrict to one approval status",
     )
     p_approval_list.add_argument(
         "--type",
         dest="approver_type",
         default=None,
-        choices=sorted(kb.VALID_APPROVAL_TYPES),
+        choices=sorted(approvals_db.VALID_APPROVAL_TYPES),
         help="Restrict to human or agent approvals",
     )
     p_approval_list.add_argument("--json", action="store_true")

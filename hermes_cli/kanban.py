@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_approvals as approvals_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_approvals_db as approvals_db
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name, get_profile_dir, seed_profile_skills
 
@@ -1453,6 +1454,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    from hermes_cli import kanban_approvals_db as approvals_db
+
     with kb.connect() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -1462,8 +1465,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
-        approvals = kb.list_task_approvals(conn, args.task_id)
-        approval_runs = kb.list_task_approval_runs(conn, args.task_id)
+        approvals = approvals_db.list_task_approvals(conn, args.task_id)
+        approval_runs = approvals_db.list_task_approval_runs(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via ``task_runs.summary`` (kanban-worker skill);
         # ``tasks.result`` is left NULL unless the caller explicitly passed
