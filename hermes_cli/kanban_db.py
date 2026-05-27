@@ -90,48 +90,36 @@ from typing import Any, Iterable, Optional, Sequence
 
 from toolsets import get_toolset_names
 
-from hermes_cli.kanban_approvals_db import (
-    Approval,
-    ApprovalRun,
-    DECISION_APPROVAL_STATUSES,
-    TERMINAL_APPROVAL_STATUSES,
-    VALID_APPROVAL_RUN_STATUSES,
-    VALID_APPROVAL_STATUSES,
-    VALID_APPROVAL_TYPES,
-    _TASK_APPROVAL_RESET_SET_SQL,
-    _apply_task_approval_aggregate_transition,
-    _approval_exists,
-    _compute_task_approval_aggregate_status,
-    _finalize_task_approval_result_if_owned,
-    _finalize_task_approval_row_if_owned,
-    _normalize_approval_profile,
-    _reclaim_running_task_approvals,
-    _reset_task_approval_row,
-    _reset_task_approvals,
-    _validate_approval_decision_status,
-    _validate_approval_identity,
-    _validate_approval_run_status,
-    _validate_approval_status,
-    _validate_task_comment_reference,
-    _validate_terminal_approval_status,
-    claim_task_approval,
-    create_task_approval,
-    create_task_approval_run,
-    get_task_approval,
-    heartbeat_task_approval,
-    list_approvals,
-    list_approval_runs,
-    list_runnable_task_approvals,
-    list_task_approval_runs,
-    list_task_approvals,
-    record_manual_task_approval_decision,
-    record_task_approval_decision,
-    record_task_approval_failure,
-    reclaim_task_approval,
-    remove_task_approval,
-    reset_task_approval,
-    set_task_approval_worker_pid,
-)
+import hermes_cli.kanban_approvals_db as approvals_db
+
+Approval = approvals_db.Approval
+ApprovalRun = approvals_db.ApprovalRun
+VALID_APPROVAL_STATUSES = approvals_db.VALID_APPROVAL_STATUSES
+VALID_APPROVAL_TYPES = approvals_db.VALID_APPROVAL_TYPES
+claim_task_approval = approvals_db.claim_task_approval
+create_task_approval = approvals_db.create_task_approval
+create_task_approval_run = approvals_db.create_task_approval_run
+get_task_approval = approvals_db.get_task_approval
+heartbeat_task_approval = approvals_db.heartbeat_task_approval
+list_approvals = approvals_db.list_approvals
+list_approval_runs = approvals_db.list_approval_runs
+list_runnable_task_approvals = approvals_db.list_runnable_task_approvals
+list_task_approval_runs = approvals_db.list_task_approval_runs
+list_task_approvals = approvals_db.list_task_approvals
+record_manual_task_approval_decision = approvals_db.record_manual_task_approval_decision
+record_task_approval_decision = approvals_db.record_task_approval_decision
+record_task_approval_failure = approvals_db.record_task_approval_failure
+reclaim_task_approval = approvals_db.reclaim_task_approval
+remove_task_approval = approvals_db.remove_task_approval
+reset_task_approval = approvals_db.reset_task_approval
+set_task_approval_worker_pid = approvals_db.set_task_approval_worker_pid
+compute_task_approval_aggregate_status = approvals_db.compute_task_approval_aggregate_status
+apply_task_approval_aggregate_transition_in_txn = approvals_db.apply_task_approval_aggregate_transition_in_txn
+finalize_task_approval_result_if_owned_in_txn = approvals_db.finalize_task_approval_result_if_owned_in_txn
+finalize_task_approval_row_if_owned_in_txn = approvals_db.finalize_task_approval_row_if_owned_in_txn
+reclaim_running_task_approvals_in_txn = approvals_db.reclaim_running_task_approvals_in_txn
+reset_task_approval_row_in_txn = approvals_db.reset_task_approval_row_in_txn
+reset_task_approvals_in_txn = approvals_db.reset_task_approvals_in_txn
 
 _log = logging.getLogger(__name__)
 
@@ -3735,7 +3723,7 @@ def complete_task(
         # Successful worker completion owns the fresh-result reset boundary.
         # If approvals are attached, the new task result must enter a fresh
         # approval cycle instead of reusing stale approval state.
-        next_status = "approval" if list_task_approvals(conn, task_id) else "done"
+        next_status = "approval" if approvals_db.list_task_approvals(conn, task_id) else "done"
 
         if expected_run_id is None:
             cur = conn.execute(
@@ -3771,7 +3759,7 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         if next_status == "approval":
-            _reset_task_approvals(conn, task_id)
+            approvals_db.reset_task_approvals_in_txn(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -4658,7 +4646,7 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
-        _reclaim_running_task_approvals(conn, task_id)
+        approvals_db.reclaim_running_task_approvals_in_txn(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -4730,7 +4718,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         deleted = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if deleted.rowcount != 1:
             return False
-        _reclaim_running_task_approvals(conn, task_id)
+        approvals_db.reclaim_running_task_approvals_in_txn(conn, task_id)
         _delete_task_owned_rows(conn, task_id)
     recompute_ready(conn)
     return True
@@ -6126,7 +6114,7 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
 
 def has_spawnable_approvals(conn: sqlite3.Connection) -> bool:
     """Return True iff at least one runnable agent approval is spawnable."""
-    rows = list_runnable_task_approvals(conn, limit=50)
+    rows = approvals_db.list_runnable_task_approvals(conn, limit=50)
     return any(bool(row.approver_profile) for row in rows)
 
 
@@ -6537,7 +6525,7 @@ def dispatch_once(
         )
 
     approval_spawned = 0
-    approval_rows = list_runnable_task_approvals(conn)
+    approval_rows = approvals_db.list_runnable_task_approvals(conn)
     for approval in approval_rows:
         if (
             max_approval_spawn is not None
@@ -6549,7 +6537,7 @@ def dispatch_once(
                 (approval.id, approval.approver_profile or "", approval.task_id)
             )
             continue
-        claimed_approval = claim_task_approval(
+        claimed_approval = approvals_db.claim_task_approval(
             conn,
             approval.id,
             ttl_seconds=ttl_seconds,
@@ -6595,7 +6583,7 @@ def dispatch_once(
                     raise RuntimeError(
                         f"approval {claimed_approval.id} missing current_run_id after claim"
                     )
-                set_task_approval_worker_pid(
+                approvals_db.set_task_approval_worker_pid(
                     conn,
                     claimed_approval.id,
                     int(pid),
@@ -7071,10 +7059,10 @@ def _record_approval_runtime_failure(
     outcome: str,
 ) -> None:
     """Mark an in-flight approval attempt failed through shared DB helpers."""
-    approval = get_task_approval(conn, approval_id)
+    approval = approvals_db.get_task_approval(conn, approval_id)
     if approval is None or approval.current_run_id is None:
         return
-    record_task_approval_failure(
+    approvals_db.record_task_approval_failure(
         conn,
         approval_id=approval_id,
         expected_run_id=int(approval.current_run_id),
@@ -7122,7 +7110,7 @@ def detect_crashed_approval_workers(
         run_id = int(row["current_run_id"])
         kind, code = _classify_worker_exit(pid)
         if kind == "clean_exit":
-            record_task_approval_failure(
+            approvals_db.record_task_approval_failure(
                 conn,
                 approval_id=approval_id,
                 expected_run_id=run_id,
@@ -7141,7 +7129,7 @@ def detect_crashed_approval_workers(
             error_text = f"pid {pid} killed by signal {code}"
         else:
             error_text = f"pid {pid} not alive"
-        record_task_approval_failure(
+        approvals_db.record_task_approval_failure(
             conn,
             approval_id=approval_id,
             expected_run_id=run_id,
@@ -7199,7 +7187,7 @@ def release_stale_approval_claims(
             continue
 
         _terminate_reclaimed_worker(pid, row["claim_lock"], signal_fn=signal_fn)
-        result = record_task_approval_failure(
+        result = approvals_db.record_task_approval_failure(
             conn,
             approval_id=int(row["id"]),
             expected_run_id=int(row["current_run_id"]),
@@ -7251,7 +7239,7 @@ def enforce_approval_max_runtime(
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
                 pass
-        result = record_task_approval_failure(
+        result = approvals_db.record_task_approval_failure(
             conn,
             approval_id=int(row["id"]),
             expected_run_id=int(row["current_run_id"]),
@@ -7338,6 +7326,7 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
+    max_approval_spawn: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
@@ -7375,6 +7364,7 @@ def run_daemon(
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
+                    max_approval_spawn=max_approval_spawn,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

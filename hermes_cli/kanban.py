@@ -630,7 +630,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
-                        help="Cap number of spawns this pass")
+                        help="Cap number of task-worker spawns this pass")
+    p_disp.add_argument("--max-approvals", type=int, default=None,
+                        help="Cap number of approval-worker spawns this pass (defaults to config)")
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -645,7 +647,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_daemon.add_argument("--interval", type=float, default=60.0,
                           help="Seconds between dispatch ticks (default: 60)")
     p_daemon.add_argument("--max", type=int, default=None,
-                          help="Cap number of spawns per tick")
+                          help="Cap number of task-worker spawns per tick")
+    p_daemon.add_argument("--max-approvals", type=int, default=None,
+                          help="Cap number of approval-worker spawns per tick (defaults to config)")
     p_daemon.add_argument("--failure-limit", type=int,
                           default=kb.DEFAULT_SPAWN_FAILURE_LIMIT)
     p_daemon.add_argument("--pidfile", default=None,
@@ -2155,7 +2159,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
-        raw_max_approval_spawn = _kanban_cfg.get("max_approval_spawn", 2)
+        raw_max_approval_spawn = (
+            args.max_approvals
+            if getattr(args, "max_approvals", None) is not None
+            else _kanban_cfg.get("max_approval_spawn", 2)
+        )
         try:
             max_approval_spawn = int(raw_max_approval_spawn)
         except (TypeError, ValueError):
@@ -2373,10 +2381,26 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         except Exception:
             return False
 
+    from hermes_cli.config import load_config
+
+    kanban_cfg = (load_config().get("kanban") or {})
+    raw_max_approval_spawn = (
+        args.max_approvals
+        if getattr(args, "max_approvals", None) is not None
+        else kanban_cfg.get("max_approval_spawn", 2)
+    )
+    try:
+        max_approval_spawn = int(raw_max_approval_spawn)
+    except (TypeError, ValueError):
+        max_approval_spawn = 2
+    if max_approval_spawn < 1:
+        max_approval_spawn = 2
+
     try:
         kb.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
+            max_approval_spawn=max_approval_spawn,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
         )

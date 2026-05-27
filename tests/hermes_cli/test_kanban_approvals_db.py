@@ -1484,7 +1484,7 @@ def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home,
                 (other_comment_id, 2, "keep me", 6_100, other.id),
             )
 
-            reset_count = kb._reset_task_approvals(conn, task_id)
+            reset_count = kb.reset_task_approvals_in_txn(conn, task_id)
 
         reset = kb.get_task_approval(conn, approval.id)
         untouched = kb.get_task_approval(conn, other.id)
@@ -1554,7 +1554,7 @@ def test_compute_task_approval_aggregate_status(kanban_home, statuses, expected_
                     )
                 )
 
-    assert kb._compute_task_approval_aggregate_status(approvals) == expected_status
+    assert kb.compute_task_approval_aggregate_status(approvals) == expected_status
 
 
 def test_apply_task_approval_aggregate_transition_marks_approval_task_done_when_all_gates_are_satisfied(
@@ -1591,7 +1591,7 @@ def test_apply_task_approval_aggregate_transition_marks_approval_task_done_when_
         )
 
         with kb.write_txn(conn):
-            aggregate_status = kb._apply_task_approval_aggregate_transition(
+            aggregate_status = kb.apply_task_approval_aggregate_transition_in_txn(
                 conn,
                 task_id,
                 approvals=[agent, human],
@@ -1633,7 +1633,7 @@ def test_apply_task_approval_aggregate_transition_marks_approval_task_done_when_
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         with kb.write_txn(conn):
-            aggregate_status = kb._apply_task_approval_aggregate_transition(
+            aggregate_status = kb.apply_task_approval_aggregate_transition_in_txn(
                 conn,
                 task_id,
                 approvals=[],
@@ -1880,7 +1880,7 @@ def test_finalize_task_approval_row_if_owned_applies_terminal_status(kanban_home
                 ("lease-1", 123, 456, 789, run.id, 2, "old failure", approval.id),
             )
 
-            finalized = kb._finalize_task_approval_row_if_owned(
+            finalized = kb.finalize_task_approval_row_if_owned_in_txn(
                 conn,
                 approval_id=approval.id,
                 expected_run_id=run.id,
@@ -1933,7 +1933,7 @@ def test_finalize_task_approval_row_if_owned_discards_non_running_rows(kanban_ho
                 ("lease-1", run.id, 6_000, approval.id),
             )
 
-            finalized = kb._finalize_task_approval_row_if_owned(
+            finalized = kb.finalize_task_approval_row_if_owned_in_txn(
                 conn,
                 approval_id=approval.id,
                 expected_run_id=run.id,
@@ -1980,7 +1980,7 @@ def test_finalize_task_approval_row_if_owned_discards_run_ownership_mismatches(k
                 ("lease-1", run.id, 6_500, approval.id),
             )
 
-            finalized = kb._finalize_task_approval_row_if_owned(
+            finalized = kb.finalize_task_approval_row_if_owned_in_txn(
                 conn,
                 approval_id=approval.id,
                 expected_run_id=stale_run.id,
