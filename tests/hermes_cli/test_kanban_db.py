@@ -903,7 +903,7 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
 )
 def test_compute_task_approval_aggregate_status_human_precedence(approval_specs, expected):
     approvals = [
-        kb.Approval(
+        approvals_db.Approval(
             id=index + 1,
             task_id="t_approval_order",
             approver_type=spec["type"],

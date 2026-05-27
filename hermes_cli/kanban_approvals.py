@@ -8,10 +8,11 @@ import os
 import sys
 from typing import Any
 
+from hermes_cli import kanban_approvals_db as approvals_db
 from hermes_cli import kanban_db as kb
 
 
-def approval_run_to_dict(run: kb.ApprovalRun) -> dict[str, Any]:
+def approval_run_to_dict(run: approvals_db.ApprovalRun) -> dict[str, Any]:
     return {
         "id": run.id,
         "approval_id": run.approval_id,
@@ -42,7 +43,7 @@ def _profile_author() -> str:
         return "user"
 
 
-def approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
+def approval_to_dict(approval: approvals_db.Approval) -> dict[str, Any]:
     return {
         "id": approval.id,
         "task_id": approval.task_id,
@@ -63,7 +64,7 @@ def approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
     }
 
 
-def _format_approval_target(approval: kb.Approval) -> str:
+def _format_approval_target(approval: approvals_db.Approval) -> str:
     if approval.approver_type == "human":
         return "human"
 
@@ -73,7 +74,7 @@ def _format_approval_target(approval: kb.Approval) -> str:
     return target
 
 
-def _format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> str:
+def _format_approval_line(approval: approvals_db.Approval, *, include_task_id: bool) -> str:
     bits = [f"#{approval.id}", f"{approval.status:10s}", _format_approval_target(approval)]
     if include_task_id:
         bits.append(f"task={approval.task_id}")
@@ -82,11 +83,11 @@ def _format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> st
     return "  " + "  ".join(bits)
 
 
-def format_approval_line(approval: kb.Approval, *, include_task_id: bool) -> str:
+def format_approval_line(approval: approvals_db.Approval, *, include_task_id: bool) -> str:
     return _format_approval_line(approval, include_task_id=include_task_id)
 
 
-def format_approval_run_line(run: kb.ApprovalRun) -> str:
+def format_approval_run_line(run: approvals_db.ApprovalRun) -> str:
     elapsed = (max(0, run.ended_at - run.started_at) if run.ended_at is not None else None)
     elapsed_text = f"{elapsed}s" if elapsed is not None else "active"
     outcome = run.outcome or run.status or "active"
@@ -100,7 +101,7 @@ def format_approval_run_line(run: kb.ApprovalRun) -> str:
     return "  " + "  ".join(bits)
 
 
-def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, Any]:
+def _approval_mutation_payload(conn: Any, approval: approvals_db.Approval) -> dict[str, Any]:
     task = kb.get_task(conn, approval.task_id)
     assert task is not None
     return {
@@ -110,7 +111,6 @@ def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, An
 
 
 def _cmd_approval_request(args: argparse.Namespace) -> int:
-    from hermes_cli import kanban_approvals_db as approvals_db
     approver_type = "human" if getattr(args, "human", False) else "agent"
     if approver_type == "human" and getattr(args, "skill", None):
         raise ValueError("--skill is only valid with --agent")
@@ -135,7 +135,6 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_list(args: argparse.Namespace) -> int:
-    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         task_id = getattr(args, "task", None)
         if task_id is not None and kb.get_task(conn, task_id) is None:
@@ -163,7 +162,6 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_remove(args: argparse.Namespace) -> int:
-    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         approval = approvals_db.remove_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
@@ -179,7 +177,6 @@ def _cmd_approval_remove(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
-    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         aggregate_status = approvals_db.record_manual_task_approval_decision(
             conn,
@@ -205,7 +202,6 @@ def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
 
 
 def _cmd_approval_reset(args: argparse.Namespace) -> int:
-    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         approval = approvals_db.reset_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
@@ -221,7 +217,6 @@ def _cmd_approval_reset(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_reclaim(args: argparse.Namespace) -> int:
-    from hermes_cli import kanban_approvals_db as approvals_db
     with kb.connect() as conn:
         approval = approvals_db.reclaim_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
@@ -264,7 +259,6 @@ def dispatch_approval_command(args: argparse.Namespace) -> int:
 
 
 def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
-    from hermes_cli import kanban_approvals_db as approvals_db
     p_approval = subparsers.add_parser(
         "approval",
         help="Manage task approval rows",
