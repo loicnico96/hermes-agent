@@ -5466,7 +5466,7 @@ class GatewayRunner:
                             )
                             if requested_human:
                                 msg = (
-                                    f"⏸ {tag}Kanban {task_id} awaiting human approval "
+                                    f"🛑 {tag}Kanban {task_id} awaiting human approval "
                                     f"— {title}"
                                 )
                             else:
@@ -5485,7 +5485,7 @@ class GatewayRunner:
                                 suffix = f"; task moved to {next_status}"
                             if decision == "approved":
                                 msg = (
-                                    f"✅ {approver_tag}Kanban {task_id} approved — "
+                                    f"☑️ {approver_tag}Kanban {task_id} approved — "
                                     f"{title}{suffix}"
                                 )
                             elif decision == "rejected":
@@ -5495,7 +5495,7 @@ class GatewayRunner:
                                 )
                             elif decision == "escalated":
                                 msg = (
-                                    f"⏸ {approver_tag}Kanban {task_id} requested human approval — "
+                                    f"🛑 {approver_tag}Kanban {task_id} requested human approval — "
                                     f"{title}{suffix}"
                                 )
                             else:
