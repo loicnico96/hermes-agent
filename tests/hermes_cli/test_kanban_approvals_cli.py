@@ -65,7 +65,7 @@ def test_cli_approval_remove_and_reset(kanban_home):
     survivor = json.loads(run_slash(f"approval request {task_id} --human --json"))
 
     with kb.connect() as conn:
-        removed_run = approvals_db.create_task_approval_run(conn, approval_id=removed["id"], status="running")
+        removed_run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=removed["id"], status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
@@ -134,7 +134,7 @@ def test_cli_approval_reclaim(kanban_home):
     approval = json.loads(run_slash(f"approval request {task_id} --agent reviewer --json"))
 
     with kb.connect() as conn:
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval["id"], status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval["id"], status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """

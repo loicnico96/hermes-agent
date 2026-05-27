@@ -158,7 +158,7 @@ def test_run_slash_show_surfaces_approval_runs(kanban_home):
             approver_profile="coder",
             approver_skill="hermes-agent",
         )
-        approvals_db.create_task_approval_run(
+        approvals_db._create_task_approval_run_for_tests(
             conn,
             approval_id=approval.id,
             profile="coder",

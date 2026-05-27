@@ -1128,7 +1128,7 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
             **approval_kwargs,
         )
         run = (
-            approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+            approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
             if approver_type == "agent"
             else None
         )
