@@ -1,6 +1,6 @@
 # Kanban Task Approvals — Master Spec
 
-Status: Draft (phased rollout; Phase 2 kernel semantics and Phase 3 CLI/manual workflows landed, Phase 4 autonomous approval runtime landed on the branch/PR lane, and Phase 5 semantic/runtime cleanup is specified in `05-approval-event-and-worker-surface-hardening.md`)
+Status: Draft (phased rollout; Phase 2 kernel semantics and Phase 3 CLI/manual workflows landed, Phase 4 autonomous approval runtime landed on the branch/PR lane, Phase 5 semantic/runtime cleanup is specified in `05-approval-event-and-worker-surface-hardening.md`, and Phase 6 dispatcher budgeting/approval-pass refactoring is specified in `06-dispatch-budget-and-approval-pass-refactor.md`)
 Owner: Hermes Kanban
 Scope: Kanban DB, dispatcher/runtime, worker prompt contract, and CLI surface. Dashboard UI is out of scope.
 
