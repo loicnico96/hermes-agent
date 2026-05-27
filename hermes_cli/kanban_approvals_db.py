@@ -245,6 +245,7 @@ def _emit_approval_decided(
     decision: str,
     comment_id: Optional[int] = None,
     approval_run_id: Optional[int] = None,
+    next_status: Optional[str] = None,
 ) -> None:
     payload = _approval_identity_payload(approval)
     payload["decision"] = decision
@@ -252,6 +253,8 @@ def _emit_approval_decided(
         payload["comment_id"] = int(comment_id)
     if approval_run_id is not None:
         payload["approval_run_id"] = int(approval_run_id)
+    if next_status != "approval":
+        payload["next_status"] = next_status
     kb._append_event(conn, approval.task_id, "approval_decided", payload)
 
 
@@ -761,6 +764,14 @@ def record_manual_task_approval_decision(
         )
         assert cur.rowcount == 1
 
+        approvals = list_task_approvals(conn, approval.task_id)
+        aggregate_status = apply_task_approval_aggregate_transition_in_txn(
+            conn,
+            approval.task_id,
+            approvals=approvals,
+            now=effective_now,
+        )
+
         updated_approval = get_task_approval(conn, approval_id)
         assert updated_approval is not None
         _emit_approval_decided(
@@ -768,15 +779,9 @@ def record_manual_task_approval_decision(
             updated_approval,
             decision=normalized_status,
             comment_id=comment_id,
+            next_status=aggregate_status,
         )
-
-        approvals = list_task_approvals(conn, approval.task_id)
-        return apply_task_approval_aggregate_transition_in_txn(
-            conn,
-            approval.task_id,
-            approvals=approvals,
-            now=effective_now,
-        )
+        return aggregate_status
 
 
 def remove_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
@@ -1361,18 +1366,23 @@ def record_task_approval_failure(
                 now=effective_now,
             )
 
-        kb._append_event(
-            conn,
-            approval.task_id,
-            "approval_failed",
+        updated_approval = get_task_approval(conn, approval_id)
+        assert updated_approval is not None
+        payload = _approval_identity_payload(updated_approval)
+        payload.update(
             {
-                "approval_id": int(approval_id),
                 "outcome": normalized_outcome,
                 "error": normalized_error,
                 "failures": failures,
                 "status": next_status,
                 "failure_limit": APPROVAL_FAILURE_LIMIT,
-            },
+            }
+        )
+        kb._append_event(
+            conn,
+            approval.task_id,
+            "approval_failed",
+            payload,
             run_id=int(expected_run_id),
         )
         return next_status
@@ -1429,6 +1439,7 @@ def record_task_approval_decision(
             decision=normalized_status,
             comment_id=comment_id,
             approval_run_id=expected_run_id,
+            next_status=aggregate_status,
         )
 
         run_cur = conn.execute(

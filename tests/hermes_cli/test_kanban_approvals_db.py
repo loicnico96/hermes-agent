@@ -458,6 +458,7 @@ def test_record_task_approval_decision_emits_approval_run_in_payload_but_not_tas
         "approver_profile": "reviewer",
         "decision": "approved",
         "approval_run_id": run.id,
+        "next_status": "done",
     }
 
 
