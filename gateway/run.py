@@ -5058,7 +5058,8 @@ class GatewayRunner:
                             if next_status is not None:
                                 suffix = f"; task moved to {next_status}"
                             if decision == "approved":
-                                approved_icon = "✅" if next_status == "done" else "☑️"
+                                approver_type = str(payload.get("approver_type") or "").lower()
+                                approved_icon = "✅" if approver_type == "human" else "☑️"
                                 msg = (
                                     f"{approved_icon} {approver_tag}Kanban {task_id} approved — "
                                     f"{title}{suffix}"
