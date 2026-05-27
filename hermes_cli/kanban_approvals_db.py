@@ -771,7 +771,7 @@ def record_manual_task_approval_decision(
         )
 
         approvals = list_task_approvals(conn, approval.task_id)
-        return _apply_task_approval_aggregate_transition(
+        return apply_task_approval_aggregate_transition_in_txn(
             conn,
             approval.task_id,
             approvals=approvals,
@@ -795,7 +795,7 @@ def remove_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval
 
         if task.status == "approval":
             remaining = list_task_approvals(conn, approval.task_id)
-            _apply_task_approval_aggregate_transition(
+            apply_task_approval_aggregate_transition_in_txn(
                 conn,
                 approval.task_id,
                 approvals=remaining,
@@ -821,7 +821,7 @@ def reset_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approval:
         if approval.approver_type == "agent" and approval.status == "running":
             _reclaim_running_approval(conn, approval=approval, now=now)
 
-        cur = _reset_task_approval_row(conn, approval_id=int(approval_id), now=now)
+        cur = reset_task_approval_row_in_txn(conn, approval_id=int(approval_id), now=now)
         assert cur.rowcount == 1
 
         approval = get_task_approval(conn, approval_id)
@@ -847,7 +847,7 @@ def reclaim_task_approval(conn: sqlite3.Connection, approval_id: int) -> Approva
             raise ValueError("reclaim requires a running agent approval")
         _reclaim_running_approval(conn, approval=approval, now=now)
         remaining = list_task_approvals(conn, approval.task_id)
-        _apply_task_approval_aggregate_transition(
+        apply_task_approval_aggregate_transition_in_txn(
             conn,
             approval.task_id,
             approvals=remaining,
@@ -872,7 +872,7 @@ updated_at = ?
 """
 
 
-def _reset_task_approval_row(
+def reset_task_approval_row_in_txn(
     conn: sqlite3.Connection,
     *,
     approval_id: int,
@@ -946,7 +946,7 @@ def _reclaim_running_approval(
     return False
 
 
-def _reclaim_running_task_approvals(
+def reclaim_running_task_approvals_in_txn(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -981,7 +981,7 @@ def _reclaim_running_task_approvals(
     return reclaimed
 
 
-def _reset_task_approvals(
+def reset_task_approvals_in_txn(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -990,7 +990,7 @@ def _reset_task_approvals(
 ) -> int:
     effective_now = int(time.time()) if now is None else int(now)
     approvals_before = list_task_approvals(conn, task_id)
-    _reclaim_running_task_approvals(
+    reclaim_running_task_approvals_in_txn(
         conn,
         task_id,
         now=effective_now,
@@ -1014,7 +1014,7 @@ def _reset_task_approvals(
 
 
 
-def _compute_task_approval_aggregate_status(
+def compute_task_approval_aggregate_status(
     approvals: Sequence[Approval],
 ) -> str:
     humans = [approval for approval in approvals if approval.approver_type == "human"]
@@ -1035,14 +1035,14 @@ def _compute_task_approval_aggregate_status(
     return "done"
 
 
-def _apply_task_approval_aggregate_transition(
+def apply_task_approval_aggregate_transition_in_txn(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     approvals: Sequence[Approval],
     now: Optional[int] = None,
 ) -> str:
-    aggregate_status = _compute_task_approval_aggregate_status(approvals)
+    aggregate_status = compute_task_approval_aggregate_status(approvals)
     effective_now = int(time.time()) if now is None else int(now)
 
     if aggregate_status == "todo":
@@ -1056,7 +1056,7 @@ def _apply_task_approval_aggregate_transition(
             (task_id,),
         )
         if cur.rowcount == 1:
-            _reset_task_approvals(conn, task_id, now=effective_now)
+            reset_task_approvals_in_txn(conn, task_id, now=effective_now)
         return aggregate_status
 
     if aggregate_status == "done":
@@ -1070,7 +1070,7 @@ def _apply_task_approval_aggregate_transition(
             (task_id,),
         )
         if cur.rowcount == 1:
-            _reclaim_running_task_approvals(conn, task_id, now=effective_now)
+            reclaim_running_task_approvals_in_txn(conn, task_id, now=effective_now)
             handoff_event = conn.execute(
                 """
                 SELECT run_id, payload
@@ -1102,7 +1102,7 @@ def _apply_task_approval_aggregate_transition(
     return aggregate_status
 
 
-def _finalize_task_approval_result_if_owned(
+def finalize_task_approval_result_if_owned_in_txn(
     conn: sqlite3.Connection,
     *,
     approval: Approval,
@@ -1114,7 +1114,7 @@ def _finalize_task_approval_result_if_owned(
 ) -> Optional[str]:
     """Finalize an owned approval run and propagate any resulting task transition.
 
-    This wraps `_finalize_task_approval_row_if_owned()` with the higher-level
+    This wraps `finalize_task_approval_row_if_owned_in_txn()` with the higher-level
     consequences: optional escalation to a human approval and recomputing the
     enclosing task's aggregate approval state.
     """
@@ -1123,7 +1123,7 @@ def _finalize_task_approval_result_if_owned(
     if task is None or task.status != "approval":
         return None
 
-    finalized = _finalize_task_approval_row_if_owned(
+    finalized = finalize_task_approval_row_if_owned_in_txn(
         conn,
         approval_id=approval_id,
         expected_run_id=expected_run_id,
@@ -1143,7 +1143,7 @@ def _finalize_task_approval_result_if_owned(
         )
 
     approvals = list_task_approvals(conn, approval.task_id)
-    return _apply_task_approval_aggregate_transition(
+    return apply_task_approval_aggregate_transition_in_txn(
         conn,
         approval.task_id,
         approvals=approvals,
@@ -1151,7 +1151,7 @@ def _finalize_task_approval_result_if_owned(
     )
 
 
-def _finalize_task_approval_row_if_owned(
+def finalize_task_approval_row_if_owned_in_txn(
     conn: sqlite3.Connection,
     *,
     approval_id: int,
@@ -1251,7 +1251,7 @@ def _ensure_requested_human_approval(
         refreshed = get_task_approval(conn, approval.id)
         assert refreshed is not None
         return refreshed
-    cur = _reset_task_approval_row(conn, approval_id=approval.id, now=effective_now)
+    cur = reset_task_approval_row_in_txn(conn, approval_id=approval.id, now=effective_now)
     assert cur.rowcount == 1
     refreshed = get_task_approval(conn, approval.id)
     assert refreshed is not None
@@ -1354,7 +1354,7 @@ def record_task_approval_failure(
         if next_status == "failed":
             _ensure_requested_human_approval(conn, approval.task_id, now=effective_now)
             approvals = list_task_approvals(conn, approval.task_id)
-            _apply_task_approval_aggregate_transition(
+            apply_task_approval_aggregate_transition_in_txn(
                 conn,
                 approval.task_id,
                 approvals=approvals,
@@ -1409,7 +1409,7 @@ def record_task_approval_decision(
         if run_row is None:
             return None
 
-        aggregate_status = _finalize_task_approval_result_if_owned(
+        aggregate_status = finalize_task_approval_result_if_owned_in_txn(
             conn,
             approval=approval,
             approval_id=approval_id,

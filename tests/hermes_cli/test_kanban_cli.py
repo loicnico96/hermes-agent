@@ -11,6 +11,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import config as config_mod
 
 
 @pytest.fixture
@@ -208,6 +209,78 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     kc.run_slash("create 'b' --assignee bob")
     out = kc.run_slash("dispatch --dry-run")
     assert "Spawned:" in out
+
+
+def test_cmd_dispatch_uses_max_approvals_flag_over_config(monkeypatch):
+    calls = {}
+
+    class DummyConn:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approval_spawn': 7}})
+    monkeypatch.setattr(kb, 'connect', lambda: DummyConn())
+
+    class Result:
+        reclaimed = 0
+        crashed = []
+        timed_out = []
+        stale = []
+        auto_blocked = []
+        promoted = 0
+        spawned = []
+        approval_spawned = []
+        skipped_unassigned = []
+        skipped_nonspawnable = []
+
+    def fake_dispatch_once(conn, **kwargs):
+        calls.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(kb, 'dispatch_once', fake_dispatch_once)
+    args = argparse.Namespace(dry_run=True, max=3, max_approvals=5, failure_limit=2, json=True)
+
+    assert kc._cmd_dispatch(args) == 0
+    assert calls['max_spawn'] == 3
+    assert calls['max_approval_spawn'] == 5
+
+
+def test_cmd_dispatch_max_approvals_falls_back_to_config(monkeypatch):
+    calls = {}
+
+    class DummyConn:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approval_spawn': 4}})
+    monkeypatch.setattr(kb, 'connect', lambda: DummyConn())
+
+    class Result:
+        reclaimed = 0
+        crashed = []
+        timed_out = []
+        stale = []
+        auto_blocked = []
+        promoted = 0
+        spawned = []
+        approval_spawned = []
+        skipped_unassigned = []
+        skipped_nonspawnable = []
+
+    def fake_dispatch_once(conn, **kwargs):
+        calls.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(kb, 'dispatch_once', fake_dispatch_once)
+    args = argparse.Namespace(dry_run=True, max=None, max_approvals=None, failure_limit=2, json=True)
+
+    assert kc._cmd_dispatch(args) == 0
+    assert calls['max_spawn'] is None
+    assert calls['max_approval_spawn'] == 4
 
 
 def test_run_slash_context_output_format(kanban_home):

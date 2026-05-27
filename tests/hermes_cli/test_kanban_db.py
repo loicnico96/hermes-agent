@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_approvals_db as approvals_db
 
 
 @pytest.fixture
@@ -414,7 +415,7 @@ def test_non_owner_status_helpers_do_not_prepare_approval_reset(kanban_home, mon
         assert task_id
         calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_reset_task_approvals", fake_hook)
+    monkeypatch.setattr(approvals_db, "reset_task_approvals_in_txn", fake_hook)
 
     with kb.connect() as conn:
         scheduled = kb.create_task(conn, title="scheduled", assignee="ops")
@@ -447,7 +448,7 @@ def test_complete_task_prepares_completion_cycle_only_when_approvals_exist(kanba
         assert task_id
         calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_reset_task_approvals", fake_hook)
+    monkeypatch.setattr(approvals_db, "reset_task_approvals_in_txn", fake_hook)
 
     with kb.connect() as conn:
         no_approval_task = kb.create_task(conn, title="no approval", assignee="ops")
@@ -467,7 +468,7 @@ def test_archive_task_is_not_an_approval_reset_owner(kanban_home, monkeypatch):
         assert task_id
         calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_reset_task_approvals", fake_hook)
+    monkeypatch.setattr(approvals_db, "reset_task_approvals_in_txn", fake_hook)
 
     with kb.connect() as conn:
         archived = kb.create_task(conn, title="archived", assignee="ops")
@@ -923,7 +924,7 @@ def test_compute_task_approval_aggregate_status_human_precedence(approval_specs,
         for index, spec in enumerate(approval_specs)
     ]
 
-    assert kb._compute_task_approval_aggregate_status(approvals) == expected
+    assert approvals_db.compute_task_approval_aggregate_status(approvals) == expected
 
 
 def test_block_then_unblock(kanban_home):
@@ -1179,7 +1180,7 @@ def test_apply_task_approval_aggregate_transition_done_reclaims_running_agents(
         assert kb.set_task_approval_worker_pid(conn, running.id, 4321, run_id=claimed.current_run_id)
 
         approvals = kb.list_task_approvals(conn, task_id)
-        aggregate = kb._apply_task_approval_aggregate_transition(conn, task_id, approvals=approvals)
+        aggregate = approvals_db.apply_task_approval_aggregate_transition_in_txn(conn, task_id, approvals=approvals)
 
         task = kb.get_task(conn, task_id)
         running_after = kb.get_task_approval(conn, running.id)
@@ -1236,7 +1237,7 @@ def test_apply_task_approval_aggregate_transition_todo_resets_all_approvals(
         assert kb.set_task_approval_worker_pid(conn, running.id, 9876, run_id=claimed.current_run_id)
 
         approvals = kb.list_task_approvals(conn, task_id)
-        aggregate = kb._apply_task_approval_aggregate_transition(conn, task_id, approvals=approvals)
+        aggregate = approvals_db.apply_task_approval_aggregate_transition_in_txn(conn, task_id, approvals=approvals)
 
         task = kb.get_task(conn, task_id)
         running_after = kb.get_task_approval(conn, running.id)
@@ -1291,7 +1292,7 @@ def test_block_like_todo_transition_reclaims_running_approval_and_resets_other_d
         assert claimed is not None and claimed.current_run_id is not None
         assert kb.set_task_approval_worker_pid(conn, running.id, 6789, run_id=claimed.current_run_id)
 
-        kb._reset_task_approvals(conn, task_id)
+        approvals_db.reset_task_approvals_in_txn(conn, task_id)
 
         running_after = kb.get_task_approval(conn, running.id)
         decided_after = kb.get_task_approval(conn, decided.id)
