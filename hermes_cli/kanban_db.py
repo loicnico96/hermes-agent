@@ -1215,8 +1215,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_approvals_task_status ON task_approvals(task_id, status);
 CREATE INDEX IF NOT EXISTS idx_approvals_claimable ON task_approvals(status, approver_type, claim_lock);
-CREATE INDEX IF NOT EXISTS idx_approval_runs_approval_started ON task_approval_runs(approval_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_approval_runs_task_started ON task_approval_runs(task_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_approval_runs_approval ON task_approval_runs(approval_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_approval_runs_task ON task_approval_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
@@ -4720,18 +4720,18 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
+    we explicitly delete the task row and its child tables inside one
+    ``write_txn``.
 
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
     with write_txn(conn):
-        _reclaim_running_task_approvals(conn, task_id)
-        _delete_task_owned_rows(conn, task_id)
         deleted = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if deleted.rowcount != 1:
             return False
+        _reclaim_running_task_approvals(conn, task_id)
+        _delete_task_owned_rows(conn, task_id)
     recompute_ready(conn)
     return True
 
