@@ -341,7 +341,7 @@ def test_notifier_formats_approval_decided_with_comment_and_transition(tmp_path,
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"☑️ @coder Kanban {tid} approved — Approval outcome; task moved to done\n"
+        f"✅ @coder Kanban {tid} approved — Approval outcome; task moved to done\n"
         "Looks good from agent review."
     ]
 

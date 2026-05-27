@@ -335,8 +335,9 @@ class GatewayKanbanWatchersMixin:
                             if next_status is not None:
                                 suffix = f"; task moved to {next_status}"
                             if decision == "approved":
+                                approved_icon = "✅" if next_status == "done" else "☑️"
                                 msg = (
-                                    f"☑️ {approver_tag}Kanban {task_id} approved — "
+                                    f"{approved_icon} {approver_tag}Kanban {task_id} approved — "
                                     f"{title}{suffix}"
                                 )
                             elif decision == "rejected":
