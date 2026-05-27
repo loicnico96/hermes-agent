@@ -72,11 +72,22 @@ class GatewayKanbanWatchersMixin:
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_approvals_db as _approvals
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = (
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "awaiting_approval",
+            "approval_decided",
+            "approval_failed",
+            "approval_cancelled",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -188,10 +199,13 @@ class GatewayKanbanWatchersMixin:
                                 )
                                 if not events:
                                     continue
-                                task = _kb.get_task(conn, sub["task_id"])
+                                task_id = sub["task_id"]
+                                task = _kb.get_task(conn, task_id)
+                                approvals = _approvals.list_task_approvals(conn, task_id)
+                                comments = _kb.list_comments(conn, task_id)
                                 logger.debug(
                                     "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                    len(events), sub["task_id"], slug, old_cursor, cursor,
+                                    len(events), task_id, slug, old_cursor, cursor,
                                 )
                                 deliveries.append({
                                     "sub": sub,
@@ -199,6 +213,8 @@ class GatewayKanbanWatchersMixin:
                                     "cursor": cursor,
                                     "events": events,
                                     "task": task,
+                                    "approvals": approvals,
+                                    "comments": comments,
                                     "board": slug,
                                 })
                         finally:
@@ -208,7 +224,11 @@ class GatewayKanbanWatchersMixin:
                 deliveries = await asyncio.to_thread(_collect)
                 for d in deliveries:
                     sub = d["sub"]
+                    task_id = sub["task_id"]
                     task = d["task"]
+                    approvals = d.get("approvals") or []
+                    comments = d.get("comments") or []
+                    comments_by_id = {c.id: c for c in comments}
                     board_slug = d.get("board")
                     platform_str = (sub["platform"] or "").lower()
                     try:
@@ -234,7 +254,7 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
-                    title = (task.title if task else sub["task_id"])[:120]
+                    title = (task.title if task else task_id)[:120]
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -261,25 +281,25 @@ class GatewayKanbanWatchersMixin:
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\n{r}"
                             msg = (
-                                f"✔ {tag}Kanban {sub['task_id']} done"
+                                f"✔ {tag}Kanban {task_id} done"
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"⏸ {tag}Kanban {task_id} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} gave up "
+                                f"✖ {tag}Kanban {task_id} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {tag}Kanban {sub['task_id']} worker crashed "
+                                f"✖ {tag}Kanban {task_id} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -287,9 +307,63 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {tag}Kanban {sub['task_id']} timed out "
+                                f"⏱ {tag}Kanban {task_id} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
+                        elif kind == "awaiting_approval":
+                            requested_human = any(
+                                approval.status == "requested" and approval.approver_type == "human"
+                                for approval in approvals
+                            )
+                            if requested_human:
+                                msg = (
+                                    f"⏸ {tag}Kanban {task_id} awaiting human approval "
+                                    f"— {title}"
+                                )
+                            else:
+                                msg = (
+                                    f"🔎 {tag}Kanban {task_id} awaiting agent approval "
+                                    f"— {title}"
+                                )
+                        elif kind == "approval_decided":
+                            payload = ev.payload or {}
+                            approver = payload.get("approver_profile")
+                            approver_tag = f"@{approver} " if approver else ""
+                            decision = str(payload.get("decision") or "").lower()
+                            suffix = ""
+                            next_status = payload.get("next_status")
+                            if next_status is not None:
+                                suffix = f"; task moved to {next_status}"
+                            if decision == "approved":
+                                msg = (
+                                    f"✅ {approver_tag}Kanban {task_id} approved — "
+                                    f"{title}{suffix}"
+                                )
+                            elif decision == "rejected":
+                                msg = (
+                                    f"⛔ {approver_tag}Kanban {task_id} rejected — "
+                                    f"{title}{suffix}"
+                                )
+                            elif decision == "escalated":
+                                msg = (
+                                    f"⏸ {approver_tag}Kanban {task_id} requested human approval — "
+                                    f"{title}{suffix}"
+                                )
+                            else:
+                                msg = (
+                                    f"🔎 {approver_tag}Kanban {task_id} approval updated — "
+                                    f"{title}{suffix}"
+                                )
+                            comment_id = payload.get("comment_id")
+                            if comment_id is not None and comment_id in comments_by_id:
+                                body = (comments_by_id[comment_id].body or "").strip()
+                                if body:
+                                    first = body.splitlines()[0][:200]
+                                    msg += f"\n{first}"
+                        elif kind == "approval_failed":
+                            msg = f"✖ {tag}Kanban {task_id} approval failed — {title}"
+                        elif kind == "approval_cancelled":
+                            msg = f"⏹ {tag}Kanban {task_id} approval cancelled — {title}"
                         else:
                             continue
                         metadata: dict[str, Any] = {}
