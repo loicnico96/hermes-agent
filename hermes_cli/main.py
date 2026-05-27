@@ -10313,19 +10313,19 @@ def cmd_profile(args):
         meta = read_profile_meta(profile_dir)
         wrapper = _get_wrapper_dir() / name
 
-        print(f"\nProfile: {name}")
+        print(f"\nProfile:    {name}")
         if meta.get("nickname"):
-            print(f"Nickname: {meta['nickname']}")
-        print(f"Path:    {profile_dir}")
+            print(f"Nickname:   {meta['nickname']}")
+        print(f"Path:       {profile_dir}")
         if model:
-            print(f"Model:   {model}" + (f" ({provider})" if provider else ""))
-        print(f"Gateway: {'running' if gw else 'stopped'}")
-        print(f"Skills:  {skills}")
+            print(f"Model:      {model}" + (f" ({provider})" if provider else ""))
+        print(f"Gateway:    {'running' if gw else 'stopped'}")
+        print(f"Skills:     {skills}")
         print(
-            f".env:    {'exists' if (profile_dir / '.env').exists() else 'not configured'}"
+            f".env:       {'exists' if (profile_dir / '.env').exists() else 'not configured'}"
         )
         print(
-            f"SOUL.md: {'exists' if (profile_dir / 'SOUL.md').exists() else 'not configured'}"
+            f"SOUL.md:    {'exists' if (profile_dir / 'SOUL.md').exists() else 'not configured'}"
         )
         if dist_name:
             print(f"Distribution: {dist_name}@{dist_version or '?'}")
@@ -10333,7 +10333,7 @@ def cmd_profile(args):
                 print(f"Installed from: {dist_source}")
             print(f"  (run `hermes profile info {name}` for full manifest)")
         if wrapper.exists():
-            print(f"Alias:   {wrapper}")
+            print(f"Alias:      {wrapper}")
         print()
 
     elif action == "alias":
