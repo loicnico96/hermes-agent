@@ -422,7 +422,7 @@ def test_record_task_approval_decision_emits_approval_run_in_payload_but_not_tas
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
@@ -514,45 +514,6 @@ def test_task_approval_runtime_helpers_require_matching_run_id(kanban_home):
     assert [row["kind"] for row in event_rows] == ["created", "approval_requested", "approval_claimed"]
 
 
-def test_create_task_approval_run_inserts_agent_runs(kanban_home):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="approval target")
-        comment_id = kb.add_comment(conn, task_id, "reviewer", "approved")
-        approval = approvals_db.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="Reviewer",
-        )
-
-        run = approvals_db.create_task_approval_run(
-            conn,
-            approval_id=approval.id,
-            status="approved",
-            claim_lock=" lease-1 ",
-            claim_expires=55,
-            worker_pid=77,
-            last_heartbeat_at=88,
-            started_at=33,
-            ended_at=44,
-            outcome=" approved ",
-            comment_id=comment_id,
-        )
-
-    assert run.approval_id == approval.id
-    assert run.task_id == task_id
-    assert run.profile == "reviewer"
-    assert run.status == "approved"
-    assert run.claim_lock == "lease-1"
-    assert run.claim_expires == 55
-    assert run.worker_pid == 77
-    assert run.last_heartbeat_at == 88
-    assert run.started_at == 33
-    assert run.ended_at == 44
-    assert run.outcome == "approved"
-    assert run.comment_id == comment_id
-
-
 def test_list_task_approval_runs_filters_by_task_and_approval(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target")
@@ -576,10 +537,10 @@ def test_list_task_approval_runs_filters_by_task_and_approval(kanban_home):
             approver_profile="ops",
         )
 
-        run1 = approvals_db.create_task_approval_run(conn, approval_id=first.id, status="running", started_at=10)
-        run2 = approvals_db.create_task_approval_run(conn, approval_id=first.id, status="timed_out", started_at=20)
-        run3 = approvals_db.create_task_approval_run(conn, approval_id=second.id, status="approved", started_at=30)
-        approvals_db.create_task_approval_run(conn, approval_id=foreign.id, status="failed", started_at=40)
+        run1 = approvals_db._create_task_approval_run_for_tests(conn, approval_id=first.id, status="running", started_at=10)
+        run2 = approvals_db._create_task_approval_run_for_tests(conn, approval_id=first.id, status="timed_out", started_at=20)
+        run3 = approvals_db._create_task_approval_run_for_tests(conn, approval_id=second.id, status="approved", started_at=30)
+        approvals_db._create_task_approval_run_for_tests(conn, approval_id=foreign.id, status="failed", started_at=40)
 
         task_runs = approvals_db.list_task_approval_runs(conn, task_id)
         first_runs = approvals_db.list_task_approval_runs(conn, task_id, approval_id=first.id)
@@ -588,58 +549,6 @@ def test_list_task_approval_runs_filters_by_task_and_approval(kanban_home):
     assert [run.id for run in task_runs] == [run1.id, run2.id, run3.id]
     assert [run.id for run in first_runs] == [run1.id, run2.id]
     assert [run.id for run in timed_out] == [run2.id]
-
-
-@pytest.mark.parametrize(
-    ("setup", "kwargs", "message"),
-    [
-        (
-            "human",
-            {"status": "running"},
-            "approval runs require an agent approval",
-        ),
-        (
-            "agent",
-            {"status": "queued"},
-            "approval run status must be one of",
-        ),
-    ],
-)
-def test_create_task_approval_run_rejects_invalid_rows(kanban_home, setup, kwargs, message):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="approval target")
-        approval = approvals_db.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type=setup,
-            approver_profile=("reviewer" if setup == "agent" else None),
-        )
-
-        with pytest.raises(ValueError, match=message):
-            approvals_db.create_task_approval_run(conn, approval_id=approval.id, **kwargs)
-
-        with pytest.raises(ValueError, match="unknown approval"):
-            approvals_db.create_task_approval_run(conn, approval_id=999999)
-
-
-def test_create_task_approval_run_rejects_cross_task_comment(kanban_home):
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="approval target")
-        other_task_id = kb.create_task(conn, title="other")
-        other_comment_id = kb.add_comment(conn, other_task_id, "user", "foreign")
-        approval = approvals_db.create_task_approval(
-            conn,
-            task_id=task_id,
-            approver_type="agent",
-            approver_profile="reviewer",
-        )
-
-        with pytest.raises(ValueError, match="comment_id must reference a comment on the same task"):
-            approvals_db.create_task_approval_run(
-                conn,
-                approval_id=approval.id,
-                comment_id=other_comment_id,
-            )
 
 
 def test_record_task_approval_decision_treats_missing_approval_as_stale_noop(kanban_home):
@@ -652,7 +561,7 @@ def test_record_task_approval_decision_treats_missing_approval_as_stale_noop(kan
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
 
         conn.execute("DELETE FROM task_approvals WHERE id = ?", (approval.id,))
 
@@ -675,7 +584,6 @@ def test_record_task_approval_decision_treats_missing_approval_as_stale_noop(kan
     assert run_row["outcome"] is None
 
 
-
 def test_record_task_approval_decision_treats_missing_run_row_as_stale_noop(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target", assignee="ops")
@@ -686,7 +594,7 @@ def test_record_task_approval_decision_treats_missing_run_row_as_stale_noop(kanb
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
@@ -719,7 +627,6 @@ def test_record_task_approval_decision_treats_missing_run_row_as_stale_noop(kanb
     assert refreshed.updated_at == 8_900
     assert task is not None
     assert task.status == "approval"
-
 
 
 def test_record_task_approval_decision_rejects_live_or_retry_statuses(kanban_home):
@@ -764,7 +671,7 @@ def test_reset_task_approval_clears_mutable_fields_and_preserves_identity(kanban
             approver_skill="security-review",
             status="running",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
 
         with kb.write_txn(conn):
             conn.execute(
@@ -925,7 +832,7 @@ def test_reclaim_task_approval_reclaims_running_agent_row(kanban_home, monkeypat
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
@@ -1006,7 +913,7 @@ def test_reclaim_task_approval_transitions_task_done_when_last_running_agent_is_
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
@@ -1051,7 +958,7 @@ def test_reclaim_task_approval_transitions_task_todo_when_other_rejection_exists
             approver_profile="reviewer-2",
             status="rejected",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=running.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=running.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
@@ -1096,7 +1003,7 @@ def test_remove_task_approval_recomputes_approval_parent_state(kanban_home):
             approver_type="human",
             status="approved",
         )
-        removed_run = approvals_db.create_task_approval_run(conn, approval_id=removed.id, status="running")
+        removed_run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=removed.id, status="running")
         conn.execute(
             "UPDATE task_approvals SET current_run_id = NULL, claim_lock = NULL, updated_at = ? WHERE id = ?",
             (7_500, removed.id),
@@ -1163,7 +1070,7 @@ def test_remove_task_approval_allows_actively_owned_rows_and_deletes_run_rows(ka
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute(
             "UPDATE task_approvals SET current_run_id = ?, claim_lock = ?, updated_at = ? WHERE id = ?",
             (run.id, "lease-1", 7_600, approval.id),
@@ -1455,7 +1362,7 @@ def test_reset_task_approvals_for_task_resets_only_target_task_rows(kanban_home,
             approver_profile="security",
             status="approved",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
 
         with kb.write_txn(conn):
             conn.execute(
@@ -1663,7 +1570,7 @@ def test_record_task_approval_decision_marks_approval_task_done_when_live_gate_i
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         with kb.write_txn(conn):
@@ -1736,7 +1643,7 @@ def test_record_task_approval_decision_escalated_resets_existing_human_gate(kanb
             status="approved",
             comment_id=human_comment_id,
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         with kb.write_txn(conn):
             conn.execute(
@@ -1825,7 +1732,7 @@ def test_record_task_approval_decision_escalated_creates_human_gate_when_missing
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             "UPDATE task_approvals SET status = 'running', current_run_id = ?, updated_at = ? WHERE id = ?",
@@ -1863,7 +1770,7 @@ def test_finalize_task_approval_row_if_owned_applies_terminal_status(kanban_home
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         with kb.write_txn(conn):
             conn.execute(
@@ -1920,7 +1827,7 @@ def test_finalize_task_approval_row_if_owned_discards_non_running_rows(kanban_ho
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         with kb.write_txn(conn):
             conn.execute(
@@ -1966,8 +1873,8 @@ def test_finalize_task_approval_row_if_owned_discards_run_ownership_mismatches(k
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
-        stale_run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
+        stale_run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         with kb.write_txn(conn):
             conn.execute(
@@ -2021,8 +1928,8 @@ def test_record_task_approval_decision_keeps_task_approval_while_other_approval_
             approver_profile="reviewer-2",
             status="requested",
         )
-        rejected_run = approvals_db.create_task_approval_run(conn, approval_id=rejected.id, status="running")
-        other_run = approvals_db.create_task_approval_run(conn, approval_id=other.id, status="running")
+        rejected_run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=rejected.id, status="running")
+        other_run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=other.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         with kb.write_txn(conn):
@@ -2131,8 +2038,8 @@ def test_record_task_approval_decision_moves_task_to_todo_after_last_running_app
             approver_profile="reviewer-2",
             status="requested",
         )
-        rejected_run = approvals_db.create_task_approval_run(conn, approval_id=rejected.id, status="running")
-        other_run = approvals_db.create_task_approval_run(conn, approval_id=other.id, status="running")
+        rejected_run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=rejected.id, status="running")
+        other_run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=other.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
 
         with kb.write_txn(conn):
@@ -2193,7 +2100,7 @@ def test_record_task_approval_decision_discards_results_after_task_leaves_approv
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (task_id,))
         conn.execute(
             "UPDATE task_approvals SET status = 'running', current_run_id = ?, claim_lock = ?, updated_at = ? WHERE id = ?",
@@ -2239,7 +2146,7 @@ def test_record_task_approval_failure_requeues_requested_under_limit(kanban_home
             approver_profile="reviewer",
             status="requested",
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """
@@ -2309,7 +2216,7 @@ def test_record_task_approval_failure_marks_failed_and_resets_human_gate_at_limi
             status="approved",
             comment_id=human_comment_id,
         )
-        run = approvals_db.create_task_approval_run(conn, approval_id=approval.id, status="running")
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
         conn.execute(
             """

@@ -1468,10 +1468,8 @@ def record_task_approval_decision(
 
         return aggregate_status
 
-
-
-
-def create_task_approval_run(
+# For tests
+def _create_task_approval_run_for_tests(
     conn: sqlite3.Connection,
     *,
     approval_id: int,
