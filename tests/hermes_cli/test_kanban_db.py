@@ -67,13 +67,10 @@ def test_init_creates_approval_indexes(kanban_home):
         ).fetchall()
     names = {r["name"] for r in rows}
     assert {
-        "idx_task_approvals_task_id",
-        "idx_task_approvals_status",
-        "idx_task_approvals_type_status",
-        "idx_task_approvals_claimable",
-        "idx_task_approval_runs_approval_id",
-        "idx_task_approval_runs_task_id",
-        "idx_task_approval_runs_status",
+        "idx_approvals_task_status",
+        "idx_approvals_claimable",
+        "idx_approval_runs_approval_started",
+        "idx_approval_runs_task_started",
     } <= names
 
 
@@ -219,13 +216,10 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     # Approval schema is created additively on legacy boards.
     assert "task_approvals" in tables
     assert "task_approval_runs" in tables
-    assert "idx_task_approvals_task_id" in indexes
-    assert "idx_task_approvals_status" in indexes
-    assert "idx_task_approvals_type_status" in indexes
-    assert "idx_task_approvals_claimable" in indexes
-    assert "idx_task_approval_runs_approval_id" in indexes
-    assert "idx_task_approval_runs_task_id" in indexes
-    assert "idx_task_approval_runs_status" in indexes
+    assert "idx_approvals_task_status" in indexes
+    assert "idx_approvals_claimable" in indexes
+    assert "idx_approval_runs_approval_started" in indexes
+    assert "idx_approval_runs_task_started" in indexes
     # Existing additive-column indexes still migrate.
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
@@ -461,7 +455,7 @@ def test_non_owner_status_helpers_do_not_prepare_approval_reset(kanban_home, mon
         assert task_id
         calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_prepare_task_approvals_for_new_completion_cycle", fake_hook)
+    monkeypatch.setattr(kb, "_reset_task_approvals", fake_hook)
 
     with kb.connect() as conn:
         scheduled = kb.create_task(conn, title="scheduled", assignee="ops")
@@ -494,7 +488,7 @@ def test_complete_task_prepares_completion_cycle_only_when_approvals_exist(kanba
         assert task_id
         calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_prepare_task_approvals_for_new_completion_cycle", fake_hook)
+    monkeypatch.setattr(kb, "_reset_task_approvals", fake_hook)
 
     with kb.connect() as conn:
         no_approval_task = kb.create_task(conn, title="no approval", assignee="ops")
@@ -514,7 +508,7 @@ def test_archive_task_is_not_an_approval_reset_owner(kanban_home, monkeypatch):
         assert task_id
         calls.append(task_id)
 
-    monkeypatch.setattr(kb, "_prepare_task_approvals_for_new_completion_cycle", fake_hook)
+    monkeypatch.setattr(kb, "_reset_task_approvals", fake_hook)
 
     with kb.connect() as conn:
         archived = kb.create_task(conn, title="archived", assignee="ops")

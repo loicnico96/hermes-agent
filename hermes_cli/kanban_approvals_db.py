@@ -1013,12 +1013,6 @@ def _reset_task_approvals(
     return int(cur.rowcount)
 
 
-def _prepare_task_approvals_for_new_completion_cycle(
-    conn: sqlite3.Connection,
-    task_id: str,
-) -> None:
-    _reset_task_approvals(conn, task_id)
-
 
 def _compute_task_approval_aggregate_status(
     approvals: Sequence[Approval],
@@ -1118,6 +1112,12 @@ def _finalize_task_approval_result_if_owned(
     comment_id: Optional[int] = None,
     now: Optional[int] = None,
 ) -> Optional[str]:
+    """Finalize an owned approval run and propagate any resulting task transition.
+
+    This wraps `_finalize_task_approval_row_if_owned()` with the higher-level
+    consequences: optional escalation to a human approval and recomputing the
+    enclosing task's aggregate approval state.
+    """
     effective_now = int(time.time()) if now is None else int(now)
     task = kb.get_task(conn, approval.task_id)
     if task is None or task.status != "approval":
@@ -1149,6 +1149,59 @@ def _finalize_task_approval_result_if_owned(
         approvals=approvals,
         now=effective_now,
     )
+
+
+def _finalize_task_approval_row_if_owned(
+    conn: sqlite3.Connection,
+    *,
+    approval_id: int,
+    expected_run_id: int,
+    status: str,
+    comment_id: Optional[int] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Finalize just the approval row if this worker still owns the active run.
+
+    This is the low-level compare-and-swap: it clears the worker lease and writes
+    the terminal approval status, but it intentionally does not touch the parent
+    task state. Callers that need task-level transitions should layer on top.
+    """
+    approval = get_task_approval(conn, approval_id)
+    if approval is None:
+        raise ValueError(f"unknown approval {approval_id}")
+
+    normalized_status = _validate_terminal_approval_status(status)
+    normalized_comment_id = _validate_task_comment_reference(
+        conn, task_id=approval.task_id, comment_id=comment_id
+    )
+    effective_now = int(time.time()) if now is None else int(now)
+
+    cur = conn.execute(
+        """
+        UPDATE task_approvals
+           SET status = ?,
+               comment_id = ?,
+               claim_lock = NULL,
+               claim_expires = NULL,
+               worker_pid = NULL,
+               last_heartbeat_at = NULL,
+               current_run_id = NULL,
+               consecutive_failures = 0,
+               last_failure_error = NULL,
+               updated_at = ?
+         WHERE id = ?
+           AND status = 'running'
+           AND current_run_id = ?
+        """,
+        (
+            normalized_status,
+            normalized_comment_id,
+            effective_now,
+            int(approval_id),
+            int(expected_run_id),
+        ),
+    )
+    return cur.rowcount == 1
 
 
 def _ensure_requested_human_approval(
@@ -1405,51 +1458,6 @@ def record_task_approval_decision(
         return aggregate_status
 
 
-def _finalize_task_approval_row_if_owned(
-    conn: sqlite3.Connection,
-    *,
-    approval_id: int,
-    expected_run_id: int,
-    status: str,
-    comment_id: Optional[int] = None,
-    now: Optional[int] = None,
-) -> bool:
-    approval = get_task_approval(conn, approval_id)
-    if approval is None:
-        raise ValueError(f"unknown approval {approval_id}")
-
-    normalized_status = _validate_terminal_approval_status(status)
-    normalized_comment_id = _validate_task_comment_reference(
-        conn, task_id=approval.task_id, comment_id=comment_id
-    )
-    effective_now = int(time.time()) if now is None else int(now)
-
-    cur = conn.execute(
-        """
-        UPDATE task_approvals
-           SET status = ?,
-               comment_id = ?,
-               claim_lock = NULL,
-               claim_expires = NULL,
-               worker_pid = NULL,
-               last_heartbeat_at = NULL,
-               current_run_id = NULL,
-               consecutive_failures = 0,
-               last_failure_error = NULL,
-               updated_at = ?
-         WHERE id = ?
-           AND status = 'running'
-           AND current_run_id = ?
-        """,
-        (
-            normalized_status,
-            normalized_comment_id,
-            effective_now,
-            int(approval_id),
-            int(expected_run_id),
-        ),
-    )
-    return cur.rowcount == 1
 
 
 def create_task_approval_run(

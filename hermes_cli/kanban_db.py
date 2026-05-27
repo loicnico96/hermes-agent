@@ -105,7 +105,6 @@ from hermes_cli.kanban_approvals_db import (
     _finalize_task_approval_result_if_owned,
     _finalize_task_approval_row_if_owned,
     _normalize_approval_profile,
-    _prepare_task_approvals_for_new_completion_cycle,
     _reclaim_running_task_approvals,
     _reset_task_approval_row,
     _reset_task_approvals,
@@ -1214,13 +1213,10 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_task_approvals_task_id ON task_approvals(task_id);
-CREATE INDEX IF NOT EXISTS idx_task_approvals_status ON task_approvals(status);
-CREATE INDEX IF NOT EXISTS idx_task_approvals_type_status ON task_approvals(approver_type, status);
-CREATE INDEX IF NOT EXISTS idx_task_approvals_claimable ON task_approvals(status, approver_type, claim_lock);
-CREATE INDEX IF NOT EXISTS idx_task_approval_runs_approval_id ON task_approval_runs(approval_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_task_approval_runs_task_id ON task_approval_runs(task_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_task_approval_runs_status ON task_approval_runs(status);
+CREATE INDEX IF NOT EXISTS idx_approvals_task_status ON task_approvals(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_approvals_claimable ON task_approvals(status, approver_type, claim_lock);
+CREATE INDEX IF NOT EXISTS idx_approval_runs_approval_started ON task_approval_runs(approval_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_approval_runs_task_started ON task_approval_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
@@ -3775,7 +3771,7 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         if next_status == "approval":
-            _prepare_task_approvals_for_new_completion_cycle(conn, task_id)
+            _reset_task_approvals(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -4731,12 +4727,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
-        row = conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        if row is None:
-            return False
         _reclaim_running_task_approvals(conn, task_id)
         _delete_task_owned_rows(conn, task_id)
-        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        deleted = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        if deleted.rowcount != 1:
+            return False
     recompute_ready(conn)
     return True
 
@@ -6828,7 +6823,7 @@ def _skill_available(skill_name: str, hermes_home: Optional[str]) -> bool:
     from pathlib import Path as _Path
 
     base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    candidate_roots = [base / "skills", _Path(__file__).resolve().parents[1] / "skills"]
+    candidate_roots = [base / "skills"]
     for skills_root in candidate_roots:
         if not skills_root.is_dir():
             continue
@@ -7133,18 +7128,6 @@ def _record_approval_runtime_failure(
 
 def _approval_log_path(approval_id: int, *, board: Optional[str] = None) -> Path:
     return worker_logs_dir(board=board) / f"approval-{int(approval_id)}.log"
-
-
-def _read_last_nonempty_log_line(path: Path) -> str:
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        raise ValueError(f"unable to read approval log: {exc}") from exc
-    for line in reversed(text.splitlines()):
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    raise ValueError("approval worker log did not contain a final response")
 
 
 def detect_crashed_approval_workers(

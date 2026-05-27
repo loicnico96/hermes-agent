@@ -318,7 +318,7 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
-def _require_task_worker_tool(tool_name: str) -> Optional[str]:
+def _require_not_approval_worker(tool_name: str) -> Optional[str]:
     if _is_approval_worker():
         return tool_error(
             f"{tool_name} is not available to approval workers; use "
@@ -327,7 +327,7 @@ def _require_task_worker_tool(tool_name: str) -> Optional[str]:
     return None
 
 
-def _require_approval_worker_tool(tool_name: str) -> Optional[str]:
+def _require_approval_worker(tool_name: str) -> Optional[str]:
     if not _is_approval_worker():
         return tool_error(
             f"{tool_name} requires HERMES_KANBAN_APPROVAL_ID and an active "
@@ -505,7 +505,7 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
-    worker_mode_err = _require_task_worker_tool("kanban_complete")
+    worker_mode_err = _require_not_approval_worker("kanban_complete")
     if worker_mode_err:
         return worker_mode_err
     tid = _default_task_id(args.get("task_id"))
@@ -630,7 +630,7 @@ def _handle_complete(args: dict, **kw) -> str:
 
 def _handle_approval(args: dict, **kw) -> str:
     """Apply an approval-worker decision to the active approval row."""
-    approval_mode_err = _require_approval_worker_tool("kanban_approval")
+    approval_mode_err = _require_approval_worker("kanban_approval")
     if approval_mode_err:
         return approval_mode_err
     decision = args.get("decision")
@@ -692,7 +692,7 @@ def _handle_approval(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
-    worker_mode_err = _require_task_worker_tool("kanban_block")
+    worker_mode_err = _require_not_approval_worker("kanban_block")
     if worker_mode_err:
         return worker_mode_err
     tid = _default_task_id(args.get("task_id"))
@@ -784,7 +784,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
-    worker_mode_err = _require_task_worker_tool("kanban_comment")
+    worker_mode_err = _require_not_approval_worker("kanban_comment")
     if worker_mode_err:
         return worker_mode_err
     tid = args.get("task_id")
