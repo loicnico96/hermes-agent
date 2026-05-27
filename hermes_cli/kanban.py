@@ -1454,7 +1454,6 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    from hermes_cli import kanban_approvals_db as approvals_db
 
     with kb.connect() as conn:
         task = kb.get_task(conn, args.task_id)

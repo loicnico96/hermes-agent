@@ -186,7 +186,6 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
-    from hermes_cli import kanban_approvals_db as approvals_db
     return kb, kb.connect(board=board)
 
 
