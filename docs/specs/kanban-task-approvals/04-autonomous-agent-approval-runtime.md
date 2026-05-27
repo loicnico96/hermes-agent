@@ -1,6 +1,6 @@
 # Kanban Task Approvals — Autonomous Agent Approval Runtime Spec
 
-Status: Draft (Phase 4 runtime slice landed on the branch/PR lane; Phase 5 semantic/runtime cleanup for status naming, event payloads, and worker/approver tool surfaces is specified in `05-approval-event-and-worker-surface-hardening.md`)
+Status: Draft (Phase 4 runtime slice landed on the branch/PR lane; Phase 5 semantic/runtime cleanup for status naming, event payloads, and worker/approver tool surfaces is specified in `05-approval-event-and-worker-surface-hardening.md`; Phase 6 dispatcher budgeting and approval-pass refactoring is specified in `06-dispatch-budget-and-approval-pass-refactor.md`)
 Depends on:
 - `docs/specs/kanban-task-approvals/00-master-spec.md`
 - `docs/specs/kanban-task-approvals/01-db-and-migration.md`
