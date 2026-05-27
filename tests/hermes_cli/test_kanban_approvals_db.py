@@ -2403,9 +2403,9 @@ def test_approval_from_row_parses_nullable_and_identity_fields():
             """
         ).fetchone()
 
-        approval = kb.Approval.from_row(row)
+        approval = approvals_db.Approval.from_row(row)
 
-    assert approval == kb.Approval(
+    assert approval == approvals_db.Approval(
         id=7,
         task_id="t_approval",
         approver_type="agent",
@@ -2448,9 +2448,9 @@ def test_approval_run_from_row_parses_optional_fields():
             """
         ).fetchone()
 
-        approval_run = kb.ApprovalRun.from_row(row)
+        approval_run = approvals_db.ApprovalRun.from_row(row)
 
-    assert approval_run == kb.ApprovalRun(
+    assert approval_run == approvals_db.ApprovalRun(
         id=11,
         approval_id=7,
         task_id="t_approval",
