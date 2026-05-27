@@ -10017,11 +10017,11 @@ def cmd_profile(args):
         # Header
         if show_nickname:
             print(
-                f"\n {'Profile':<16} {'Nickname':<12} {'Model':<28} {'Gateway':<12} "
+                f"\n {'Profile':<16} {'Nickname':<16} {'Model':<28} {'Gateway':<12} "
                 f"{'Alias':<12} {'Distribution'}"
             )
             print(
-                f" {'─' * 15}    {'─' * 11}    {'─' * 27}    {'─' * 11}    "
+                f" {'─' * 15}    {'─' * 15}    {'─' * 27}    {'─' * 11}    "
                 f"{'─' * 11}    {'─' * 20}"
             )
         else:
@@ -10041,7 +10041,7 @@ def cmd_profile(args):
                 else "  "
             )
             name = p.name
-            nickname = (p.nickname or "—")[:11]
+            nickname = (p.nickname or "—")[:15]
             model = (p.model or "—")[:26]
             gw = "running" if p.gateway_running else "stopped"
             alias = p.name if p.alias_path else "—"
@@ -10054,7 +10054,7 @@ def cmd_profile(args):
                 dist = "—"
             if show_nickname:
                 print(
-                    f"{marker}{name:<15} {nickname:<12} {model:<28} {gw:<12} {alias:<12} {dist}"
+                    f"{marker}{name:<15} {nickname:<16} {model:<28} {gw:<12} {alias:<12} {dist}"
                 )
             else:
                 print(f"{marker}{name:<15} {model:<28} {gw:<12} {alias:<12} {dist}")
