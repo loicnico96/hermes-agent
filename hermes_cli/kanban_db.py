@@ -5831,19 +5831,18 @@ def _skill_available(skill_name: str, hermes_home: Optional[str]) -> bool:
     from pathlib import Path as _Path
 
     base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
-    candidate_roots = [base / "skills"]
-    for skills_root in candidate_roots:
-        if not skills_root.is_dir():
-            continue
-        canonical = skills_root / "devops" / skill_name / "SKILL.md"
-        if canonical.is_file():
-            return True
-        try:
-            for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
-                if skill_md.is_file():
-                    return True
-        except OSError:
-            continue
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+    canonical = skills_root / "devops" / skill_name / "SKILL.md"
+    if canonical.is_file():
+        return True
+    try:
+        for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
+            if skill_md.is_file():
+                return True
+    except OSError:
+        return False
     return False
 
 
@@ -5853,48 +5852,6 @@ def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
 
 
 KANBAN_APPROVER_DEFAULT_SKILL = "kanban-approver"
-
-@dataclass(frozen=True)
-class ApprovalWorkerDecision:
-    decision: str
-    comment: Optional[str] = None
-
-
-def parse_approval_worker_response(response_text: str) -> ApprovalWorkerDecision:
-    """Validate the approval worker's final response.
-
-    The contract is intentionally strict: the entire response must be one JSON
-    object with exactly the supported keys so downstream approval application
-    never has to guess which of several conflicting statements is authoritative.
-    """
-    text = (response_text or "").strip()
-    if not text:
-        raise ValueError("approval worker response must be a JSON object, got empty output")
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError("approval worker response must be valid JSON") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("approval worker response must be a JSON object")
-    if "decision" not in payload:
-        raise ValueError("approval worker response must include decision")
-    decision = payload["decision"]
-    if not isinstance(decision, str):
-        raise ValueError("approval worker decision must be a string")
-    normalized_decision = decision.strip().lower()
-    if normalized_decision not in DECISION_APPROVAL_STATUSES:
-        raise ValueError(
-            "approval worker decision must be one of "
-            + ", ".join(sorted(DECISION_APPROVAL_STATUSES))
-        )
-    comment = payload.get("comment")
-    if comment is not None and not isinstance(comment, str):
-        raise ValueError("approval worker comment must be a string when provided")
-    normalized_comment = comment.strip() if isinstance(comment, str) else None
-    return ApprovalWorkerDecision(
-        decision=normalized_decision,
-        comment=normalized_comment or None,
-    )
 
 
 def _approval_worker_skill_names(
