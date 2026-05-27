@@ -11,7 +11,7 @@ from typing import Any
 from hermes_cli import kanban_db as kb
 
 
-def _approval_run_to_dict(run: kb.ApprovalRun) -> dict[str, Any]:
+def approval_run_to_dict(run: kb.ApprovalRun) -> dict[str, Any]:
     return {
         "id": run.id,
         "approval_id": run.approval_id,
@@ -42,7 +42,7 @@ def _profile_author() -> str:
         return "user"
 
 
-def _approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
+def approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
     return {
         "id": approval.id,
         "task_id": approval.task_id,
@@ -61,14 +61,6 @@ def _approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
         "created_at": approval.created_at,
         "updated_at": approval.updated_at,
     }
-
-
-def approval_to_dict(approval: kb.Approval) -> dict[str, Any]:
-    return _approval_to_dict(approval)
-
-
-def approval_run_to_dict(run: kb.ApprovalRun) -> dict[str, Any]:
-    return _approval_run_to_dict(run)
 
 
 def _format_approval_target(approval: kb.Approval) -> str:
@@ -112,7 +104,7 @@ def _approval_mutation_payload(conn: Any, approval: kb.Approval) -> dict[str, An
     task = kb.get_task(conn, approval.task_id)
     assert task is not None
     return {
-        "approval": _approval_to_dict(approval),
+        "approval": approval_to_dict(approval),
         "task_status": task.status,
     }
 
@@ -132,7 +124,7 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
         )
 
     if getattr(args, "json", False):
-        print(json.dumps(_approval_to_dict(approval), indent=2, ensure_ascii=False))
+        print(json.dumps(approval_to_dict(approval), indent=2, ensure_ascii=False))
     else:
         print(
             f"Requested approval #{approval.id} on {approval.task_id} "
@@ -155,7 +147,7 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         )
 
     if getattr(args, "json", False):
-        print(json.dumps([_approval_to_dict(approval) for approval in approvals], indent=2, ensure_ascii=False))
+        print(json.dumps([approval_to_dict(approval) for approval in approvals], indent=2, ensure_ascii=False))
         return 0
 
     if not approvals:
