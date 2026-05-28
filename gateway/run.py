@@ -5465,39 +5465,45 @@ class GatewayRunner:
                                 f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "awaiting_approval":
+                            # Notification may be processed after approvals were decided
+                            # This notification is useless/misleading in that case so we
+                            # skip it entirely
                             if not task or task.status != "approval":
                                 continue
-                            requested_approvals = [
+                            pending_approvals = [
                                 approval
                                 for approval in approvals
-                                if approval.status == "requested"
+                                if approval.status in {"requested", "running"}
                             ]
-                            if not requested_approvals:
-                                continue
-                            requested_human_approvals = [
+                            pending_human_approvals = [
                                 approval
-                                for approval in requested_approvals
+                                for approval in pending_approvals
                                 if approval.approver_type == "human"
                             ]
-                            requested_agent_approvals = [
+                            pending_agent_approvals = [
                                 approval
-                                for approval in requested_approvals
+                                for approval in pending_approvals
                                 if approval.approver_type == "agent"
                             ]
-                            handoff = _handoff_line()
-                            if requested_human_approvals:
-                                requested_human_id = requested_human_approvals[0].id
+                            # If there are human approvals, show them in priority and with a
+                            # different icon, so user knows to react differently.
+                            if pending_human_approvals:
+                                handoff = _handoff_line()
+                                pending_human_ids = ", ".join(
+                                    f"#{approval.id}" for approval in pending_human_approvals
+                                )
                                 msg = (
                                     f"🛑 {tag}Kanban {task_id} awaiting human approval "
-                                    f"(#{requested_human_id}) — {title}{handoff}"
+                                    f"({pending_human_ids}) — {title}{handoff}"
                                 )
-                            elif requested_agent_approvals:
-                                requested_agent_ids = ", ".join(
-                                    f"#{approval.id}" for approval in requested_agent_approvals
+                            elif pending_agent_approvals:
+                                handoff = _handoff_line()
+                                pending_agent_ids = ", ".join(
+                                    f"#{approval.id}" for approval in pending_agent_approvals
                                 )
                                 msg = (
                                     f"🔎 {tag}Kanban {task_id} awaiting agent approval "
-                                    f"({requested_agent_ids}) — {title}{handoff}"
+                                    f"({pending_agent_ids}) — {title}{handoff}"
                                 )
                             else:
                                 continue
@@ -5524,7 +5530,7 @@ class GatewayRunner:
                                     f"{title}{suffix}"
                                 )
                             elif decision == "escalated":
-                                requested_human_approval = next(
+                                pending_human_approval = next(
                                     (
                                         approval
                                         for approval in approvals
@@ -5533,8 +5539,8 @@ class GatewayRunner:
                                     None,
                                 )
                                 human_suffix = ""
-                                if approval_id is not None and requested_human_approval is not None:
-                                    human_suffix = f" (#{int(approval_id)} -> #{requested_human_approval.id})"
+                                if approval_id is not None and pending_human_approval is not None:
+                                    human_suffix = f" (#{int(approval_id)} -> #{pending_human_approval.id})"
                                 elif approval_id is not None:
                                     human_suffix = f" (#{int(approval_id)})"
                                 msg = (
