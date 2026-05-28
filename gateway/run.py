@@ -5226,7 +5226,7 @@ class GatewayRunner:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = (
+        NOTIFICATION_EVENT_KINDS = (
             "completed",
             "blocked",
             "gave_up",
@@ -5237,6 +5237,7 @@ class GatewayRunner:
             "approval_failed",
             "approval_cancelled",
         )
+        TERMINAL_STATUSES = {"done", "archived"}
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -5344,7 +5345,7 @@ class GatewayRunner:
                                     platform=sub["platform"],
                                     chat_id=sub["chat_id"],
                                     thread_id=sub.get("thread_id") or "",
-                                    kinds=TERMINAL_KINDS,
+                                    kinds=NOTIFICATION_EVENT_KINDS,
                                 )
                                 if not events:
                                     continue
@@ -5631,9 +5632,9 @@ class GatewayRunner:
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
-                        # same state. See the longer comment on TERMINAL_KINDS
+                        # same state. See the longer comment on TERMINAL_STATUSES
                         # above for the failure mode this prevents.
-                        task_terminal = task and task.status in {"done", "archived"}
+                        task_terminal = task and task.status in TERMINAL_STATUSES
                         if task_terminal:
                             await asyncio.to_thread(
                                 self._kanban_unsub, sub, board_slug,
