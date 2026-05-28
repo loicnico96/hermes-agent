@@ -5412,24 +5412,28 @@ class GatewayRunner:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+
+                        def _handoff_line(*, limit: int = 200) -> str:
+                            payload_summary = None
+                            if ev.payload and ev.payload.get("summary"):
+                                payload_summary = str(ev.payload["summary"])
+                            if payload_summary:
+                                first_line = payload_summary.strip().splitlines()[0][:limit]
+                                if first_line:
+                                    return f"\n{first_line}"
+                            if task and task.result:
+                                first_line = task.result.strip().splitlines()[0][: min(limit, 160)]
+                                if first_line:
+                                    return f"\n{first_line}"
+                            return ""
+
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
                             # task.result for legacy rows written before
                             # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
+                            handoff = _handoff_line()
                             msg = (
                                 f"✔ {tag}Kanban {task_id} done"
                                 f" — {title}{handoff}"
@@ -5461,30 +5465,42 @@ class GatewayRunner:
                                 f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "awaiting_approval":
-                            requested_human_approvals = [
+                            if not task or task.status != "approval":
+                                continue
+                            requested_approvals = [
                                 approval
                                 for approval in approvals
-                                if approval.status == "requested" and approval.approver_type == "human"
+                                if approval.status == "requested"
+                            ]
+                            if not requested_approvals:
+                                continue
+                            requested_human_approvals = [
+                                approval
+                                for approval in requested_approvals
+                                if approval.approver_type == "human"
                             ]
                             requested_agent_approvals = [
                                 approval
-                                for approval in approvals
-                                if approval.status == "requested" and approval.approver_type == "agent"
+                                for approval in requested_approvals
+                                if approval.approver_type == "agent"
                             ]
+                            handoff = _handoff_line()
                             if requested_human_approvals:
                                 requested_human_id = requested_human_approvals[0].id
                                 msg = (
                                     f"🛑 {tag}Kanban {task_id} awaiting human approval "
-                                    f"(#{requested_human_id}) — {title}"
+                                    f"(#{requested_human_id}) — {title}{handoff}"
                                 )
-                            else:
+                            elif requested_agent_approvals:
                                 requested_agent_ids = ", ".join(
                                     f"#{approval.id}" for approval in requested_agent_approvals
                                 )
                                 msg = (
                                     f"🔎 {tag}Kanban {task_id} awaiting agent approval "
-                                    f"({requested_agent_ids}) — {title}"
+                                    f"({requested_agent_ids}) — {title}{handoff}"
                                 )
+                            else:
+                                continue
                         elif kind == "approval_decided":
                             payload = ev.payload or {}
                             approver = payload.get("approver_profile")
@@ -5497,8 +5513,7 @@ class GatewayRunner:
                             if next_status is not None:
                                 suffix = f"; task moved to {next_status}"
                             if decision == "approved":
-                                approver_type = str(payload.get("approver_type") or "").lower()
-                                approved_icon = "✅" if approver_type == "human" else "☑️"
+                                approved_icon = "✅" if next_status == "done" else "☑️"
                                 msg = (
                                     f"{approved_icon} {approver_tag}Kanban {task_id} approved{approval_suffix} — "
                                     f"{title}{suffix}"
