@@ -266,7 +266,7 @@ def test_notifier_formats_awaiting_human_approval(tmp_path, monkeypatch):
     conn = kb.connect()
     try:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (tid,))
-        approvals_db.create_task_approval(conn, task_id=tid, approver_type="human")
+        approval = approvals_db.create_task_approval(conn, task_id=tid, approver_type="human")
         kb._append_event(conn, tid, kind="awaiting_approval", payload={"task_status": "approval"})
     finally:
         conn.close()
@@ -276,7 +276,7 @@ def test_notifier_formats_awaiting_human_approval(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"🛑 @worker Kanban {tid} awaiting human approval — Needs human eyes"
+        f"🛑 @worker Kanban {tid} awaiting human approval (#{approval.id}) — Needs human eyes"
     ]
 
 
@@ -290,11 +290,17 @@ def test_notifier_formats_awaiting_agent_approval(tmp_path, monkeypatch):
     conn = kb.connect()
     try:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (tid,))
-        approvals_db.create_task_approval(
+        approval_1 = approvals_db.create_task_approval(
             conn,
             task_id=tid,
             approver_type="agent",
             approver_profile="coder",
+        )
+        approval_2 = approvals_db.create_task_approval(
+            conn,
+            task_id=tid,
+            approver_type="agent",
+            approver_profile="default",
         )
         kb._append_event(conn, tid, kind="awaiting_approval", payload={"task_status": "approval"})
     finally:
@@ -305,7 +311,7 @@ def test_notifier_formats_awaiting_agent_approval(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"🔎 @worker Kanban {tid} awaiting agent approval — Needs agent eyes"
+        f"🔎 @worker Kanban {tid} awaiting agent approval (#{approval_1.id}, #{approval_2.id}) — Needs agent eyes"
     ]
 
 
@@ -341,8 +347,42 @@ def test_notifier_formats_approval_decided_with_comment_and_transition(tmp_path,
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"☑️ @coder Kanban {tid} approved — Approval outcome; task moved to done\n"
+        f"☑️ @coder Kanban {tid} approved (#7) — Approval outcome; task moved to done\n"
         "Looks good from agent review."
+    ]
+
+
+def test_notifier_formats_human_escalation_with_requested_human_id(tmp_path, monkeypatch):
+    db_path = tmp_path / "approval-escalated.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_approval_subscription(title="Escalated approval")
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (tid,))
+        human_approval = approvals_db.create_task_approval(conn, task_id=tid, approver_type="human")
+        kb._append_event(
+            conn,
+            tid,
+            kind="approval_decided",
+            payload={
+                "approval_id": 1,
+                "approver_type": "agent",
+                "approver_profile": "default",
+                "decision": "escalated",
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [d["text"] for d in adapter.sent] == [
+        f"🛑 @default Kanban {tid} requested human approval (#1 -> #{human_approval.id}) — Escalated approval"
     ]
 
 
@@ -377,7 +417,7 @@ def test_notifier_formats_human_approved_with_green_check(tmp_path, monkeypatch)
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"✅ Kanban {tid} approved — Human approval outcome; task moved to done\n"
+        f"✅ Kanban {tid} approved (#8) — Human approval outcome; task moved to done\n"
         "Human approved after a quick pass."
     ]
 
@@ -425,6 +465,6 @@ def test_notifier_formats_approval_failed_and_cancelled(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"✖ @coder Kanban {tid} approval failed — Approval failure lane",
-        f"⏹ @coder Kanban {tid} approval cancelled — Approval failure lane",
+        f"✖ @coder Kanban {tid} approval failed (#11) — Approval failure lane",
+        f"⏹ @coder Kanban {tid} approval cancelled (#12) — Approval failure lane",
     ]

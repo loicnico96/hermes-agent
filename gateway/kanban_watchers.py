@@ -311,25 +311,37 @@ class GatewayKanbanWatchersMixin:
                                 f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "awaiting_approval":
-                            requested_human = any(
-                                approval.status == "requested" and approval.approver_type == "human"
+                            requested_human_approvals = [
+                                approval
                                 for approval in approvals
-                            )
-                            if requested_human:
+                                if approval.status == "requested" and approval.approver_type == "human"
+                            ]
+                            requested_agent_approvals = [
+                                approval
+                                for approval in approvals
+                                if approval.status == "requested" and approval.approver_type == "agent"
+                            ]
+                            if requested_human_approvals:
+                                requested_human_id = requested_human_approvals[0].id
                                 msg = (
                                     f"🛑 {tag}Kanban {task_id} awaiting human approval "
-                                    f"— {title}"
+                                    f"(#{requested_human_id}) — {title}"
                                 )
                             else:
+                                requested_agent_ids = ", ".join(
+                                    f"#{approval.id}" for approval in requested_agent_approvals
+                                )
                                 msg = (
                                     f"🔎 {tag}Kanban {task_id} awaiting agent approval "
-                                    f"— {title}"
+                                    f"({requested_agent_ids}) — {title}"
                                 )
                         elif kind == "approval_decided":
                             payload = ev.payload or {}
                             approver = payload.get("approver_profile")
                             approver_tag = f"@{approver} " if approver else ""
                             decision = str(payload.get("decision") or "").lower()
+                            approval_id = payload.get("approval_id")
+                            approval_suffix = f" (#{int(approval_id)})" if approval_id is not None else ""
                             suffix = ""
                             next_status = payload.get("next_status")
                             if next_status is not None:
@@ -338,34 +350,54 @@ class GatewayKanbanWatchersMixin:
                                 approver_type = str(payload.get("approver_type") or "").lower()
                                 approved_icon = "✅" if approver_type == "human" else "☑️"
                                 msg = (
-                                    f"{approved_icon} {approver_tag}Kanban {task_id} approved — "
+                                    f"{approved_icon} {approver_tag}Kanban {task_id} approved{approval_suffix} — "
                                     f"{title}{suffix}"
                                 )
                             elif decision == "rejected":
                                 msg = (
-                                    f"⛔ {approver_tag}Kanban {task_id} rejected — "
+                                    f"⛔ {approver_tag}Kanban {task_id} rejected{approval_suffix} — "
                                     f"{title}{suffix}"
                                 )
                             elif decision == "escalated":
+                                requested_human_approval = next(
+                                    (
+                                        approval
+                                        for approval in approvals
+                                        if approval.status == "requested" and approval.approver_type == "human"
+                                    ),
+                                    None,
+                                )
+                                human_suffix = ""
+                                if approval_id is not None and requested_human_approval is not None:
+                                    human_suffix = f" (#{int(approval_id)} -> #{requested_human_approval.id})"
+                                elif approval_id is not None:
+                                    human_suffix = f" (#{int(approval_id)})"
                                 msg = (
-                                    f"🛑 {approver_tag}Kanban {task_id} requested human approval — "
+                                    f"🛑 {approver_tag}Kanban {task_id} requested human approval{human_suffix} — "
                                     f"{title}{suffix}"
                                 )
                             else:
-                                msg = (
-                                    f"🔎 {approver_tag}Kanban {task_id} approval updated — "
-                                    f"{title}{suffix}"
-                                )
+                                continue
                             comment_id = payload.get("comment_id")
                             if comment_id is not None and comment_id in comments_by_id:
-                                body = (comments_by_id[comment_id].body or "").strip()
+                                body = (comments_by_id[int(comment_id)].body or "").strip()
                                 if body:
                                     first = body.splitlines()[0][:200]
                                     msg += f"\n{first}"
                         elif kind == "approval_failed":
-                            msg = f"✖ {tag}Kanban {task_id} approval failed — {title}"
+                            payload = ev.payload or {}
+                            approver = payload.get("approver_profile")
+                            approver_tag = f"@{approver} " if approver else ""
+                            approval_id = payload.get("approval_id")
+                            approval_suffix = f" (#{int(approval_id)})" if approval_id is not None else ""
+                            msg = f"✖ {approver_tag}Kanban {task_id} approval failed{approval_suffix} — {title}"
                         elif kind == "approval_cancelled":
-                            msg = f"⏹ {tag}Kanban {task_id} approval cancelled — {title}"
+                            payload = ev.payload or {}
+                            approver = payload.get("approver_profile")
+                            approver_tag = f"@{approver} " if approver else ""
+                            approval_id = payload.get("approval_id")
+                            approval_suffix = f" (#{int(approval_id)})" if approval_id is not None else ""
+                            msg = f"⏹ {approver_tag}Kanban {task_id} approval cancelled{approval_suffix} — {title}"
                         else:
                             continue
                         metadata: dict[str, Any] = {}
