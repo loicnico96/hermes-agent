@@ -5502,7 +5502,7 @@ class GatewayRunner:
                                     f"#{approval.id}" for approval in pending_agent_approvals
                                 )
                                 msg = (
-                                    f"🔎 {tag}Kanban {task_id} awaiting agent approval "
+                                    f"⚖️ {tag}Kanban {task_id} awaiting agent approval "
                                     f"({pending_agent_ids}) — {title}{handoff}"
                                 )
                             else:
