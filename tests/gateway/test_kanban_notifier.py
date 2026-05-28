@@ -267,7 +267,12 @@ def test_notifier_formats_awaiting_human_approval(tmp_path, monkeypatch):
     try:
         conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (tid,))
         approval = approvals_db.create_task_approval(conn, task_id=tid, approver_type="human")
-        kb._append_event(conn, tid, kind="awaiting_approval", payload={"task_status": "approval"})
+        kb._append_event(
+            conn,
+            tid,
+            kind="awaiting_approval",
+            payload={"task_status": "approval", "summary": "Worker asked for a quick human pass.\nExtra detail ignored."},
+        )
     finally:
         conn.close()
 
@@ -276,8 +281,60 @@ def test_notifier_formats_awaiting_human_approval(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"🛑 @worker Kanban {tid} awaiting human approval (#{approval.id}) — Needs human eyes"
+        f"🛑 @worker Kanban {tid} awaiting human approval (#{approval.id}) — Needs human eyes\n"
+        "Worker asked for a quick human pass."
     ]
+
+
+def test_notifier_skips_awaiting_approval_if_task_is_no_longer_in_approval(tmp_path, monkeypatch):
+    db_path = tmp_path / "awaiting-stale-status.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_approval_subscription(title="Late processed human approval")
+
+    conn = kb.connect()
+    try:
+        approval = approvals_db.create_task_approval(conn, task_id=tid, approver_type="human")
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (tid,))
+        conn.execute("UPDATE task_approvals SET status = 'approved' WHERE id = ?", (approval.id,))
+        kb._append_event(conn, tid, kind="awaiting_approval", payload={"task_status": "approval"})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+
+
+def test_notifier_skips_awaiting_approval_if_no_requested_approvals_remain(tmp_path, monkeypatch):
+    db_path = tmp_path / "awaiting-no-requested.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_approval_subscription(title="Late processed stale approvals")
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (tid,))
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=tid,
+            approver_type="agent",
+            approver_profile="coder",
+        )
+        conn.execute("UPDATE task_approvals SET status = 'cancelled' WHERE id = ?", (approval.id,))
+        kb._append_event(conn, tid, kind="awaiting_approval", payload={"task_status": "approval"})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
 
 
 def test_notifier_formats_awaiting_agent_approval(tmp_path, monkeypatch):
@@ -302,7 +359,12 @@ def test_notifier_formats_awaiting_agent_approval(tmp_path, monkeypatch):
             approver_type="agent",
             approver_profile="default",
         )
-        kb._append_event(conn, tid, kind="awaiting_approval", payload={"task_status": "approval"})
+        kb._append_event(
+            conn,
+            tid,
+            kind="awaiting_approval",
+            payload={"task_status": "approval", "summary": "Worker queued both agent reviewers.\nExtra detail ignored."},
+        )
     finally:
         conn.close()
 
@@ -311,7 +373,8 @@ def test_notifier_formats_awaiting_agent_approval(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"🔎 @worker Kanban {tid} awaiting agent approval (#{approval_1.id}, #{approval_2.id}) — Needs agent eyes"
+        f"🔎 @worker Kanban {tid} awaiting agent approval (#{approval_1.id}, #{approval_2.id}) — Needs agent eyes\n"
+        "Worker queued both agent reviewers."
     ]
 
 
@@ -347,8 +410,44 @@ def test_notifier_formats_approval_decided_with_comment_and_transition(tmp_path,
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"☑️ @coder Kanban {tid} approved (#7) — Approval outcome; task moved to done\n"
+        f"✅ @coder Kanban {tid} approved (#7) — Approval outcome; task moved to done\n"
         "Looks good from agent review."
+    ]
+
+
+def test_notifier_uses_blue_checkmark_when_approval_does_not_move_task_to_done(tmp_path, monkeypatch):
+    db_path = tmp_path / "approval-decided-nonterminal.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    tid = _create_approval_subscription(title="Approval stays in review loop")
+
+    conn = kb.connect()
+    try:
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (tid,))
+        comment_id = kb.add_comment(conn, tid, "reviewer", "Approved, but another approval is still needed.")
+        kb._append_event(
+            conn,
+            tid,
+            kind="approval_decided",
+            payload={
+                "approval_id": 9,
+                "approver_type": "human",
+                "decision": "approved",
+                "comment_id": comment_id,
+                "next_status": None,
+            },
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [d["text"] for d in adapter.sent] == [
+        f"☑️ Kanban {tid} approved (#9) — Approval stays in review loop\n"
+        "Approved, but another approval is still needed."
     ]
 
 
