@@ -429,6 +429,7 @@ AUTHOR_MAP = {
     "octavio.turra@gmail.com": "octavioturra",
     "275877312+ryo-solo@users.noreply.github.com": "ryo-solo",
     "524706+Twanislas@users.noreply.github.com": "Twanislas",
+    "loicnico96@gmail.com": "loicnico96",
     "9592417+adam91holt@users.noreply.github.com": "adam91holt",
     "kchuang1015@users.noreply.github.com": "kchuang1015",
     "maheshthedev@gmail.com": "MaheshtheDev",

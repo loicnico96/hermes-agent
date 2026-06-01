@@ -706,9 +706,12 @@ here; full developer notes live in `AGENTS.md`, user-facing docs under
 
 Spawn a subagent with an isolated context + terminal session.
 
-- **Single:** `delegate_task(goal, context)`.
-- **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
+- **Single:** `delegate_task(goal, context, tier=...)`.
+- **Batch:** `delegate_task(tasks=[{goal, ...}, ...], tier=...)` runs children in
   parallel, capped by `delegation.max_concurrent_children` (default 3).
+- **Tier routing:** top-level `tier` is bounded to `small`, `medium`, or `large`,
+  with `medium` being the default. This determines which delegation routing
+  tier/model class is used.
 - **Background:** `delegate_task(background=true)` returns a handle
   immediately and keeps the parent loop going; the child's result
   re-enters the conversation as a new turn when it finishes.
@@ -719,7 +722,8 @@ Spawn a subagent with an isolated context + terminal session.
   the process, use `cronjob` or
   `terminal(background=True, notify_on_complete=True)`.
 
-Config: `delegation.*` in `config.yaml`.
+Config: `delegation.*` in `config.yaml`, plus optional `delegation_small.*`
+and `delegation_large.*` routing blocks.
 
 ### Cron (scheduled jobs)
 
