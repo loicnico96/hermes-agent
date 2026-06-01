@@ -1828,6 +1828,7 @@ AUTHOR_MAP = {
     "andrew@hndl.app": "andrewhomeyer",  # PR #20056 (snapshot owner-only perms, co-author on #57386 salvage)
     "edison@mcclean.codes": "McClean-Edison",  # PR #29817 (register_auxiliary_task plugin API)
     "OYLFLMH@users.noreply.github.com": "OYLFLMH",  # PR #48312 salvage (cli_refresh_interval config, #48309)
+    "loicnico96@gmail.com": "loicnico96",
     "zhangsamuel12@gmail.com": "SamuelZ12",  # PR #7480 (show recap after in-session resume)
     "490408354@qq.com": "daizhonggeng",  # PR #9020 (numbered /resume selection)
     "claw@openclaw.ai": "wanwan2qq",  # PR #10215 (strip brackets/quotes from /resume; gateway session-ID lookup)
