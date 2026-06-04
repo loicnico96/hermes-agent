@@ -64,6 +64,7 @@ def _unseen_terminal_events(tid):
             platform="telegram",
             chat_id="chat-1",
             kinds=[
+                "spawned",
                 "completed",
                 "blocked",
                 "gave_up",
@@ -124,6 +125,30 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+def test_kanban_notifier_sends_spawned_event(tmp_path, monkeypatch):
+    db_path = tmp_path / "spawned-notify.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="notify spawn", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.claim_task(conn, tid)
+        kb._set_worker_pid(conn, tid, 98765)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [d["text"] for d in adapter.sent] == [
+        f"▶ @worker Kanban {tid} started — notify spawn (pid 98765)"
+    ]
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):

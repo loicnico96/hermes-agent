@@ -5179,9 +5179,10 @@ class GatewayRunner:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
-        stored cursor with kind in the terminal set (``completed``,
-        ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
-        message per new event to ``(platform, chat_id, thread_id)``,
+        stored cursor with kind in the notification set (``spawned``,
+        ``completed``, ``blocked``, ``gave_up``, ``crashed``,
+        ``timed_out``). Sends one message per new event to
+        ``(platform, chat_id, thread_id)``,
         then advances the cursor. When a task reaches a terminal state
         (``completed`` / ``archived``), the subscription is removed.
 
@@ -5227,6 +5228,7 @@ class GatewayRunner:
             return
 
         NOTIFICATION_EVENT_KINDS = (
+            "spawned",
             "completed",
             "blocked",
             "gave_up",
@@ -5427,7 +5429,16 @@ class GatewayRunner:
                                     return f"\n{first_line}"
                             return ""
 
-                        if kind == "completed":
+                        if kind == "spawned":
+                            pid = None
+                            if ev.payload and ev.payload.get("pid") is not None:
+                                pid = int(ev.payload["pid"])
+                            pid_suffix = f" (pid {pid})" if pid is not None else ""
+                            msg = (
+                                f"▶ {tag}Kanban {task_id} started"
+                                f" — {title}{pid_suffix}"
+                            )
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
