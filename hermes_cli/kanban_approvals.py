@@ -115,7 +115,7 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
     if approver_type == "human" and getattr(args, "skill", None):
         raise ValueError("--skill is only valid with --agent")
 
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         approval = approvals_db.create_task_approval(
             conn,
             task_id=args.task_id,
@@ -135,7 +135,7 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_list(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         task_id = getattr(args, "task", None)
         if task_id is not None and kb.get_task(conn, task_id) is None:
             print(f"no such task: {task_id}", file=sys.stderr)
@@ -162,7 +162,7 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_remove(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         approval = approvals_db.remove_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
 
@@ -177,7 +177,7 @@ def _cmd_approval_remove(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         aggregate_status = approvals_db.record_manual_task_approval_decision(
             conn,
             approval_id=args.approval_id,
@@ -202,7 +202,7 @@ def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
 
 
 def _cmd_approval_reset(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         approval = approvals_db.reset_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
 
@@ -217,7 +217,7 @@ def _cmd_approval_reset(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_reclaim(args: argparse.Namespace) -> int:
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         approval = approvals_db.reclaim_task_approval(conn, args.approval_id)
         payload = _approval_mutation_payload(conn, approval)
 

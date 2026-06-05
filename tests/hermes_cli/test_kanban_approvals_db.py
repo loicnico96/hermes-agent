@@ -514,6 +514,103 @@ def test_task_approval_runtime_helpers_require_matching_run_id(kanban_home):
     assert [row["kind"] for row in event_rows] == ["created", "approval_requested", "approval_claimed"]
 
 
+def test_set_task_approval_worker_pid_rolls_back_if_run_row_disappears(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(
+            conn,
+            approval.id,
+            ttl_seconds=60,
+            claimer="dispatcher:55",
+            now=500,
+        )
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+
+        conn.execute("DELETE FROM task_approval_runs WHERE id = ?", (claimed.current_run_id,))
+
+        with pytest.raises(RuntimeError, match="lost sync while recording approval worker pid"):
+            approvals_db.set_task_approval_worker_pid(
+                conn,
+                approval.id,
+                4321,
+                run_id=claimed.current_run_id,
+            )
+
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+        event_rows = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+
+    assert refreshed is not None
+    assert refreshed.worker_pid is None
+    assert [row["kind"] for row in event_rows] == ["created", "approval_requested", "approval_claimed"]
+
+
+def test_record_task_approval_failure_rolls_back_if_approval_row_is_stale(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval target", assignee="ops")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        run = approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'requested',
+                   current_run_id = ?,
+                   claim_lock = ?,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (run.id, "lease-1", 8_900, approval.id),
+        )
+
+        with pytest.raises(RuntimeError, match="lost sync while recording approval failure"):
+            approvals_db.record_task_approval_failure(
+                conn,
+                approval_id=approval.id,
+                expected_run_id=run.id,
+                outcome="failed",
+                error="boom",
+                now=9_000,
+            )
+
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, ended_at, outcome, error FROM task_approval_runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
+        event_rows = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id == run.id
+    assert run_row is not None
+    assert run_row["status"] == "running"
+    assert run_row["ended_at"] is None
+    assert run_row["outcome"] is None
+    assert run_row["error"] is None
+    assert [row["kind"] for row in event_rows] == ["created", "approval_requested"]
+
+
 def test_list_task_approval_runs_filters_by_task_and_approval(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval target")

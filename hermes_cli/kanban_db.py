@@ -4690,7 +4690,6 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         deleted = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if deleted.rowcount != 1:
             return False
-        approvals_db.reclaim_running_task_approvals_in_txn(conn, task_id)
         _delete_task_owned_rows(conn, task_id)
     recompute_ready(conn)
     return True

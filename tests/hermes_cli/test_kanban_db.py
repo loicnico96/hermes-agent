@@ -1866,7 +1866,7 @@ def test_archive_task_reclaims_running_approval_and_preserves_other_decision(kan
 
 
 
-def test_delete_task_reclaims_running_task_approvals_before_deleting(kanban_home, monkeypatch):
+def test_delete_task_removes_running_task_approval_rows_without_reclaiming(kanban_home, monkeypatch):
     killed: list[tuple[int, object]] = []
 
     def fake_terminate(pid, claim_lock, *, signal_fn=None):
@@ -1897,8 +1897,10 @@ def test_delete_task_reclaims_running_task_approvals_before_deleting(kanban_home
 
         assert kb.delete_task(conn, task_id) is True
         assert kb.get_task(conn, task_id) is None
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE task_id = ?", (task_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE task_id = ?", (task_id,)).fetchone()[0] == 0
 
-    assert killed == [(1357, claimed.claim_lock)]
+    assert killed == []
 
 
 def test_delete_archived_task_removes_related_rows(kanban_home):

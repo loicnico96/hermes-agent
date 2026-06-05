@@ -593,6 +593,13 @@ def claim_task_approval(
         return claimed
 
 
+def _raise_approval_run_sync_error(*, approval_id: int, run_id: int, context: str) -> None:
+    """Abort the surrounding write_txn when approval/run rows drift mid-update."""
+    raise RuntimeError(
+        f"approval {approval_id} run {run_id} lost sync while {context}"
+    )
+
+
 def heartbeat_task_approval(
     conn: sqlite3.Connection,
     approval_id: int,
@@ -641,7 +648,11 @@ def heartbeat_task_approval(
             (effective_now, claim_expires, run_id, int(approval_id)),
         )
         if run_cur.rowcount != 1:
-            return False
+            _raise_approval_run_sync_error(
+                approval_id=int(approval_id),
+                run_id=run_id,
+                context="recording approval heartbeat",
+            )
 
         approval = get_task_approval(conn, approval_id)
         assert approval is not None
@@ -691,7 +702,11 @@ def set_task_approval_worker_pid(
             (int(pid), run_id, int(approval_id)),
         )
         if run_cur.rowcount != 1:
-            return False
+            _raise_approval_run_sync_error(
+                approval_id=int(approval_id),
+                run_id=run_id,
+                context="recording approval worker pid",
+            )
 
         approval = get_task_approval(conn, approval_id)
         assert approval is not None
@@ -1354,7 +1369,11 @@ def record_task_approval_failure(
             ),
         )
         if approval_cur.rowcount != 1:
-            return None
+            _raise_approval_run_sync_error(
+                approval_id=int(approval_id),
+                run_id=int(expected_run_id),
+                context="recording approval failure",
+            )
 
         if next_status == "failed":
             _ensure_requested_human_approval(conn, approval.task_id, now=effective_now)
@@ -1464,7 +1483,11 @@ def record_task_approval_decision(
             ),
         )
         if run_cur.rowcount != 1:
-            return None
+            _raise_approval_run_sync_error(
+                approval_id=int(approval_id),
+                run_id=int(expected_run_id),
+                context="recording approval decision",
+            )
 
         return aggregate_status
 
