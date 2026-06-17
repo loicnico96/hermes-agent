@@ -1209,7 +1209,8 @@ def test_complete_task_with_approvals_resets_rows_and_enters_approval(
     [
         ([{"type": "human", "status": "rejected"}, {"type": "agent", "status": "running"}], "todo"),
         ([{"type": "human", "status": "approved"}, {"type": "agent", "status": "rejected"}], "done"),
-        ([{"type": "human", "status": "requested"}, {"type": "agent", "status": "rejected"}], "approval"),
+        ([{"type": "human", "status": "requested"}, {"type": "agent", "status": "rejected"}], "todo"),
+        ([{"type": "human", "status": "requested"}, {"type": "agent", "status": "escalated"}], "approval"),
         ([{"type": "agent", "status": "running"}, {"type": "agent", "status": "rejected"}], "approval"),
         ([{"type": "agent", "status": "rejected"}, {"type": "agent", "status": "requested"}], "todo"),
         ([{"type": "agent", "status": "requested"}, {"type": "agent", "status": "approved"}], "approval"),

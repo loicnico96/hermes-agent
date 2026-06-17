@@ -1024,19 +1024,23 @@ def compute_task_approval_aggregate_status(
 ) -> str:
     humans = [approval for approval in approvals if approval.approver_type == "human"]
 
+    # Explicit human approval/rejection takes full precedence over any agent rows
     if any(approval.status == "rejected" for approval in humans):
         return "todo"
     if any(approval.status == "approved" for approval in humans):
         return "done"
-    if humans:
+    # If an agent escalated, human decision is required before proceeding
+    if any(approval.status == "escalated" for approval in approvals):
         return "approval"
-
+    # Let running agents terminate before proceeding (they may contribute additional feedback)
     if any(approval.status == "running" for approval in approvals):
         return "approval"
+    # Any rejection causes the task to re-run
     if any(approval.status == "rejected" for approval in approvals):
         return "todo"
     if any(approval.status == "requested" for approval in approvals):
         return "approval"
+    # If no outstanding approvals, move to done
     return "done"
 
 
