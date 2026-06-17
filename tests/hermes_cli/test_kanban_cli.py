@@ -226,7 +226,7 @@ def test_cmd_dispatch_uses_max_approvers_flag_over_config(monkeypatch):
             return False
 
     monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approvers': 7}})
-    monkeypatch.setattr(kb, 'connect', lambda: DummyConn())
+    monkeypatch.setattr(kb, 'connect_closing', lambda *args, **kwargs: DummyConn())
 
     class Result:
         reclaimed = 0
@@ -239,6 +239,8 @@ def test_cmd_dispatch_uses_max_approvers_flag_over_config(monkeypatch):
         approval_spawned = []
         skipped_unassigned = []
         skipped_nonspawnable = []
+        skipped_per_profile_capped = []
+        auto_assigned_default = []
 
     def fake_dispatch_once(conn, **kwargs):
         calls.update(kwargs)
@@ -262,7 +264,7 @@ def test_cmd_dispatch_max_approvers_falls_back_to_config(monkeypatch):
             return False
 
     monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approvers': 4}})
-    monkeypatch.setattr(kb, 'connect', lambda: DummyConn())
+    monkeypatch.setattr(kb, 'connect_closing', lambda *args, **kwargs: DummyConn())
 
     class Result:
         reclaimed = 0
@@ -275,6 +277,8 @@ def test_cmd_dispatch_max_approvers_falls_back_to_config(monkeypatch):
         approval_spawned = []
         skipped_unassigned = []
         skipped_nonspawnable = []
+        skipped_per_profile_capped = []
+        auto_assigned_default = []
 
     def fake_dispatch_once(conn, **kwargs):
         calls.update(kwargs)
