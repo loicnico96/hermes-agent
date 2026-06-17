@@ -87,10 +87,12 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
+
+import hermes_cli.kanban_approvals_db as approvals_db
 
 _log = logging.getLogger(__name__)
 
@@ -99,7 +101,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "approval", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -169,6 +171,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
 # ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` to raise the default claim window for
 # long single-call MCP workflows.
 DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+DEFAULT_MAX_CONCURRENT_APPROVERS = 2
 
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
@@ -1247,6 +1250,42 @@ CREATE TABLE IF NOT EXISTS task_attachments (
     created_at   INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS task_approvals (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id              TEXT NOT NULL,
+    approver_type        TEXT NOT NULL,
+    approver_profile     TEXT,
+    approver_skill       TEXT,
+    status               TEXT NOT NULL,
+    comment_id           INTEGER,
+    claim_lock           TEXT,
+    claim_expires        INTEGER,
+    worker_pid           INTEGER,
+    last_heartbeat_at    INTEGER,
+    current_run_id       INTEGER,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_failure_error   TEXT,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_approval_runs (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_id       INTEGER NOT NULL,
+    task_id           TEXT NOT NULL,
+    profile           TEXT,
+    status            TEXT NOT NULL,
+    claim_lock        TEXT,
+    claim_expires     INTEGER,
+    worker_pid        INTEGER,
+    last_heartbeat_at INTEGER,
+    started_at        INTEGER NOT NULL,
+    ended_at          INTEGER,
+    outcome           TEXT,
+    comment_id        INTEGER,
+    error             TEXT
+);
+
 -- Subscription from a gateway source (platform + chat + thread) to a
 -- task. The gateway's kanban-notifier watcher tails task_events and
 -- pushes ``completed`` / ``blocked`` / ``spawn_auto_blocked`` events to
@@ -1272,6 +1311,10 @@ CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, cre
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_approvals_task_status ON task_approvals(task_id, status);
+CREATE INDEX IF NOT EXISTS idx_approvals_claimable   ON task_approvals(status, approver_type, claim_lock);
+CREATE INDEX IF NOT EXISTS idx_approval_runs         ON task_approval_runs(approval_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_approval_runs_task    ON task_approval_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
 
@@ -2773,6 +2816,13 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+def _normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
@@ -2919,26 +2969,41 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # Comments & events
 # ---------------------------------------------------------------------------
 
-def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+def _insert_task_comment(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    author: str,
+    body: str,
+    now: Optional[int] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
-    now = int(time.time())
+
+    effective_now = int(time.time()) if now is None else int(now)
+    if not conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone():
+        raise ValueError(f"unknown task {task_id}")
+
+    normalized_author = author.strip()
+    normalized_body = body.strip()
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, normalized_author, normalized_body, effective_now),
+    )
+    _append_event(conn, task_id, "commented", {"author": normalized_author, "len": len(normalized_body)})
+    return int(cur.lastrowid or 0)
+
+
+def add_comment(
+    conn: sqlite3.Connection, task_id: str, author: str, body: str
+) -> int:
     with write_txn(conn):
-        if not conn.execute(
-            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone():
-            raise ValueError(f"unknown task {task_id}")
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
-        )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        return _insert_task_comment(conn, task_id=task_id, author=author, body=body)
 
 
 def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
@@ -4043,11 +4108,16 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        # Successful worker completion owns the fresh-result reset boundary.
+        # If approvals are attached, the new task result must enter a fresh
+        # approval cycle instead of reusing stale approval state.
+        next_status = "approval" if approvals_db.list_task_approvals(conn, task_id) else "done"
+
         if expected_run_id is None:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -4058,13 +4128,13 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (next_status, result, now, task_id),
             )
         else:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
+                   SET status       = ?,
                        result       = ?,
                        completed_at = ?,
                        claim_lock   = NULL,
@@ -4076,10 +4146,12 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (next_status, result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
+        if next_status == "approval":
+            approvals_db.reset_task_approvals_in_txn(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -4103,12 +4175,14 @@ def complete_task(
         # full summary stays on the run row.
         ev_summary = (summary if summary is not None else result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
-        completed_payload: dict = {
+        event_kind = "awaiting_approval" if next_status == "approval" else "completed"
+        event_payload = {
             "result_len": len(result) if result else 0,
             "summary": ev_summary or None,
+            "task_status": next_status,
         }
         if verified_cards:
-            completed_payload["verified_cards"] = verified_cards
+            event_payload["verified_cards"] = verified_cards
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -4122,10 +4196,12 @@ def complete_task(
                     str(p).strip() for p in md_artifacts if isinstance(p, str) and str(p).strip()
                 ]
                 if cleaned_artifacts:
-                    completed_payload["artifacts"] = cleaned_artifacts
+                    event_payload["artifacts"] = cleaned_artifacts
         _append_event(
-            conn, task_id, "completed",
-            completed_payload,
+            conn,
+            task_id,
+            event_kind,
+            event_payload,
             run_id=run_id,
         )
     # Prose-scan the summary + result for t_<hex> references that do
@@ -4837,7 +4913,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT status, current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
         if stale and stale["current_run_id"]:
@@ -5206,6 +5282,7 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        approvals_db.reclaim_running_task_approvals_in_txn(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -5244,37 +5321,41 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
-        conn.execute(
-            "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
-            (task_id, task_id),
-        )
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        _delete_task_owned_rows(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
+
+
+def _delete_task_owned_rows(conn: sqlite3.Connection, task_id: str) -> None:
+    """Delete every child row owned by ``task_id`` inside an open txn."""
+    conn.execute(
+        "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
+        (task_id, task_id),
+    )
+    conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_approvals WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM task_approval_runs WHERE task_id = ?", (task_id,))
+    conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and cascade to all related rows.
 
     Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
+    we explicitly delete the task row and its child tables inside one
+    ``write_txn``.
 
     Returns ``True`` if the task existed and was deleted, ``False``
     if the task was not found.
     """
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
+        deleted = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        if deleted.rowcount != 1:
             return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        approvals_db.reclaim_running_task_approvals_in_txn(conn, task_id)
+        _delete_task_owned_rows(conn, task_id)
     recompute_ready(conn)
     return True
 
@@ -5727,6 +5808,8 @@ class DispatchResult:
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed because no progress (heartbeat) was seen
     within ``dispatch_stale_timeout_seconds``."""
+    approval_spawned: list[tuple[int, str, str]] = field(default_factory=list)
+    """List of ``(approval_id, approver_profile, task_id)`` triples."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """Tasks skipped by the respawn guard, as ``(task_id, reason)`` pairs.
 
@@ -6817,9 +6900,15 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         ticks of recovery first.
 
     ``"recent_success"``
-        A completed run exists within ``_RESPAWN_GUARD_SUCCESS_WINDOW``
-        seconds.  Useful work already succeeded for this task; wait for
-        human review rather than immediately re-spawning.
+        A task-level ``completed`` event exists within
+        ``_RESPAWN_GUARD_SUCCESS_WINDOW`` seconds. Useful work already
+        succeeded for this task; wait for human review rather than
+        immediately re-spawning. This intentionally keys off the task
+        event log rather than ``task_runs.outcome='completed'`` because
+        approval handoff closes the worker run as completed while the
+        task lifecycle is still only at ``awaiting_approval`` until the
+        final approval replay emits a true task-level ``completed``
+        event.
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
@@ -6882,11 +6971,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
-    # 3. Completed run within guard window — proof of recent success.
+    now = int(time.time())
+
+    # 2. Recent task-level completed event — proof of recent success.
+    # Do NOT key this off ``task_runs.outcome='completed'``: approval
+    # handoff closes the worker run as completed before the task is truly
+    # finalized, so a run-level check would incorrectly suppress retries
+    # while the task is only in ``awaiting_approval``.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     if conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'completed' AND ended_at >= ?",
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'completed' AND created_at >= ?",
         (task_id, cutoff),
     ).fetchone():
         return "recent_success"
@@ -6961,13 +7056,21 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def has_spawnable_approvals(conn: sqlite3.Connection) -> bool:
+    """Return True iff at least one runnable agent approval is spawnable."""
+    rows = approvals_db.list_runnable_task_approvals(conn, limit=50)
+    return any(bool(row.approver_profile) for row in rows)
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    approval_spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_approvers: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -6999,9 +7102,11 @@ def dispatch_once(
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            approval_spawn_fn=approval_spawn_fn,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
+            max_approvers=max_approvers,
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
@@ -7015,9 +7120,11 @@ def dispatch_once(
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            approval_spawn_fn=approval_spawn_fn,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
+            max_approvers=max_approvers,
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
@@ -7031,9 +7138,11 @@ def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    approval_spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_approvers: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -7048,10 +7157,14 @@ def _dispatch_once_locked(
       2. Reclaim stale running tasks (no recent heartbeat).
       3. Reclaim crashed running tasks (host-local PID no longer alive).
       3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      4. For each ready/review task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
+      5. For each runnable approval row, atomically claim and call
+         ``approval_spawn_fn(approval, workspace_path, board) -> Optional[int]``.
+         The return value (if any) is recorded on both the live approval row
+         and its current ``task_approval_runs`` row.
 
     Spawn failures are counted per-task. After ``failure_limit`` consecutive
     failures the task is auto-blocked with the last error as its reason —
@@ -7065,7 +7178,8 @@ def _dispatch_once_locked(
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
 
-    ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
+    ``spawn_fn`` defaults to ``_default_spawn`` and ``approval_spawn_fn``
+    defaults to ``_spawn_approval_worker``. Tests pass stubs.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
@@ -7075,9 +7189,11 @@ def _dispatch_once_locked(
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
+    release_stale_approval_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
+    detect_crashed_approval_workers(conn, board=board)
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
@@ -7096,6 +7212,7 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    enforce_approval_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -7127,11 +7244,15 @@ def _dispatch_once_locked(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
-            return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+            # Do not early-return here: max_in_progress is only a worker gate,
+            # and later unrelated dispatch work (such as spawning approvers)
+            # should still run this tick.
+            max_spawn = 0
+        else:
+            # Only spawn enough to reach the cap, respecting max_spawn too.
+            remaining = max_in_progress - in_progress
+            if max_spawn is None or max_spawn > remaining:
+                max_spawn = remaining
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -7426,6 +7547,91 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+
+    running_approval_count = 0
+    if max_approvers is not None:
+        running_approval_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM task_approvals WHERE status = 'running'"
+            ).fetchone()[0]
+        )
+
+    approval_spawned = 0
+    approval_rows = approvals_db.list_runnable_task_approvals(conn)
+    for approval in approval_rows:
+        if (
+            max_approvers is not None
+            and running_approval_count + approval_spawned >= max_approvers
+        ):
+            break
+        if dry_run:
+            result.approval_spawned.append(
+                (approval.id, approval.approver_profile or "", approval.task_id)
+            )
+            continue
+        claimed_approval = approvals_db.claim_task_approval(
+            conn,
+            approval.id,
+            ttl_seconds=ttl_seconds,
+        )
+        if claimed_approval is None:
+            continue
+        task = get_task(conn, claimed_approval.task_id)
+        if task is None:
+            _record_approval_runtime_failure(
+                conn,
+                claimed_approval.id,
+                error=f"task {claimed_approval.task_id} disappeared before spawn",
+                outcome="spawn_failed",
+            )
+            continue
+        try:
+            workspace = resolve_workspace(task, board=board)
+        except Exception as exc:
+            _record_approval_runtime_failure(
+                conn,
+                claimed_approval.id,
+                error=f"workspace: {exc}",
+                outcome="spawn_failed",
+            )
+            continue
+        set_workspace_path(conn, task.id, str(workspace))
+        _spawn_approval = (
+            approval_spawn_fn if approval_spawn_fn is not None else _spawn_approval_worker
+        )
+        try:
+            import inspect
+            try:
+                sig = inspect.signature(_spawn_approval)
+                if "board" in sig.parameters:
+                    pid = _spawn_approval(claimed_approval, str(workspace), board=board)
+                else:
+                    pid = _spawn_approval(claimed_approval, str(workspace))
+            except (TypeError, ValueError):
+                pid = _spawn_approval(claimed_approval, str(workspace))
+            if pid:
+                run_id = claimed_approval.current_run_id
+                if run_id is None:
+                    raise RuntimeError(
+                        f"approval {claimed_approval.id} missing current_run_id after claim"
+                    )
+                approvals_db.set_task_approval_worker_pid(
+                    conn,
+                    claimed_approval.id,
+                    int(pid),
+                    run_id=run_id,
+                )
+            result.approval_spawned.append(
+                (claimed_approval.id, claimed_approval.approver_profile or "", claimed_approval.task_id)
+            )
+            approval_spawned += 1
+        except Exception as exc:
+            _record_approval_runtime_failure(
+                conn,
+                claimed_approval.id,
+                error=str(exc),
+                outcome="spawn_failed",
+            )
     return result
 
 
@@ -7435,6 +7641,13 @@ def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= minimum else default
+
+
+def get_max_approvers(kanban_cfg, *, override: Optional[str] = None) -> int:
+    raw = override if override is not None else (kanban_cfg or {}).get(
+        "max_approvers", DEFAULT_MAX_CONCURRENT_APPROVERS
+    )
+    return _positive_int(raw, DEFAULT_MAX_CONCURRENT_APPROVERS)
 
 
 def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
@@ -7627,6 +7840,50 @@ def _resolve_hermes_argv() -> list[str]:
     return _module_hermes_argv()
 
 
+def _skill_available(skill_name: str, hermes_home: Optional[str]) -> bool:
+    """True if ``skill_name`` resolves for the home the spawned worker uses.
+
+    Preloading an unknown skill is fatal at CLI startup. Dispatcher-side spawn
+    helpers therefore gate optional default skills on actual resolvability under
+    the target profile's ``HERMES_HOME``.
+    """
+    from pathlib import Path as _Path
+
+    base = _Path(hermes_home) if hermes_home else (_Path.home() / ".hermes")
+    skills_root = base / "skills"
+    if not skills_root.is_dir():
+        return False
+    canonical = skills_root / "devops" / skill_name / "SKILL.md"
+    if canonical.is_file():
+        return True
+    try:
+        for skill_md in skills_root.rglob(f"{skill_name}/SKILL.md"):
+            if skill_md.is_file():
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _kanban_worker_skill_available(hermes_home: Optional[str]) -> bool:
+    """True if the bundled ``kanban-worker`` skill resolves for the target home."""
+    return _skill_available("kanban-worker", hermes_home)
+
+
+KANBAN_APPROVER_DEFAULT_SKILL = "kanban-approver"
+
+
+def _approval_worker_skill_names(
+    approval: Approval,
+    *,
+    hermes_home: Optional[str],
+) -> list[str]:
+    if approval.approver_skill:
+        return [approval.approver_skill]
+    if _skill_available(KANBAN_APPROVER_DEFAULT_SKILL, hermes_home):
+        return [KANBAN_APPROVER_DEFAULT_SKILL]
+    return []
+
 def _worker_terminal_timeout_env(
     max_runtime_seconds: Optional[int],
     current_timeout: Optional[str],
@@ -7719,6 +7976,8 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    env.pop("HERMES_KANBAN_APPROVAL_ID", None)
+    env.pop("HERMES_KANBAN_APPROVAL_RUN_ID", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -7864,6 +8123,273 @@ def _default_spawn(
     return proc.pid
 
 
+def _record_approval_runtime_failure(
+    conn: sqlite3.Connection,
+    approval_id: int,
+    *,
+    error: str,
+    outcome: str,
+) -> None:
+    """Mark an in-flight approval attempt failed through shared DB helpers."""
+    approval = approvals_db.get_task_approval(conn, approval_id)
+    if approval is None or approval.current_run_id is None:
+        return
+    approvals_db.record_task_approval_failure(
+        conn,
+        approval_id=approval_id,
+        expected_run_id=int(approval.current_run_id),
+        outcome=outcome,
+        error=error,
+    )
+
+
+def _approval_log_path(approval_id: int, *, board: Optional[str] = None) -> Path:
+    return worker_logs_dir(board=board) / f"approval-{int(approval_id)}.log"
+
+
+def detect_crashed_approval_workers(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[int]:
+    """Handle exited approval workers.
+
+    Clean exits are treated as decision delivery attempts: the dispatcher reads
+    the final log line, parses the structured response, and applies it through
+    the kernel-owned approval helpers. Non-zero exits, signals, and malformed
+    structured output are recorded as approval failures.
+    """
+    failed: list[int] = []
+    rows = conn.execute(
+        """
+        SELECT id, task_id, approver_profile, worker_pid, claim_lock, current_run_id
+          FROM task_approvals
+         WHERE status = 'running'
+           AND worker_pid IS NOT NULL
+           AND current_run_id IS NOT NULL
+        """
+    ).fetchall()
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        pid = int(row["worker_pid"])
+        if _pid_alive(pid):
+            continue
+
+        approval_id = int(row["id"])
+        run_id = int(row["current_run_id"])
+        kind, code = _classify_worker_exit(pid)
+        if kind == "clean_exit":
+            approvals_db.record_task_approval_failure(
+                conn,
+                approval_id=approval_id,
+                expected_run_id=run_id,
+                outcome="failed",
+                error=(
+                    "approval worker exited cleanly (rc=0) without calling "
+                    "kanban_approval — protocol violation"
+                ),
+            )
+            failed.append(approval_id)
+            continue
+
+        if kind == "nonzero_exit":
+            error_text = f"pid {pid} exited with code {code}"
+        elif kind == "signaled":
+            error_text = f"pid {pid} killed by signal {code}"
+        else:
+            error_text = f"pid {pid} not alive"
+        approvals_db.record_task_approval_failure(
+            conn,
+            approval_id=approval_id,
+            expected_run_id=run_id,
+            outcome="crashed",
+            error=error_text,
+        )
+        failed.append(approval_id)
+    return failed
+
+
+def release_stale_approval_claims(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> int:
+    now = int(time.time())
+    reclaimed = 0
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        """
+        SELECT id, worker_pid, claim_lock, claim_expires, current_run_id
+          FROM task_approvals
+         WHERE status = 'running'
+           AND claim_expires IS NOT NULL
+           AND current_run_id IS NOT NULL
+           AND claim_expires < ?
+        """,
+        (now,),
+    ).fetchall()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        host_local = lock.startswith(host_prefix)
+        pid = row["worker_pid"]
+        if host_local and pid and _pid_alive(pid):
+            new_expires = now + _resolve_claim_ttl_seconds()
+            with write_txn(conn):
+                cur = conn.execute(
+                    """
+                    UPDATE task_approvals
+                       SET claim_expires = ?
+                     WHERE id = ?
+                       AND status = 'running'
+                       AND claim_lock IS ?
+                       AND claim_expires IS NOT NULL
+                       AND claim_expires < ?
+                    """,
+                    (new_expires, int(row["id"]), row["claim_lock"], now),
+                )
+                if cur.rowcount != 1:
+                    continue
+                conn.execute(
+                    "UPDATE task_approval_runs SET claim_expires = ? WHERE id = ?",
+                    (new_expires, int(row["current_run_id"])),
+                )
+            continue
+
+        _terminate_reclaimed_worker(pid, row["claim_lock"], signal_fn=signal_fn)
+        result = approvals_db.record_task_approval_failure(
+            conn,
+            approval_id=int(row["id"]),
+            expected_run_id=int(row["current_run_id"]),
+            outcome="reclaimed",
+            error=f"stale approval claim lock={row['claim_lock']}",
+        )
+        if result is not None:
+            reclaimed += 1
+    return reclaimed
+
+
+def enforce_approval_max_runtime(
+    conn: sqlite3.Connection,
+    *,
+    signal_fn=None,
+) -> list[int]:
+    import signal
+
+    timed_out: list[int] = []
+    now = int(time.time())
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    rows = conn.execute(
+        """
+        SELECT a.id, a.task_id, a.worker_pid, a.claim_lock, a.current_run_id,
+               COALESCE(r.started_at, a.updated_at) AS active_started_at,
+               t.max_runtime_seconds
+          FROM task_approvals a
+          JOIN tasks t ON t.id = a.task_id
+          LEFT JOIN task_approval_runs r ON r.id = a.current_run_id
+         WHERE a.status = 'running'
+           AND a.worker_pid IS NOT NULL
+           AND a.current_run_id IS NOT NULL
+           AND t.max_runtime_seconds IS NOT NULL
+        """
+    ).fetchall()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        elapsed = now - int(row["active_started_at"])
+        limit = int(row["max_runtime_seconds"])
+        if elapsed < limit:
+            continue
+
+        pid = int(row["worker_pid"])
+        kill = signal_fn if signal_fn is not None else (os.kill if hasattr(os, "kill") else None)
+        if kill is not None:
+            try:
+                kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+        result = approvals_db.record_task_approval_failure(
+            conn,
+            approval_id=int(row["id"]),
+            expected_run_id=int(row["current_run_id"]),
+            outcome="timed_out",
+            error=f"elapsed {elapsed}s > limit {limit}s",
+        )
+        if result is not None:
+            timed_out.append(int(row["id"]))
+    return timed_out
+
+
+def _spawn_approval_worker(
+    approval: Approval,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[int]:
+    """Spawn a one-shot approval worker bound to a single approval row."""
+    import subprocess
+    if not approval.approver_profile:
+        raise ValueError(f"approval {approval.id} has no approver_profile")
+
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    prompt = f"review kanban task {approval.task_id}"
+
+    profile_arg = normalize_profile_name(approval.approver_profile)
+    env = dict(os.environ)
+    env.pop("HERMES_KANBAN_RUN_ID", None)
+    env.pop("HERMES_KANBAN_CLAIM_LOCK", None)
+    env["HERMES_KANBAN_APPROVAL_ID"] = str(approval.id)
+    env["HERMES_KANBAN_TASK"] = approval.task_id
+    if approval.current_run_id is not None:
+        env["HERMES_KANBAN_APPROVAL_RUN_ID"] = str(approval.current_run_id)
+    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_BOARD"] = _normalize_board_slug(board) or get_current_board()
+    env["HERMES_PROFILE"] = profile_arg
+    try:
+        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        pass
+
+    cmd = [*_resolve_hermes_argv(), "-p", profile_arg, "--accept-hooks"]
+    for skill_name in _approval_worker_skill_names(
+        approval,
+        hermes_home=env.get("HERMES_HOME"),
+    ):
+        cmd.extend(["--skills", skill_name])
+    cmd.extend(["chat", "-q", prompt])
+
+    log_dir = worker_logs_dir(board=board)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"approval-{approval.id}.log"
+    rotate_bytes, backup_count = worker_log_rotation_config()
+    _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    log_f = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=workspace if os.path.isdir(workspace) else None,
+            stdin=subprocess.DEVNULL,
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+    except FileNotFoundError:
+        log_f.close()
+        raise RuntimeError(
+            "`hermes` executable not found on PATH. "
+            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+        )
+    return proc.pid
+
+
 # ---------------------------------------------------------------------------
 # Long-lived dispatcher daemon
 # ---------------------------------------------------------------------------
@@ -7872,6 +8398,7 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
+    max_approvers: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
@@ -7909,6 +8436,7 @@ def run_daemon(
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
+                    max_approvers=max_approvers,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:

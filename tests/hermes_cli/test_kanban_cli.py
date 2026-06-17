@@ -10,8 +10,13 @@ from pathlib import Path
 
 import pytest
 
+from hermes_cli import kanban_approvals_db as approvals_db
+from hermes_cli import kanban_db as kb
+
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_approvals_db as approvals_db
+from hermes_cli import config as config_mod
 
 
 @pytest.fixture
@@ -139,6 +144,43 @@ def test_run_slash_show_includes_comments(kanban_home):
     assert "performance section" in show
 
 
+def test_run_slash_show_surfaces_approval_runs(kanban_home):
+    out = kc.run_slash("create 'needs approval'")
+    import re
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m is not None
+    tid = m.group(1)
+    with kb.connect() as conn:
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=tid,
+            approver_type="agent",
+            approver_profile="coder",
+            approver_skill="hermes-agent",
+        )
+        approvals_db._create_task_approval_run_for_tests(
+            conn,
+            approval_id=approval.id,
+            profile="coder",
+            status="timed_out",
+            started_at=100,
+            ended_at=112,
+            outcome="timed_out",
+            error="worker exceeded runtime budget",
+        )
+    show = kc.run_slash(f"show {tid}")
+    assert "Approvals (1):" in show
+    assert f"#{approval.id}" in show
+    assert "Approval runs (1):" in show
+    assert "timed_out" in show
+    assert "worker exceeded runtime budget" in show
+
+    payload = json.loads(kc.run_slash(f"show {tid} --json"))
+    assert payload["approvals"][0]["id"] == approval.id
+    assert payload["approval_runs"][0]["approval_id"] == approval.id
+    assert payload["approval_runs"][0]["outcome"] == "timed_out"
+
+
 def test_run_slash_comment_max_len_trims_long_body(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
@@ -174,6 +216,82 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
+def test_cmd_dispatch_uses_max_approvers_flag_over_config(monkeypatch):
+    calls = {}
+
+    class DummyConn:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approvers': 7}})
+    monkeypatch.setattr(kb, 'connect_closing', lambda *args, **kwargs: DummyConn())
+
+    class Result:
+        reclaimed = 0
+        crashed = []
+        timed_out = []
+        stale = []
+        auto_blocked = []
+        promoted = 0
+        spawned = []
+        approval_spawned = []
+        skipped_unassigned = []
+        skipped_nonspawnable = []
+        skipped_per_profile_capped = []
+        auto_assigned_default = []
+
+    def fake_dispatch_once(conn, **kwargs):
+        calls.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(kb, 'dispatch_once', fake_dispatch_once)
+    args = argparse.Namespace(dry_run=True, max=3, max_approvers=5, failure_limit=2, json=True)
+
+    assert kc._cmd_dispatch(args) == 0
+    assert calls['max_spawn'] == 3
+    assert calls['max_approvers'] == 5
+
+
+def test_cmd_dispatch_max_approvers_falls_back_to_config(monkeypatch):
+    calls = {}
+
+    class DummyConn:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(config_mod, 'load_config', lambda: {'kanban': {'max_approvers': 4}})
+    monkeypatch.setattr(kb, 'connect_closing', lambda *args, **kwargs: DummyConn())
+
+    class Result:
+        reclaimed = 0
+        crashed = []
+        timed_out = []
+        stale = []
+        auto_blocked = []
+        promoted = 0
+        spawned = []
+        approval_spawned = []
+        skipped_unassigned = []
+        skipped_nonspawnable = []
+        skipped_per_profile_capped = []
+        auto_assigned_default = []
+
+    def fake_dispatch_once(conn, **kwargs):
+        calls.update(kwargs)
+        return Result()
+
+    monkeypatch.setattr(kb, 'dispatch_once', fake_dispatch_once)
+    args = argparse.Namespace(dry_run=True, max=None, max_approvers=None, failure_limit=2, json=True)
+
+    assert kc._cmd_dispatch(args) == 0
+    assert calls['max_spawn'] is None
+    assert calls['max_approvers'] == 4
+
+
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re
@@ -197,7 +315,6 @@ def test_run_slash_tenant_filter(kanban_home):
 def test_run_slash_session_filter(kanban_home):
     """`hermes kanban list --session <id>` filters by the originating
     chat session id stamped on tasks created from inside an ACP loop."""
-    from hermes_cli import kanban_db as kb
     with kb.connect() as conn:
         kb.create_task(
             conn, title="from sess-1 a", assignee="alice", session_id="sess-1"
@@ -222,7 +339,6 @@ def test_run_slash_session_filter(kanban_home):
 def test_kanban_list_json_includes_session_id(kanban_home):
     """JSON output exposes `session_id` so external clients (Scarf, web
     dashboards) don't need a side query to filter by chat session."""
-    from hermes_cli import kanban_db as kb
     with kb.connect() as conn:
         kb.create_task(
             conn, title="acp task", assignee="alice", session_id="acp-x"
@@ -372,7 +488,6 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import re
     import time
     import secrets
-    from hermes_cli import kanban_db as kb
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
     m = re.search(r"(t_[a-f0-9]+)", out1)
@@ -410,7 +525,6 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
     import re
     import time
     import secrets
-    from hermes_cli import kanban_db as kb
 
     out1 = kc.run_slash("create 'switch model' --assignee orig")
     m = re.search(r"(t_[a-f0-9]+)", out1)

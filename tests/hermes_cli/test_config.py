@@ -118,6 +118,13 @@ class TestLoadConfigDefaults:
             assert config["terminal"]["backend"] == "local"
             assert config["display"]["interim_assistant_messages"] is True
 
+    def test_kanban_approval_spawn_default_is_isolated(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+
+        assert config["kanban"]["max_approvers"] == 2
+        assert config["kanban"]["max_approvers"] != config["delegation"]["max_concurrent_children"]
+
     def test_legacy_root_level_max_turns_migrates_to_agent_config(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             config_path = tmp_path / "config.yaml"

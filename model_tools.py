@@ -321,7 +321,11 @@ def get_tool_definitions(
             frozenset(disabled_toolsets) if disabled_toolsets else None,
             registry._generation,
             cfg_fp,
+            # These env flags change the exact kanban_* surface available to
+            # dispatcher-spawned task workers vs approval workers, so the cache
+            # must split across both modes.
             bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(os.environ.get("HERMES_KANBAN_APPROVAL_ID")),
             bool(skip_tool_search_assembly),
         )
         cached = _tool_defs_cache.get(cache_key)

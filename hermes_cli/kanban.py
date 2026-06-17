@@ -24,7 +24,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from hermes_cli import kanban_approvals as approvals_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_approvals_db as approvals_db
 from hermes_cli import kanban_swarm as ks
 from hermes_cli.profiles import get_active_profile_name
 
@@ -34,13 +36,14 @@ from hermes_cli.profiles import get_active_profile_name
 # ---------------------------------------------------------------------------
 
 _STATUS_ICONS = {
-    "todo":     "◻",
-    "ready":    "▶",
-    "running":  "●",
-    "scheduled":"⏱",
-    "blocked":  "⊘",
-    "done":     "✓",
-    "archived": "—",
+    "todo":      "◻",
+    "ready":     "▶",
+    "running":   "●",
+    "scheduled": "⏱",
+    "blocked":   "⊘",
+    "approval":  "🔎",
+    "done":      "✓",
+    "archived":  "—",
 }
 
 
@@ -440,6 +443,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="With --state-type: keep runs whose column equals this value",
     )
 
+    approvals_cli.register_approval_subparser(sub)
+
     # --- assign ---
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
@@ -641,7 +646,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
-                        help="Cap number of spawns this pass")
+                        help="Cap number of task-worker spawns this pass")
+    p_disp.add_argument("--max-approvers", type=int, default=None,
+                        help="Cap concurrently running approval workers (defaults to config)")
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -656,7 +663,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_daemon.add_argument("--interval", type=float, default=60.0,
                           help="Seconds between dispatch ticks (default: 60)")
     p_daemon.add_argument("--max", type=int, default=None,
-                          help="Cap number of spawns per tick")
+                          help="Cap number of task-worker spawns per tick")
+    p_daemon.add_argument("--max-approvers", type=int, default=None,
+                          help="Cap concurrently running approval workers (defaults to config)")
     p_daemon.add_argument("--failure-limit", type=int,
                           default=kb.DEFAULT_SPAWN_FAILURE_LIMIT)
     p_daemon.add_argument("--pidfile", default=None,
@@ -942,6 +951,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "list":     _cmd_list,
             "ls":       _cmd_list,
             "show":     _cmd_show,
+            "approval": approvals_cli.dispatch_approval_command,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
@@ -1452,6 +1462,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -1461,6 +1472,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
+        approvals = approvals_db.list_task_approvals(conn, args.task_id)
+        approval_runs = approvals_db.list_task_approval_runs(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
@@ -1473,6 +1486,10 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
+            "approvals": [approvals_cli.approval_to_dict(approval) for approval in approvals],
+            "approval_runs": [
+                approvals_cli.approval_run_to_dict(run) for run in approval_runs
+            ],
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1585,6 +1602,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print()
         print("Latest summary:")
         print(latest_summary)
+    if approvals:
+        print()
+        print(f"Approvals ({len(approvals)}):")
+        for approval in approvals:
+            print(approvals_cli.format_approval_line(approval, include_task_id=False))
     if comments:
         print()
         print(f"Comments ({len(comments)}):")
@@ -1612,6 +1634,13 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
+    if approval_runs:
+        print()
+        print(f"Approval runs ({len(approval_runs)}):")
+        for run in approval_runs:
+            print(approvals_cli.format_approval_run_line(run))
+            if run.error:
+                print(f"        ! {run.error.splitlines()[0][:160]}")
     return 0
 
 
@@ -2118,9 +2147,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
-    # cap (#21582), and kanban.max_spawn as the per-tick spawn limit
-    # (#28805). Same semantics as the gateway dispatch path so behavior
-    # matches whether the user runs the CLI directly or relies on the
+    # cap (#21582), kanban.max_spawn as the per-tick spawn limit
+    # (#28805), and kanban.max_approvers as the approval-worker cap.
+    # Same semantics as the gateway dispatch path so behavior matches
+    # whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
     try:
         from hermes_cli.config import load_config
@@ -2141,6 +2171,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        max_approvers = kb.get_max_approvers(
+            _kanban_cfg,
+            override=getattr(args, "max_approvers", None),
+        )
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2151,12 +2185,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        max_approvers = kb.get_max_approvers({}, override=getattr(args, "max_approvers", None))
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
+            max_approvers=max_approvers,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
@@ -2173,6 +2209,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
+            ],
+            "approval_spawned": [
+                {"approval_id": approval_id, "approver_profile": profile, "task_id": task_id}
+                for (approval_id, profile, task_id) in res.approval_spawned
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
@@ -2201,6 +2241,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if res.approval_spawned:
+        print(f"Approval spawned: {len(res.approval_spawned)}")
+        for approval_id, profile, task_id in res.approval_spawned:
+            tag = " (dry)" if args.dry_run else ""
+            print(f"  - approval {approval_id}  ->  {profile or '-'}  for {task_id}{tag}")
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
@@ -2347,10 +2392,19 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         except Exception:
             return False
 
+    from hermes_cli.config import load_config
+
+    kanban_cfg = (load_config().get("kanban") or {})
+    max_approvers = kb.get_max_approvers(
+        kanban_cfg,
+        override=getattr(args, "max_approvers", None),
+    )
+
     try:
         kb.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
+            max_approvers=max_approvers,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
         )

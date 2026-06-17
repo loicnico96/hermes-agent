@@ -109,5 +109,6 @@ So lane authors don't have to reimplement these:
 ## Related
 
 - [Kanban overview](./kanban) — the user-facing intro.
+- [Kanban task approvals](./kanban-approvals) — review gates, task `approval` state, and human-vs-agent precedence.
 - [Kanban tutorial](./kanban-tutorial) — walkthrough with the dashboard open.
 - [`KANBAN_GUIDANCE`](https://github.com/NousResearch/hermes-agent/blob/main/agent/prompt_builder.py) — the worker + orchestrator lifecycle injected into every kanban worker's system prompt.

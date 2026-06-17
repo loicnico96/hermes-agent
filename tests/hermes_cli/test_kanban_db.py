@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -10,11 +11,13 @@ import sys
 import time
 import types
 import unittest.mock
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_approvals_db as approvals_db
 
 
 @pytest.fixture
@@ -59,7 +62,28 @@ def test_init_creates_expected_tables(kanban_home):
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
     names = {r["name"] for r in rows}
-    assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+    assert {
+        "tasks",
+        "task_links",
+        "task_comments",
+        "task_events",
+        "task_approvals",
+        "task_approval_runs",
+    } <= names
+
+
+def test_init_creates_approval_indexes(kanban_home):
+    with kb.connect() as conn:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' ORDER BY name"
+        ).fetchall()
+    names = {r["name"] for r in rows}
+    assert {
+        "idx_approvals_task_status",
+        "idx_approvals_claimable",
+        "idx_approval_runs",
+        "idx_approval_runs_task",
+    } <= names
 
 
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
@@ -128,19 +152,7 @@ def test_connect_rejects_tls_record_in_sqlite_header(tmp_path, monkeypatch):
 
 
 def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
-    """Legacy DBs missing additive indexed columns must migrate cleanly.
-
-    SCHEMA_SQL runs in ``connect()`` before ``_migrate_add_optional_columns``.
-    Indexes over additive columns therefore must be created after the
-    migration adds those columns, or boards predating the column fail to
-    open before migration can run.
-
-    Covers all four indexes that sit on additive columns:
-    - ``tasks.session_id``       -> ``idx_tasks_session_id``    (#28447)
-    - ``tasks.tenant``           -> ``idx_tasks_tenant``        (#16081)
-    - ``tasks.idempotency_key``  -> ``idx_tasks_idempotency``   (#17805)
-    - ``task_events.run_id``     -> ``idx_events_run``          (#17805)
-    """
+    """Legacy DBs gain additive task columns plus approval tables without backfill."""
     db_path = tmp_path / "legacy-kanban.db"
     conn = sqlite3.connect(str(db_path))
     # Pre-#16081 ``tasks`` shape: missing tenant, idempotency_key, session_id.
@@ -162,6 +174,15 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
             claim_expires INTEGER
         )
     """)
+    conn.execute("""
+        CREATE TABLE task_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+    """)
     # Pre-#17805 ``task_events`` shape: missing run_id. Required because
     # ``_migrate_add_optional_columns`` unconditionally runs PRAGMA on
     # ``task_events`` for run_id back-fill.
@@ -176,7 +197,11 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     """)
     conn.execute(
         "INSERT INTO tasks (id, title, status, created_at) "
-        "VALUES ('legacy', 'old board task', 'ready', 1)"
+        "VALUES ('legacy', 'old board task', 'review', 1)"
+    )
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES ('legacy', 'user', 'review-required: old convention', 2)"
     )
     conn.commit()
     conn.close()
@@ -188,6 +213,12 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
         event_columns = {
             row["name"]
             for row in migrated.execute("PRAGMA table_info(task_events)")
+        }
+        tables = {
+            row["name"]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
         }
         indexes = {
             row["name"]
@@ -201,11 +232,22 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "tenant" in task_columns
     assert "idempotency_key" in task_columns
     assert "run_id" in event_columns
-    # And their indexes — the regression scope of this test:
+    # Approval schema is created additively on legacy boards.
+    assert "task_approvals" in tables
+    assert "task_approval_runs" in tables
+    assert "idx_approvals_task_status" in indexes
+    assert "idx_approvals_claimable" in indexes
+    assert "idx_approval_runs" in indexes
+    assert "idx_approval_runs_task" in indexes
+    # Existing additive-column indexes still migrate.
     assert "idx_tasks_session_id" in indexes
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+    # No additive migration infers approval rows from legacy review/comment conventions.
+    with kb.connect(db_path) as migrated_again:
+        assert migrated_again.execute("SELECT COUNT(*) FROM task_approvals").fetchone()[0] == 0
+        assert migrated_again.execute("SELECT COUNT(*) FROM task_approval_runs").fetchone()[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +465,80 @@ def test_unblock_scheduled_rechecks_parent_gate(kanban_home):
         assert kb.schedule_task(conn, child, reason="second timer") is True
         assert kb.unblock_task(conn, child) is True
         assert kb.get_task(conn, child).status == "ready"
+
+
+def test_non_owner_status_helpers_do_not_prepare_approval_reset(kanban_home, monkeypatch):
+    calls: list[str] = []
+
+    def fake_hook(conn, task_id):
+        assert task_id
+        calls.append(task_id)
+
+    monkeypatch.setattr(approvals_db, "reset_task_approvals_in_txn", fake_hook)
+
+    with kb.connect() as conn:
+        scheduled = kb.create_task(conn, title="scheduled", assignee="ops")
+        assert kb.schedule_task(conn, scheduled, reason="later") is True
+        assert kb.unblock_task(conn, scheduled) is True
+
+        blocked = kb.create_task(conn, title="blocked", assignee="ops")
+        assert kb.block_task(conn, blocked, reason="need input") is True
+
+        triage = kb.create_task(conn, title="triage", triage=True)
+        assert kb.specify_triage_task(conn, triage, title="triage", assignee="ops") is True
+
+        ready = kb.create_task(conn, title="ready", assignee="ops")
+        assert kb.claim_task(conn, ready, claimer="host:ops") is not None
+        assert kb.reclaim_task(conn, ready, reason="stop") is True
+
+        parent = kb.create_task(conn, title="parent", assignee="ops")
+        _set_task_status(conn, parent, "done")
+        child = kb.create_task(conn, title="child", assignee="ops", parents=[parent])
+        _set_task_status(conn, child, "blocked")
+        assert kb.recompute_ready(conn) == 1
+
+    assert calls == []
+
+
+def test_complete_task_prepares_completion_cycle_only_when_approvals_exist(kanban_home, monkeypatch):
+    calls: list[str] = []
+
+    def fake_hook(conn, task_id):
+        assert task_id
+        calls.append(task_id)
+
+    monkeypatch.setattr(approvals_db, "reset_task_approvals_in_txn", fake_hook)
+
+    with kb.connect() as conn:
+        no_approval_task = kb.create_task(conn, title="no approval", assignee="ops")
+        assert kb.complete_task(conn, no_approval_task, result="done") is True
+
+        approval_task = kb.create_task(conn, title="with approval", assignee="ops")
+        approvals_db.create_task_approval(conn, task_id=approval_task, approver_type="human")
+        assert kb.complete_task(conn, approval_task, result="done") is True
+
+    assert calls == [approval_task]
+
+
+def test_archive_task_is_not_an_approval_reset_owner(kanban_home, monkeypatch):
+    calls: list[str] = []
+
+    def fake_hook(conn, task_id):
+        assert task_id
+        calls.append(task_id)
+
+    monkeypatch.setattr(approvals_db, "reset_task_approvals_in_txn", fake_hook)
+
+    with kb.connect() as conn:
+        archived = kb.create_task(conn, title="archived", assignee="ops")
+        _set_task_status(conn, archived, "done")
+
+        # Archive is still inside the approval-bearing domain, so it must not
+        # inherit completion-cycle reset behavior just because it touches a
+        # terminal-looking status.
+        assert kb.archive_task(conn, archived) is True
+
+    assert calls == []
 
 
 def test_stale_claim_reclaimed(kanban_home, monkeypatch):
@@ -1170,6 +1286,147 @@ def test_complete_records_result(kanban_home):
     assert task.completed_at is not None
 
 
+@pytest.mark.parametrize(
+    ("approver_type", "approval_kwargs", "initial_status"),
+    [
+        ("human", {}, "approved"),
+        ("agent", {"approver_profile": "reviewer"}, "failed"),
+    ],
+)
+def test_complete_task_with_approvals_resets_rows_and_enters_approval(
+    kanban_home,
+    approver_type,
+    approval_kwargs,
+    initial_status,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"{approver_type} approval target", assignee="ops")
+        comment_id = kb.add_comment(conn, task_id, "user", "stale decision")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type=approver_type,
+            status=initial_status,
+            comment_id=comment_id,
+            **approval_kwargs,
+        )
+        run = (
+            approvals_db._create_task_approval_run_for_tests(conn, approval_id=approval.id, status="running")
+            if approver_type == "agent"
+            else None
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE task_approvals
+                   SET claim_lock = ?,
+                       claim_expires = ?,
+                       worker_pid = ?,
+                       last_heartbeat_at = ?,
+                       current_run_id = ?,
+                       consecutive_failures = ?,
+                       last_failure_error = ?
+                 WHERE id = ?
+                """,
+                (
+                    "lease-1",
+                    123,
+                    456,
+                    789,
+                    run.id if run is not None else 42,
+                    3,
+                    "stale state",
+                    approval.id,
+                ),
+            )
+
+        claimed_task = kb.claim_task(conn, task_id)
+        assert claimed_task is not None and claimed_task.current_run_id is not None
+        assert kb.complete_task(conn, task_id, result="fresh result", summary="fresh summary") is True
+
+        task = kb.get_task(conn, task_id)
+        refreshed_approval = approvals_db.get_task_approval(conn, approval.id)
+        closed_run = conn.execute(
+            "SELECT status, outcome, summary FROM task_runs WHERE id = ?",
+            (claimed_task.current_run_id,),
+        ).fetchone()
+        completed_event = conn.execute(
+            "SELECT kind, payload, run_id FROM task_events WHERE task_id = ? AND kind IN ('awaiting_approval', 'completed') ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert task is not None
+    assert task.status == "approval"
+    assert task.result == "fresh result"
+    assert task.completed_at is not None
+
+    assert refreshed_approval is not None
+    assert refreshed_approval.status == "requested"
+    assert refreshed_approval.comment_id is None
+    assert refreshed_approval.claim_lock is None
+    assert refreshed_approval.claim_expires is None
+    assert refreshed_approval.worker_pid is None
+    assert refreshed_approval.last_heartbeat_at is None
+    assert refreshed_approval.current_run_id is None
+    assert refreshed_approval.consecutive_failures == 0
+    assert refreshed_approval.last_failure_error is None
+
+    assert closed_run is not None
+    assert closed_run["status"] == "done"
+    assert closed_run["outcome"] == "completed"
+    assert closed_run["summary"] == "fresh summary"
+
+    assert completed_event is not None
+    assert completed_event["kind"] == "awaiting_approval"
+    assert completed_event["run_id"] == claimed_task.current_run_id
+    payload = json.loads(completed_event["payload"])
+    assert payload == {
+        "result_len": len("fresh result"),
+        "summary": "fresh summary",
+        "task_status": "approval",
+    }
+
+
+@pytest.mark.parametrize(
+    ("approval_specs", "expected"),
+    [
+        ([{"type": "human", "status": "rejected"}, {"type": "agent", "status": "running"}], "todo"),
+        ([{"type": "human", "status": "approved"}, {"type": "agent", "status": "rejected"}], "done"),
+        ([{"type": "human", "status": "requested"}, {"type": "agent", "status": "rejected"}], "todo"),
+        ([{"type": "human", "status": "requested"}, {"type": "agent", "status": "escalated"}], "approval"),
+        ([{"type": "agent", "status": "running"}, {"type": "agent", "status": "rejected"}], "approval"),
+        ([{"type": "agent", "status": "rejected"}, {"type": "agent", "status": "requested"}], "todo"),
+        ([{"type": "agent", "status": "requested"}, {"type": "agent", "status": "approved"}], "approval"),
+        ([{"type": "agent", "status": "approved"}], "done"),
+        ([], "done"),
+    ],
+)
+def test_compute_task_approval_aggregate_status_human_precedence(approval_specs, expected):
+    approvals = [
+        approvals_db.Approval(
+            id=index + 1,
+            task_id="t_approval_order",
+            approver_type=spec["type"],
+            approver_profile=(f"agent-{index}" if spec["type"] == "agent" else None),
+            approver_skill=None,
+            status=spec["status"],
+            comment_id=None,
+            claim_lock=None,
+            claim_expires=None,
+            worker_pid=None,
+            last_heartbeat_at=None,
+            current_run_id=None,
+            consecutive_failures=0,
+            last_failure_error=None,
+            created_at=1000 + index,
+            updated_at=1000 + index,
+        )
+        for index, spec in enumerate(approval_specs)
+    ]
+
+    assert approvals_db.compute_task_approval_aggregate_status(approvals) == expected
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
@@ -1499,11 +1756,341 @@ def test_archive_hides_from_default_list(kanban_home):
         assert len(kb.list_tasks(conn, include_archived=True)) == 1
 
 
+def _seed_approval_rows(conn, task_id: str) -> tuple[int, int]:
+    now = 100
+    approval_cur = conn.execute(
+        """
+        INSERT INTO task_approvals (
+            task_id, approver_type, approver_profile, approver_skill,
+            status, comment_id, claim_lock, claim_expires, worker_pid,
+            last_heartbeat_at, current_run_id, consecutive_failures,
+            last_failure_error, created_at, updated_at
+        ) VALUES (?, 'agent', 'reviewer', NULL, 'failed', NULL, 'lease-1', 10, 20, 30, 1, 2, 'boom', ?, ?)
+        """,
+        (task_id, now, now),
+    )
+    approval_id = int(approval_cur.lastrowid)
+    approval_run_cur = conn.execute(
+        """
+        INSERT INTO task_approval_runs (
+            approval_id, task_id, profile, status, claim_lock, claim_expires,
+            worker_pid, last_heartbeat_at, started_at, ended_at, outcome,
+            comment_id, error
+        ) VALUES (?, ?, 'reviewer', 'failed', 'lease-1', 10, 20, 30, 40, 50, 'failed', NULL, 'boom')
+        """,
+        (approval_id, task_id),
+    )
+    return approval_id, int(approval_run_cur.lastrowid)
+
+
+def test_apply_task_approval_aggregate_transition_done_reclaims_running_agents(
+    kanban_home, monkeypatch,
+):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval done", assignee="worker")
+        human = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
+        running = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        requested = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="observer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, running.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 4321, run_id=claimed.current_run_id)
+
+        approvals = approvals_db.list_task_approvals(conn, task_id)
+        aggregate = approvals_db.apply_task_approval_aggregate_transition_in_txn(conn, task_id, approvals=approvals)
+
+        task = kb.get_task(conn, task_id)
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        requested_after = approvals_db.get_task_approval(conn, requested.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert aggregate == "done"
+    assert task is not None and task.status == "done"
+    assert running_after is not None and running_after.status == "cancelled"
+    assert running_after.worker_pid is None
+    assert running_after.current_run_id is None
+    assert requested_after is not None and requested_after.status == "requested"
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["worker_pid"] is None
+    assert run_row["ended_at"] is not None
+    assert killed == [(4321, claimed.claim_lock)]
+
+
+def test_apply_task_approval_aggregate_transition_todo_resets_all_approvals(
+    kanban_home, monkeypatch,
+):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval todo", assignee="worker")
+        running = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        terminal = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="rejected")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, running.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 9876, run_id=claimed.current_run_id)
+
+        approvals = approvals_db.list_task_approvals(conn, task_id)
+        aggregate = approvals_db.apply_task_approval_aggregate_transition_in_txn(conn, task_id, approvals=approvals)
+
+        task = kb.get_task(conn, task_id)
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        terminal_after = approvals_db.get_task_approval(conn, terminal.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert aggregate == "todo"
+    assert task is not None and task.status == "todo"
+    assert running_after is not None and running_after.status == "requested"
+    assert terminal_after is not None and terminal_after.status == "requested"
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["worker_pid"] is None
+    assert run_row["ended_at"] is not None
+    assert killed == [(9876, claimed.claim_lock)]
+
+
+
+def test_block_like_todo_transition_reclaims_running_approval_and_resets_other_decision(
+    kanban_home, monkeypatch,
+):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval blocked-like reset", assignee="worker")
+        running = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        decided = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, running.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 6789, run_id=claimed.current_run_id)
+
+        approvals_db.reset_task_approvals_in_txn(conn, task_id)
+
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        decided_after = approvals_db.get_task_approval(conn, decided.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert running_after is not None and running_after.status == "requested"
+    assert decided_after is not None and decided_after.status == "requested"
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["worker_pid"] is None
+    assert run_row["ended_at"] is not None
+    assert killed == [(6789, claimed.claim_lock)]
+
+
+
+def test_archive_task_reclaims_running_task_approvals(kanban_home, monkeypatch):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="archive approvals", assignee="worker")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, approval.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert approvals_db.set_task_approval_worker_pid(conn, approval.id, 2468, run_id=claimed.current_run_id)
+
+        assert kb.archive_task(conn, task_id) is True
+
+        task = kb.get_task(conn, task_id)
+        approval_after = approvals_db.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert task is not None and task.status == "archived"
+    assert approval_after is not None and approval_after.status == "cancelled"
+    assert run_row is not None and run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert killed == [(2468, claimed.claim_lock)]
+
+
+
+def test_archive_task_reclaims_running_approval_and_preserves_other_decision(kanban_home, monkeypatch):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="archive decision preservation", assignee="worker")
+        running = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        decided = approvals_db.create_task_approval(conn, task_id=task_id, approver_type="human", status="approved")
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, running.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert approvals_db.set_task_approval_worker_pid(conn, running.id, 8642, run_id=claimed.current_run_id)
+
+        assert kb.archive_task(conn, task_id) is True
+
+        task = kb.get_task(conn, task_id)
+        running_after = approvals_db.get_task_approval(conn, running.id)
+        decided_after = approvals_db.get_task_approval(conn, decided.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, worker_pid, ended_at FROM task_approval_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+
+    assert task is not None and task.status == "archived"
+    assert running_after is not None and running_after.status == "cancelled"
+    assert decided_after is not None and decided_after.status == "approved"
+    assert run_row is not None and run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert killed == [(8642, claimed.claim_lock)]
+
+
+
+def test_delete_task_reclaims_running_task_approvals_before_deleting(kanban_home, monkeypatch):
+    killed: list[tuple[int, object]] = []
+
+    def fake_terminate(pid, claim_lock, *, signal_fn=None):
+        killed.append((pid, claim_lock))
+        return {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="delete approvals", assignee="worker")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+            status="requested",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, approval.id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert approvals_db.set_task_approval_worker_pid(conn, approval.id, 1357, run_id=claimed.current_run_id)
+
+        assert kb.delete_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id) is None
+
+    assert killed == [(1357, claimed.claim_lock)]
+
+
 def test_delete_archived_task_removes_related_rows(kanban_home):
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent")
         tid = kb.create_task(conn, title="child", parents=[parent], assignee="worker")
         kb.add_comment(conn, tid, "user", "cleanup me")
+        _seed_approval_rows(conn, tid)
         kb.claim_task(conn, tid)
         kb.complete_task(conn, tid, result="done")
         assert kb.archive_task(conn, tid)
@@ -1520,7 +2107,27 @@ def test_delete_archived_task_removes_related_rows(kanban_home):
         assert conn.execute("SELECT COUNT(*) FROM task_comments WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone()[0] == 0
+
+
+def test_delete_archived_task_only_removes_target_task_approval_rows(kanban_home):
+    with kb.connect() as conn:
+        archived = kb.create_task(conn, title="archived", assignee="worker")
+        survivor = kb.create_task(conn, title="survivor", assignee="worker")
+        archived_approval_id, archived_run_id = _seed_approval_rows(conn, archived)
+        survivor_approval_id, survivor_run_id = _seed_approval_rows(conn, survivor)
+        kb.complete_task(conn, archived, result="done")
+        assert kb.archive_task(conn, archived)
+
+        assert kb.delete_archived_task(conn, archived) is True
+
+        assert kb.get_task(conn, survivor) is not None
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE id = ?", (archived_approval_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE id = ?", (archived_run_id,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE id = ?", (survivor_approval_id,)).fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE id = ?", (survivor_run_id,)).fetchone()[0] == 1
 
 
 def test_delete_archived_task_rejects_non_archived_rows(kanban_home):
@@ -1567,11 +2174,14 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         t = kb.create_task(conn, title="to-delete", assignee="alice")
         kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
+        _seed_approval_rows(conn, t)
         assert kb.delete_task(conn, t)
         assert kb.get_task(conn, t) is None
         assert len(kb.list_comments(conn, t)) == 0
         assert len(kb.list_events(conn, t)) == 0
         assert len(kb.list_runs(conn, t)) == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approvals WHERE task_id = ?", (t,)).fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM task_approval_runs WHERE task_id = ?", (t,)).fetchone()[0] == 0
 
 
 def test_delete_task_returns_false_for_missing_task(kanban_home):
@@ -1875,28 +2485,55 @@ def test_respawn_guard_blocker_auth_on_authorization_error(kanban_home):
 
 
 def test_respawn_guard_recent_success(kanban_home):
-    """A completed run within the guard window triggers recent_success."""
+    """A recent task-level completed event triggers recent_success."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="already-done", assignee="alice")
         now = int(time.time())
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, now - 120, now - 60),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, now - 60),
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason == "recent_success"
 
 
+def test_respawn_guard_approval_handoff_not_counted_as_recent_success(kanban_home):
+    """An approval handoff should not trip recent_success until final task completion.
+
+    Approval handoff closes the worker run with outcome='completed' so the
+    attempt history reflects a successful worker execution, but the task-level
+    lifecycle is only at awaiting_approval until a real completed event is
+    emitted later. The respawn guard should key off the task-level completed
+    event, not the worker-level completed run.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs-approval", assignee="alice")
+        claim = kb.claim_task(conn, t)
+        assert claim is not None
+        approvals_db.create_task_approval(conn, task_id=t, approver_type="human")
+        assert kb.complete_task(conn, t, result="done") is True
+
+        latest = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (t,),
+        ).fetchone()
+        assert latest is not None
+        assert latest["kind"] == "awaiting_approval"
+
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
-    """A completed run outside the guard window does not block re-spawn."""
+    """A completed event outside the guard window does not block re-spawn."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="old-done", assignee="alice")
         old_end = int(time.time()) - kb._RESPAWN_GUARD_SUCCESS_WINDOW - 60
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, old_end - 300, old_end),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, old_end),
         )
         reason = kb.check_respawn_guard(conn, t)
     assert reason is None
@@ -1992,7 +2629,7 @@ def test_dispatch_respawn_guard_defers_auth_error_without_auto_block(
 def test_dispatch_respawn_guard_skips_recent_success(
     kanban_home, all_assignees_spawnable
 ):
-    """dispatch_once skips (but does not block) a task with a recent completed run."""
+    """dispatch_once skips (but does not block) a task with a recent completed event."""
     spawned_ids = []
 
     def fake_spawn(task, workspace):
@@ -2002,9 +2639,9 @@ def test_dispatch_respawn_guard_skips_recent_success(
         t = kb.create_task(conn, title="recent-winner", assignee="alice")
         now = int(time.time())
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, now - 300, now - 60),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, now - 60),
         )
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
@@ -2106,19 +2743,17 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
         t = kb.create_task(conn, title="event-check", assignee="alice")
         now = int(time.time())
         conn.execute(
-            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
-            "VALUES (?, 'done', 'completed', ?, ?)",
-            (t, now - 300, now - 60),
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'completed', NULL, ?)",
+            (t, now - 60),
         )
         kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
         events = kb.list_events(conn, t)
 
     kinds = [e.kind for e in events]
     assert "respawn_guarded" in kinds
-    guarded_evt = next(e for e in events if e.kind == "respawn_guarded")
-    # Event.payload is already parsed as a dict by list_events.
-    assert isinstance(guarded_evt.payload, dict)
-    assert guarded_evt.payload.get("reason") == "recent_success"
+    guarded = [e for e in events if e.kind == "respawn_guarded"]
+    assert guarded[-1].payload == {"reason": "recent_success"}
 
 
 # ---------------------------------------------------------------------------
@@ -2999,6 +3634,46 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
+    def test_dispatcher_spawn_clears_approval_env(self, tmp_path, monkeypatch):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setenv("HERMES_KANBAN_APPROVAL_ID", "77")
+        monkeypatch.setenv("HERMES_KANBAN_APPROVAL_RUN_ID", "88")
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_dispatch_env",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name="wt/t_dispatch_env",
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        env = captured["env"]
+        assert "HERMES_KANBAN_APPROVAL_ID" not in env
+        assert "HERMES_KANBAN_APPROVAL_RUN_ID" not in env
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
@@ -3468,6 +4143,11 @@ def test_resolve_hermes_argv_module_actually_runs():
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Approval row models
+# ---------------------------------------------------------------------------
+
+
 def _make_task(**overrides) -> "kb.Task":
     """Minimal Task with all required fields filled in. Override anything."""
     defaults = dict(
@@ -3655,7 +4335,7 @@ def test_create_task_with_explicit_workspace_ignores_board_default(kanban_home):
 
 
 def test_dispatch_max_in_progress_skips_when_at_limit(kanban_home, all_assignees_spawnable):
-    """When max_in_progress=N and N tasks are already running, spawn nothing."""
+    """When max_in_progress=N and N tasks are already running, spawn no workers."""
     spawns = []
 
     def fake_spawn(task, workspace):
@@ -3673,6 +4353,55 @@ def test_dispatch_max_in_progress_skips_when_at_limit(kanban_home, all_assignees
         kb.dispatch_once(conn, spawn_fn=fake_spawn, max_in_progress=2)
 
     assert len(spawns) == 0, f"expected 0 spawns, got {len(spawns)}"
+
+
+def test_dispatch_max_in_progress_does_not_skip_approvals(
+    kanban_home, all_assignees_spawnable,
+):
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(("worker", task.id))
+
+    def fake_approval_spawn(approval, workspace, board=None):
+        spawns.append(("approval", approval.id))
+        return 4242
+
+    with kb.connect() as conn:
+        running_a = kb.create_task(conn, title="a", assignee="alice")
+        running_b = kb.create_task(conn, title="b", assignee="bob")
+        kb.claim_task(conn, running_a)
+        kb.claim_task(conn, running_b)
+
+        ready = kb.create_task(conn, title="c", assignee="alice")
+        task_id = kb.create_task(conn, title="needs approval", assignee="alice")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            approval_spawn_fn=fake_approval_spawn,
+            max_in_progress=2,
+            max_approvers=1,
+        )
+
+        ready_task = kb.get_task(conn, ready)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+
+    assert res.spawned == []
+    assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
+    assert spawns == [("approval", approval.id)]
+    assert ready_task is not None
+    assert ready_task.status == "ready"
+    assert refreshed is not None
+    assert refreshed.status == "running"
+    assert refreshed.worker_pid == 4242
 
 
 def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_spawnable):
@@ -3831,6 +4560,208 @@ def test_dispatch_review_spawns_when_ready_empty(
     assert spawns[0] == t
 
 
+def test_dispatch_approval_dry_run_reports_runnable_rows(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+
+        res = kb.dispatch_once(conn, dry_run=True, max_approvers=2)
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+
+    assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+
+
+def test_dispatch_approval_uses_separate_concurrency_cap(kanban_home):
+    spawned = []
+
+    def fake_approval_spawn(approval, workspace, board=None):
+        spawned.append((approval.id, workspace, board))
+        return 4242
+
+    with kb.connect() as conn:
+        busy_task = kb.create_task(conn, title="already running", assignee="worker")
+        kb.claim_task(conn, busy_task)
+
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+
+        res = kb.dispatch_once(
+            conn,
+            max_spawn=0,
+            max_approvers=1,
+            approval_spawn_fn=fake_approval_spawn,
+        )
+
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+        assert refreshed is not None
+        run_row = conn.execute(
+            "SELECT worker_pid FROM task_approval_runs WHERE id = ?",
+            (refreshed.current_run_id,),
+        ).fetchone()
+
+    assert not res.spawned
+    assert res.approval_spawned == [(approval.id, "reviewer", task_id)]
+    assert spawned and spawned[0][0] == approval.id
+    assert refreshed.status == "running"
+    assert refreshed.worker_pid == 4242
+    assert run_row is not None
+    assert run_row["worker_pid"] == 4242
+
+
+def test_dispatch_approval_spawn_failure_requeues_row(kanban_home):
+    def boom(approval, workspace, board=None):
+        raise RuntimeError("approval spawn failed")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+
+        kb.dispatch_once(conn, approval_spawn_fn=boom, max_approvers=1)
+
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, error FROM task_approval_runs WHERE approval_id = ? ORDER BY id DESC LIMIT 1",
+            (approval.id,),
+        ).fetchone()
+        event_row = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 1
+    assert refreshed.last_failure_error == "approval spawn failed"
+    assert run_row is not None
+    assert run_row["status"] == "spawn_failed"
+    assert run_row["outcome"] == "spawn_failed"
+    assert run_row["error"] == "approval spawn failed"
+    assert event_row is not None
+    assert event_row["kind"] == "approval_failed"
+    assert json.loads(event_row["payload"])["approval_id"] == approval.id
+
+
+def test_detect_crashed_approval_workers_clean_exit_without_tool_call_is_protocol_failure(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        host = kb._claimer_id().split(':', 1)[0]
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        conn.execute(
+            "UPDATE task_approvals SET worker_pid = ? WHERE id = ?",
+            (43210, approval.id),
+        )
+        conn.execute(
+            "UPDATE task_approval_runs SET worker_pid = ? WHERE id = ?",
+            (43210, run_id),
+        )
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        kb._record_worker_exit(43210, 0)
+
+        failed = kb.detect_crashed_approval_workers(conn)
+
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+        task = kb.get_task(conn, task_id)
+        comments = kb.list_comments(conn, task_id)
+        run_row = conn.execute(
+            "SELECT status, outcome, comment_id, error FROM task_approval_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+
+    assert failed == [approval.id]
+    assert task is not None
+    assert task.status == "approval"
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 1
+    assert len(comments) == 0
+    assert run_row is not None
+    assert run_row["status"] == "failed"
+    assert run_row["outcome"] == "failed"
+    assert run_row["comment_id"] is None
+    assert "kanban_approval" in (run_row["error"] or "")
+
+
+def test_release_stale_approval_claims_requeues_unhealthy_run(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="worker")
+        approval = approvals_db.create_task_approval(
+            conn,
+            task_id=task_id,
+            approver_type="agent",
+            approver_profile="reviewer",
+        )
+        host = kb._claimer_id().split(':', 1)[0]
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (task_id,))
+        claimed = approvals_db.claim_task_approval(conn, approval.id, claimer=f"{host}:lease", now=1_000)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+        assert run_id is not None
+        conn.execute(
+            "UPDATE task_approvals SET worker_pid = ?, claim_expires = ? WHERE id = ?",
+            (99999, 999, approval.id),
+        )
+        conn.execute(
+            "UPDATE task_approval_runs SET worker_pid = ?, claim_expires = ? WHERE id = ?",
+            (99999, 999, run_id),
+        )
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        reclaimed = kb.release_stale_approval_claims(conn)
+
+        refreshed = approvals_db.get_task_approval(conn, approval.id)
+        run_row = conn.execute(
+            "SELECT status, outcome, error FROM task_approval_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+
+    assert reclaimed == 1
+    assert refreshed is not None
+    assert refreshed.status == "requested"
+    assert refreshed.current_run_id is None
+    assert refreshed.consecutive_failures == 1
+    assert refreshed.last_failure_error == f"stale approval claim lock={host}:lease"
+    assert run_row is not None
+    assert run_row["status"] == "reclaimed"
+    assert run_row["outcome"] == "reclaimed"
+    assert run_row["error"] == f"stale approval claim lock={host}:lease"
+
+
 def test_has_spawnable_review_true(kanban_home):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
     with kb.connect() as conn:
@@ -3873,6 +4804,24 @@ def test_dispatch_review_skips_nonspawnable(kanban_home, monkeypatch):
 def test_review_status_in_valid_statuses():
     """'review' is a valid task status."""
     assert "review" in kb.VALID_STATUSES
+
+
+def test_approval_status_round_trips_through_task_reads(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="needs approval", assignee="alice")
+        _set_task_status(conn, task_id, "approval")
+
+        task = kb.get_task(conn, task_id)
+        filtered = kb.list_tasks(conn, status="approval")
+
+    assert task is not None
+    assert task.status == "approval"
+    assert [item.id for item in filtered] == [task_id]
+
+
+def test_approval_status_in_valid_statuses():
+    """'approval' is a valid task status."""
+    assert "approval" in kb.VALID_STATUSES
 
 
 def test_dispatch_review_does_not_claim_ready_tasks(

@@ -59,7 +59,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | approval | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -674,7 +674,7 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
         [--log-retention-days N]
 ```
 
-All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below). Approval gates use the same command family via `hermes kanban approval ...` / `/kanban approval ...`; for the full approval lifecycle and review-loop semantics, see [Kanban task approvals](./kanban-approvals).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
