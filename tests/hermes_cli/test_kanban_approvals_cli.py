@@ -129,6 +129,7 @@ def test_cli_approval_ls_flat_filters_and_aliases(kanban_home):
         )
 
     flat_text = run_slash("approval ls --flat")
+    task_text = run_slash(f"approval ls {second_task['id']}")
     flat_json = json.loads(run_slash("approval ls --flat --all --json"))
     human_rows = json.loads(run_slash("approval ls --flat --human --all --json"))
     agent_rows = json.loads(run_slash("approval ls --flat --agent --all --json"))
@@ -140,6 +141,10 @@ def test_cli_approval_ls_flat_filters_and_aliases(kanban_home):
     assert second_task["id"] not in flat_text
     assert f"#{first_human['id']}" in flat_text
     assert f"{first_task['id'].ljust(12)}{'requested'.ljust(12)}human" in flat_text
+    assert second_task["id"] not in task_text
+    assert f"  #{second_agent['id']}" in task_text
+    assert f"agent @reviewer:approver-skill" in task_text
+    assert f"  #{second_human['id']}" in task_text
 
     assert [row["approval_id"] for row in flat_json] == [first_human["id"], second_agent["id"], second_human["id"]]
     assert [row["approval_id"] for row in human_rows] == [first_human["id"], second_human["id"]]
