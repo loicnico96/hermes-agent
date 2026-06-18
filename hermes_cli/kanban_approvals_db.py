@@ -413,10 +413,7 @@ def list_approvals(
         query += " AND approver_type = ?"
         params.append(approver_type)
 
-    if task_id is None:
-        query += " ORDER BY task_id ASC, created_at ASC, id ASC"
-    else:
-        query += " ORDER BY created_at ASC, id ASC"
+    query += " ORDER BY id ASC"
     rows = conn.execute(query, params).fetchall()
     return [Approval.from_row(row) for row in rows]
 
@@ -455,12 +452,7 @@ def list_approval_runs(
         query += " AND status = ?"
         params.append(_validate_approval_run_status(status))
 
-    if task_id is None and approval_id is None:
-        query += " ORDER BY task_id ASC, started_at ASC, id ASC"
-    elif approval_id is not None:
-        query += " ORDER BY id ASC"
-    else:
-        query += " ORDER BY started_at ASC, id ASC"
+    query += " ORDER BY id ASC"
     rows = conn.execute(query, params).fetchall()
     return [ApprovalRun.from_row(row) for row in rows]
 
