@@ -162,7 +162,7 @@ def test_cli_approval_runs(kanban_home, monkeypatch):
             conn,
             task["id"],
             "coder",
-            "Escalated to human after a fairly detailed review comment that should truncate cleanly.",
+            "Escalated to human after a fairly detailed review comment that should truncate cleanly once it gets past the shared kanban show width and keeps going with extra rationale for the operator to inspect in json mode.",
         )
         failed_run = approvals_db._create_task_approval_run_for_tests(
             conn,
@@ -172,7 +172,7 @@ def test_cli_approval_runs(kanban_home, monkeypatch):
             started_at=700,
             ended_at=1000,
             outcome="failed",
-            error="very long failure reason that should be truncated in the text output for readability and operator scanning",
+            error="very long failure reason that should be truncated in the text output for readability and operator scanning while still preserving the complete single-line text in json output for downstream tooling and debugging",
         )
         running_run = approvals_db._create_task_approval_run_for_tests(
             conn,
@@ -205,18 +205,20 @@ def test_cli_approval_runs(kanban_home, monkeypatch):
     assert "@default" in runs_text
     assert "[pid: 81895]" in runs_text
     assert "[comment #" in runs_text
-    assert "      ! very long failure reason" in runs_text
-    assert "      → Escalated to human" in runs_text
+    assert "    ! very long failure reason" in runs_text
+    assert "    → Escalated to human" in runs_text
+    assert "json output for downstream tooling and debugging" not in runs_text
+    assert "operator to inspect in json mode." not in runs_text
 
     assert [row["id"] for row in runs_json] == [failed_run.id, running_run.id, escalated_run.id]
     assert runs_json[0]["display_status"] == "failed"
     assert runs_json[0]["elapsed_seconds"] == 300
-    assert runs_json[0]["error_preview"].startswith("very long failure reason")
+    assert runs_json[0]["error_preview"].endswith("json output for downstream tooling and debugging")
     assert runs_json[1]["worker_pid"] == 81895
     assert runs_json[1]["elapsed_seconds"] == 67
     assert runs_json[2]["comment_id"] == comment_id
     assert runs_json[2]["comment_body"].startswith("Escalated to human")
-    assert runs_json[2]["comment_preview"].startswith("Escalated to human")
+    assert runs_json[2]["comment_preview"].endswith("operator to inspect in json mode.")
     assert missing == "unknown approval 99999"
 
 
