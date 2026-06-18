@@ -151,9 +151,9 @@ def _format_list_approval_badges(approval: approvals_db.Approval) -> str:
     return f" {' '.join(badges)}" if badges else ""
 
 
-def _truncate_single_line(text: str, *, limit: int = 80) -> str:
+def _truncate_single_line(text: str, *, limit: int | None = 160) -> str:
     collapsed = " ".join((text or "").split())
-    if len(collapsed) <= limit:
+    if limit is None or len(collapsed) <= limit:
         return collapsed
     return collapsed[: max(0, limit - 1)].rstrip() + "…"
 
@@ -316,8 +316,8 @@ def _approval_run_to_cli_dict(
         "elapsed_seconds": elapsed,
         "assignee": run.profile,
         "comment_body": comment_body,
-        "comment_preview": _truncate_single_line(comment_body) if comment_body else None,
-        "error_preview": _truncate_single_line(run.error) if run.error else None,
+        "comment_preview": _truncate_single_line(comment_body, limit=None) if comment_body else None,
+        "error_preview": _truncate_single_line(run.error, limit=None) if run.error else None,
     }
 
 
@@ -440,9 +440,9 @@ def _cmd_approval_runs(args: argparse.Namespace) -> int:
     for run in runs:
         print(_format_approval_run_line(run))
         if run.error:
-            print(f"      ! {_truncate_single_line(run.error)}")
+            print(f"    ! {_truncate_single_line(run.error)}")
         if run.comment_id is not None and (comment_body := comment_bodies.get(run.comment_id)):
-            print(f"      → {_truncate_single_line(comment_body)}")
+            print(f"    → {_truncate_single_line(comment_body)}")
     return 0
 
 
