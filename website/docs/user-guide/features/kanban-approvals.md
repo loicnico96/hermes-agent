@@ -144,23 +144,48 @@ hermes kanban approval request t_abc --agent reviewer --skill security-review
 ### Inspecting approvals
 
 ```bash
-hermes kanban show t_abc
+# Default: grouped by task, hiding done/archived parent tasks
+hermes kanban approval ls
+
+# `list` remains an alias
 hermes kanban approval list
-hermes kanban approval list --task t_abc
-hermes kanban approval list --type human
-hermes kanban approval list --type agent
+
+# Flat one-row-per-approval view
+hermes kanban approval ls --flat
+
+# Inspect one task (implies `--flat` and includes done/archived parents)
+hermes kanban approval ls --task t_abc
+
+# Restrict by approver kind or approval status
+hermes kanban approval ls --human
+hermes kanban approval ls --agent
+hermes kanban approval ls --status approved
+
+# Include done/archived parents, or only tasks currently awaiting approval
+hermes kanban approval ls --all
+hermes kanban approval ls --active
 ```
 
-- The approval ID is an integer auto-increment. It is required for further commands.
+- Default output is grouped by parent task.
+- `--task <task_id>` implies `--flat` and errors if the task does not exist.
+- `--all` and `--active` are mutually exclusive.
+- The approval ID is an integer auto-increment. It is required for follow-up commands such as `remove`, `reset`, and `reclaim`.
 
 ### Completing human review
 
 The comment is optional.
 If specified, it is added to the task thread and linked to the approval for bookkeeping.
 
+`approve` and `reject` accept either an approval id or a task id.
+When given a task id, Hermes resolves that task's human approval row, creating it first if the task is already in `approval` and no human row exists yet.
+
 ```bash
 hermes kanban approval approve 6 --comment "LGTM"
 hermes kanban approval reject 6 --comment "Needs stronger tests"
+
+# Equivalent task-id forms
+hermes kanban approval approve t_abc --comment "LGTM"
+hermes kanban approval reject t_abc --comment "Needs stronger tests"
 ```
 
 - **If any agents are currently running, they are immediately cancelled.**
