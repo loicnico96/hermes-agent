@@ -176,16 +176,52 @@ def _cmd_approval_remove(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_manual_approval_target(conn: Any, target: str) -> int:
+    normalized_target = target.strip()
+    if not normalized_target:
+        raise ValueError("approval target is required")
+
+    if normalized_target.startswith("t_"):
+        task = kb.get_task(conn, normalized_target)
+        if task is None:
+            raise ValueError(f"unknown task {normalized_target}")
+        if task.status != "approval":
+            raise ValueError("parent task must be in approval status")
+
+        human_approvals = approvals_db.list_task_approvals(
+            conn,
+            normalized_target,
+            approver_type="human",
+        )
+        if len(human_approvals) > 1:
+            raise ValueError(f"task {normalized_target} has multiple human approvals")
+        if human_approvals:
+            return human_approvals[0].id
+
+        created = approvals_db.create_task_approval(
+            conn,
+            task_id=normalized_target,
+            approver_type="human",
+        )
+        return created.id
+
+    try:
+        return int(normalized_target)
+    except ValueError as exc:
+        raise ValueError(f"unknown approval target {target!r}") from exc
+
+
 def _cmd_approval_decide(args: argparse.Namespace, *, status: str) -> int:
     with kb.connect() as conn:
+        approval_id = _resolve_manual_approval_target(conn, args.approval_target)
         aggregate_status = approvals_db.record_manual_task_approval_decision(
             conn,
-            approval_id=args.approval_id,
+            approval_id=approval_id,
             status=status,
             comment=getattr(args, "comment", None),
             comment_author=_profile_author(),
         )
-        approval = approvals_db.get_task_approval(conn, args.approval_id)
+        approval = approvals_db.get_task_approval(conn, approval_id)
         assert approval is not None
         payload = _approval_mutation_payload(conn, approval)
         payload["aggregate_status"] = aggregate_status
@@ -295,12 +331,12 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
     p_approval_remove.add_argument("--json", action="store_true")
 
     p_approval_approve = approval_sub.add_parser("approve", help="Record a human approval decision")
-    p_approval_approve.add_argument("approval_id", type=int)
+    p_approval_approve.add_argument("approval_target", help="Approval id or task id")
     p_approval_approve.add_argument("--comment", default=None, help="Optional task comment to append")
     p_approval_approve.add_argument("--json", action="store_true")
 
     p_approval_reject = approval_sub.add_parser("reject", help="Record a human rejection decision")
-    p_approval_reject.add_argument("approval_id", type=int)
+    p_approval_reject.add_argument("approval_target", help="Approval id or task id")
     p_approval_reject.add_argument("--comment", default=None, help="Optional task comment to append")
     p_approval_reject.add_argument("--json", action="store_true")
 
