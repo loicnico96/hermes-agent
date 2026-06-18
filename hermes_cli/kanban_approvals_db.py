@@ -457,6 +457,8 @@ def list_approval_runs(
 
     if task_id is None and approval_id is None:
         query += " ORDER BY task_id ASC, started_at ASC, id ASC"
+    elif approval_id is not None:
+        query += " ORDER BY id ASC"
     else:
         query += " ORDER BY started_at ASC, id ASC"
     rows = conn.execute(query, params).fetchall()

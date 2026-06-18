@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import defaultdict
 from typing import Any
 
@@ -150,6 +151,29 @@ def _format_list_approval_badges(approval: approvals_db.Approval) -> str:
     return f" {' '.join(badges)}" if badges else ""
 
 
+def _truncate_single_line(text: str, *, limit: int = 80) -> str:
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _load_task_comment_bodies(
+    conn: Any,
+    *,
+    task_id: str,
+    comment_ids: list[int],
+) -> dict[int, str]:
+    if not comment_ids:
+        return {}
+    placeholders = ", ".join("?" for _ in comment_ids)
+    rows = conn.execute(
+        f"SELECT id, body FROM task_comments WHERE task_id = ? AND id IN ({placeholders})",
+        [task_id, *comment_ids],
+    ).fetchall()
+    return {int(row["id"]): str(row["body"] or "") for row in rows}
+
+
 def _list_approval_task_ids(approvals: list[approvals_db.Approval]) -> list[str]:
     return list(dict.fromkeys(approval.task_id for approval in approvals))
 
@@ -255,6 +279,48 @@ def _flat_approval_row_to_dict(approval: approvals_db.Approval, task: kb.Task) -
     }
 
 
+def _approval_run_identity(run: approvals_db.ApprovalRun) -> str:
+    return f"@{run.profile or '-'}"
+
+
+def _format_approval_run_badges(run: approvals_db.ApprovalRun) -> str:
+    badges: list[str] = []
+    if run.worker_pid is not None:
+        badges.append(f"[pid: {run.worker_pid}]")
+    if run.comment_id is not None:
+        badges.append(f"[comment #{run.comment_id}]")
+    return f" {' '.join(badges)}" if badges else ""
+
+
+def _format_approval_run_line(run: approvals_db.ApprovalRun) -> str:
+    elapsed = max(0, (run.ended_at or int(time.time())) - run.started_at)
+    outcome = run.outcome or run.status or "active"
+    return (
+        f"#{run.id}".ljust(8)
+        + f"{outcome.ljust(12)}"
+        + f"{f'{elapsed}s'.ljust(8)}"
+        + f"{_approval_run_identity(run)}"
+        + f"{_format_approval_run_badges(run)}"
+    )
+
+
+def _approval_run_to_cli_dict(
+    run: approvals_db.ApprovalRun,
+    *,
+    comment_body: str | None,
+) -> dict[str, Any]:
+    elapsed = max(0, (run.ended_at or int(time.time())) - run.started_at)
+    return {
+        **approval_run_to_dict(run),
+        "display_status": run.outcome or run.status or "active",
+        "elapsed_seconds": elapsed,
+        "assignee": run.profile,
+        "comment_body": comment_body,
+        "comment_preview": _truncate_single_line(comment_body) if comment_body else None,
+        "error_preview": _truncate_single_line(run.error) if run.error else None,
+    }
+
+
 def _cmd_approval_request(args: argparse.Namespace) -> int:
     approver_type = "human" if getattr(args, "human", False) else "agent"
     if approver_type == "human" and getattr(args, "skill", None):
@@ -287,7 +353,7 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         approver_type = "agent"
 
     with kb.connect() as conn:
-        task_id = getattr(args, "task", None)
+        task_id = getattr(args, "task_id", None)
         task_filter = kb.get_task(conn, task_id) if task_id is not None else None
         if task_id is not None and task_filter is None:
             print(f"no such task: {task_id}", file=sys.stderr)
@@ -342,6 +408,41 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         print(_format_grouped_task_header(task))
         for approval in task_approvals:
             print(_format_grouped_approval_line(approval))
+    return 0
+
+
+def _cmd_approval_runs(args: argparse.Namespace) -> int:
+    with kb.connect() as conn:
+        approval = approvals_db.get_task_approval(conn, args.approval_id)
+        if approval is None:
+            print(f"unknown approval {args.approval_id}", file=sys.stderr)
+            return 1
+        runs = approvals_db.list_approval_runs(conn, approval_id=args.approval_id)
+        comment_ids = [run.comment_id for run in runs if run.comment_id is not None]
+        comment_bodies = _load_task_comment_bodies(
+            conn,
+            task_id=approval.task_id,
+            comment_ids=[int(comment_id) for comment_id in comment_ids],
+        )
+
+    if getattr(args, "json", False):
+        payload = [
+            _approval_run_to_cli_dict(run, comment_body=comment_bodies.get(run.comment_id, None))
+            for run in runs
+        ]
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    if not runs:
+        print("(no approval runs)")
+        return 0
+
+    for run in runs:
+        print(_format_approval_run_line(run))
+        if run.error:
+            print(f"      ! {_truncate_single_line(run.error)}")
+        if run.comment_id is not None and (comment_body := comment_bodies.get(run.comment_id)):
+            print(f"      → {_truncate_single_line(comment_body)}")
     return 0
 
 
@@ -454,12 +555,14 @@ def _cmd_approval_reclaim(args: argparse.Namespace) -> int:
 def _dispatch_approval(args: argparse.Namespace) -> int:
     sub = getattr(args, "approval_action", None)
     if not sub:
-        print("kanban approval: specify a subcommand (request, ls, list, remove, approve, reject, reset, reclaim)", file=sys.stderr)
+        print("kanban approval: specify a subcommand (request, ls, list, runs, remove, approve, reject, reset, reclaim)", file=sys.stderr)
         return 2
     if sub == "request":
         return _cmd_approval_request(args)
     if sub in {"ls", "list"}:
         return _cmd_approval_list(args)
+    if sub == "runs":
+        return _cmd_approval_runs(args)
     if sub == "remove":
         return _cmd_approval_remove(args)
     if sub == "approve":
@@ -494,7 +597,7 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
     p_approval_request.add_argument("--json", action="store_true")
 
     p_approval_list = approval_sub.add_parser("ls", aliases=["list"], help="List approval rows")
-    p_approval_list.add_argument("--task", default=None, help="Restrict to one task id")
+    p_approval_list.add_argument("task_id", nargs="?", default=None, help="Restrict to one task id")
     p_approval_list.add_argument(
         "--status",
         default=None,
@@ -509,6 +612,10 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
     approver_type.add_argument("--human", action="store_true", help="Restrict to human approvals")
     approver_type.add_argument("--agent", action="store_true", help="Restrict to agent approvals")
     p_approval_list.add_argument("--json", action="store_true")
+
+    p_approval_runs = approval_sub.add_parser("runs", help="List runs for one approval row")
+    p_approval_runs.add_argument("approval_id", type=int)
+    p_approval_runs.add_argument("--json", action="store_true")
 
     p_approval_remove = approval_sub.add_parser("remove", help="Remove one approval row")
     p_approval_remove.add_argument("approval_id", type=int)

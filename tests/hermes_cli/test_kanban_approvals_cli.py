@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_cli.kanban_approvals as approvals_cli
 from hermes_cli import kanban_approvals_db as approvals_db
 
 from hermes_cli import kanban_db as kb
@@ -39,7 +40,7 @@ def test_cli_approval_request_list_and_show(kanban_home):
         )
 
     board_rows = json.loads(run_slash("approval list --flat --json"))
-    task_rows = json.loads(run_slash(f"approval list --task {task_id} --json"))
+    task_rows = json.loads(run_slash(f"approval list {task_id} --json"))
     approved_rows = json.loads(run_slash("approval list --flat --status approved --all --json"))
     human_rows = json.loads(run_slash("approval list --flat --human --json"))
     shown = run_slash(f"show {task_id}")
@@ -87,8 +88,8 @@ def test_cli_approval_ls_groups_by_task_and_filters_parent_status(kanban_home):
     grouped_json = json.loads(run_slash("approval ls --json"))
     all_grouped_json = json.loads(run_slash("approval ls --all --json"))
     active_grouped_json = json.loads(run_slash("approval ls --active --json"))
-    task_rows = json.loads(run_slash(f"approval ls --task {done_task['id']} --json"))
-    missing_task = run_slash("approval ls --task t_missing")
+    task_rows = json.loads(run_slash(f"approval ls {done_task['id']} --json"))
+    missing_task = run_slash("approval ls t_missing")
 
     assert active_task["id"] in grouped_text
     assert done_task["id"] not in grouped_text
@@ -132,7 +133,7 @@ def test_cli_approval_ls_flat_filters_and_aliases(kanban_home):
     human_rows = json.loads(run_slash("approval ls --flat --human --all --json"))
     agent_rows = json.loads(run_slash("approval ls --flat --agent --all --json"))
     approved_rows = json.loads(run_slash("approval ls --flat --status approved --all --json"))
-    task_rows = json.loads(run_slash(f"approval ls --task {second_task['id']} --json"))
+    task_rows = json.loads(run_slash(f"approval ls {second_task['id']} --json"))
     conflict = run_slash("approval ls --all --active")
 
     assert first_task["id"] in flat_text
@@ -147,6 +148,76 @@ def test_cli_approval_ls_flat_filters_and_aliases(kanban_home):
     assert [row["approval_id"] for row in task_rows] == [second_agent["id"], second_human["id"]]
     assert task_rows[0]["task_id"] == second_task["id"]
     assert conflict.startswith("⚠ /kanban usage error")
+
+
+
+def test_cli_approval_runs(kanban_home, monkeypatch):
+    monkeypatch.setattr(approvals_cli.time, "time", lambda: 567)
+
+    task = json.loads(run_slash("create 'approval run target' --assignee worker --json"))
+    approval = json.loads(run_slash(f"approval request {task['id']} --agent coder --json"))
+
+    with kb.connect() as conn:
+        comment_id = kb.add_comment(
+            conn,
+            task["id"],
+            "coder",
+            "Escalated to human after a fairly detailed review comment that should truncate cleanly.",
+        )
+        failed_run = approvals_db._create_task_approval_run_for_tests(
+            conn,
+            approval_id=approval["id"],
+            profile="default",
+            status="failed",
+            started_at=700,
+            ended_at=1000,
+            outcome="failed",
+            error="very long failure reason that should be truncated in the text output for readability and operator scanning",
+        )
+        running_run = approvals_db._create_task_approval_run_for_tests(
+            conn,
+            approval_id=approval["id"],
+            profile="coder",
+            status="running",
+            started_at=500,
+            worker_pid=81895,
+        )
+        escalated_run = approvals_db._create_task_approval_run_for_tests(
+            conn,
+            approval_id=approval["id"],
+            profile="coder",
+            status="escalated",
+            started_at=100,
+            ended_at=223,
+            outcome="escalated",
+            comment_id=comment_id,
+        )
+
+    runs_text = run_slash(f"approval runs {approval['id']}")
+    runs_json = json.loads(run_slash(f"approval runs {approval['id']} --json"))
+    missing = run_slash("approval runs 99999")
+
+    assert f"#{failed_run.id}" in runs_text
+    assert f"#{running_run.id}" in runs_text
+    assert f"#{escalated_run.id}" in runs_text
+    assert "failed" in runs_text
+    assert "300s" in runs_text
+    assert "@default" in runs_text
+    assert "[pid: 81895]" in runs_text
+    assert "[comment #" in runs_text
+    assert "      ! very long failure reason" in runs_text
+    assert "      → Escalated to human" in runs_text
+
+    assert [row["id"] for row in runs_json] == [failed_run.id, running_run.id, escalated_run.id]
+    assert runs_json[0]["display_status"] == "failed"
+    assert runs_json[0]["elapsed_seconds"] == 300
+    assert runs_json[0]["error_preview"].startswith("very long failure reason")
+    assert runs_json[1]["worker_pid"] == 81895
+    assert runs_json[1]["elapsed_seconds"] == 67
+    assert runs_json[2]["comment_id"] == comment_id
+    assert runs_json[2]["comment_body"].startswith("Escalated to human")
+    assert runs_json[2]["comment_preview"].startswith("Escalated to human")
+    assert missing == "unknown approval 99999"
 
 
 
