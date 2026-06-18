@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+from collections import defaultdict
 from typing import Any
 
 from hermes_cli import kanban_approvals_db as approvals_db
@@ -110,6 +111,150 @@ def _approval_mutation_payload(conn: Any, approval: approvals_db.Approval) -> di
     }
 
 
+def _approval_task_to_dict(task: kb.Task) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "status": task.status,
+        "priority": task.priority,
+        "assignee": task.assignee,
+        "created_at": task.created_at,
+    }
+
+
+def _list_task_assignee(task: kb.Task) -> str:
+    if task.assignee is None:
+        return "-"
+    if task.assignee == "human":
+        return "human"
+    return f"agent @{task.assignee}"
+
+
+def _format_list_approval_target(approval: approvals_db.Approval) -> str:
+    if approval.approver_type == "human":
+        return "human"
+    target = f"agent @{approval.approver_profile}"
+    if approval.approver_skill:
+        target += f":{approval.approver_skill}"
+    return target
+
+
+def _format_list_approval_badges(approval: approvals_db.Approval) -> str:
+    badges: list[str] = []
+    if approval.current_run_id is not None:
+        badges.append(f"[run #{approval.current_run_id}]")
+    if approval.worker_pid is not None:
+        badges.append(f"[pid: {approval.worker_pid}]")
+    if approval.comment_id is not None:
+        badges.append(f"[comment #{approval.comment_id}]")
+    return f" {' '.join(badges)}" if badges else ""
+
+
+def _list_approval_task_ids(approvals: list[approvals_db.Approval]) -> list[str]:
+    return list(dict.fromkeys(approval.task_id for approval in approvals))
+
+
+def _load_approval_tasks(conn: Any, approvals: list[approvals_db.Approval]) -> dict[str, kb.Task]:
+    tasks: dict[str, kb.Task] = {}
+    for task_id in _list_approval_task_ids(approvals):
+        task = kb.get_task(conn, task_id)
+        if task is not None:
+            tasks[task_id] = task
+    return tasks
+
+
+def _matches_parent_task_filter(task: kb.Task, *, include_all: bool, active_only: bool) -> bool:
+    if include_all:
+        return True
+    if active_only:
+        return task.status == "approval"
+    return task.status not in {"done", "archived"}
+
+
+def _filter_approvals_by_parent_task(
+    approvals: list[approvals_db.Approval],
+    *,
+    tasks_by_id: dict[str, kb.Task],
+    include_all: bool,
+    active_only: bool,
+) -> list[approvals_db.Approval]:
+    return [
+        approval
+        for approval in approvals
+        if (task := tasks_by_id.get(approval.task_id)) is not None
+        and _matches_parent_task_filter(task, include_all=include_all, active_only=active_only)
+    ]
+
+
+def _group_approvals_by_task(
+    approvals: list[approvals_db.Approval],
+    *,
+    tasks_by_id: dict[str, kb.Task],
+) -> list[tuple[kb.Task, list[approvals_db.Approval]]]:
+    grouped: dict[str, list[approvals_db.Approval]] = defaultdict(list)
+    for approval in sorted(approvals, key=lambda row: row.id):
+        grouped[approval.task_id].append(approval)
+
+    tasks = [tasks_by_id[task_id] for task_id in grouped]
+    tasks.sort(key=lambda task: (-task.priority, task.created_at, task.id))
+    return [(task, grouped[task.id]) for task in tasks]
+
+
+def _format_grouped_task_header(task: kb.Task) -> str:
+    return (
+        f"{task.id.ljust(12)}"
+        f"{task.status.ljust(12)}"
+        f"{_list_task_assignee(task).ljust(26)}"
+        f"{task.title}"
+    )
+
+
+def _format_flat_approval_line(approval: approvals_db.Approval) -> str:
+    return (
+        f"#{approval.id}".ljust(8)
+        + f"{approval.task_id.ljust(12)}"
+        + f"{approval.status.ljust(12)}"
+        + f"{_format_list_approval_target(approval)}"
+        + f"{_format_list_approval_badges(approval)}"
+    )
+
+
+def _format_grouped_approval_line(approval: approvals_db.Approval) -> str:
+    return (
+        f"  #{approval.id}".ljust(12)
+        + f"{approval.status.ljust(12)}"
+        + f"{_format_list_approval_target(approval)}"
+        + f"{_format_list_approval_badges(approval)}"
+    )
+
+
+def _approval_group_to_dict(task: kb.Task, approvals: list[approvals_db.Approval]) -> dict[str, Any]:
+    return {
+        "task": _approval_task_to_dict(task),
+        "approvals": [approval_to_dict(approval) for approval in approvals],
+    }
+
+
+def _flat_approval_row_to_dict(approval: approvals_db.Approval, task: kb.Task) -> dict[str, Any]:
+    return {
+        "approval_id": approval.id,
+        "task_id": approval.task_id,
+        "approval_status": approval.status,
+        "approver_type": approval.approver_type,
+        "approver_profile": approval.approver_profile,
+        "approver_skill": approval.approver_skill,
+        "comment_id": approval.comment_id,
+        "current_run_id": approval.current_run_id,
+        "worker_pid": approval.worker_pid,
+        "task_status": task.status,
+        "task_assignee": task.assignee,
+        "task_title": task.title,
+        "task_priority": task.priority,
+        "task_created_at": task.created_at,
+        "approval_created_at": approval.created_at,
+    }
+
+
 def _cmd_approval_request(args: argparse.Namespace) -> int:
     approver_type = "human" if getattr(args, "human", False) else "agent"
     if approver_type == "human" and getattr(args, "skill", None):
@@ -135,29 +280,68 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
 
 
 def _cmd_approval_list(args: argparse.Namespace) -> int:
+    approver_type = None
+    if getattr(args, "human", False):
+        approver_type = "human"
+    elif getattr(args, "agent", False):
+        approver_type = "agent"
+
     with kb.connect() as conn:
         task_id = getattr(args, "task", None)
-        if task_id is not None and kb.get_task(conn, task_id) is None:
+        task_filter = kb.get_task(conn, task_id) if task_id is not None else None
+        if task_id is not None and task_filter is None:
             print(f"no such task: {task_id}", file=sys.stderr)
             return 1
         approvals = approvals_db.list_approvals(
             conn,
             task_id=task_id,
             status=getattr(args, "status", None),
-            approver_type=getattr(args, "approver_type", None),
+            approver_type=approver_type,
         )
+        tasks_by_id = _load_approval_tasks(conn, approvals)
+
+    include_all = bool(getattr(args, "all", False)) or task_id is not None
+    active_only = bool(getattr(args, "active", False))
+    approvals = _filter_approvals_by_parent_task(
+        approvals,
+        tasks_by_id=tasks_by_id,
+        include_all=include_all,
+        active_only=active_only,
+    )
+
+    flat_view = bool(getattr(args, "flat", False) or task_id is not None)
+    if flat_view:
+        approvals.sort(key=lambda row: row.id)
 
     if getattr(args, "json", False):
-        print(json.dumps([approval_to_dict(approval) for approval in approvals], indent=2, ensure_ascii=False))
+        if flat_view:
+            payload: Any = [
+                _flat_approval_row_to_dict(approval, tasks_by_id[approval.task_id])
+                for approval in approvals
+                if approval.task_id in tasks_by_id
+            ]
+        else:
+            payload = [
+                _approval_group_to_dict(task, task_approvals)
+                for task, task_approvals in _group_approvals_by_task(approvals, tasks_by_id=tasks_by_id)
+            ]
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
     if not approvals:
         print("(no matching approvals)")
         return 0
 
-    include_task_id = task_id is None
-    for approval in approvals:
-        print(_format_approval_line(approval, include_task_id=include_task_id))
+    if flat_view:
+        for approval in approvals:
+            print(_format_flat_approval_line(approval))
+        return 0
+
+    grouped = _group_approvals_by_task(approvals, tasks_by_id=tasks_by_id)
+    for task, task_approvals in grouped:
+        print(_format_grouped_task_header(task))
+        for approval in task_approvals:
+            print(_format_grouped_approval_line(approval))
     return 0
 
 
@@ -270,11 +454,11 @@ def _cmd_approval_reclaim(args: argparse.Namespace) -> int:
 def _dispatch_approval(args: argparse.Namespace) -> int:
     sub = getattr(args, "approval_action", None)
     if not sub:
-        print("kanban approval: specify a subcommand (request, list, remove, approve, reject, reset, reclaim)", file=sys.stderr)
+        print("kanban approval: specify a subcommand (request, ls, list, remove, approve, reject, reset, reclaim)", file=sys.stderr)
         return 2
     if sub == "request":
         return _cmd_approval_request(args)
-    if sub == "list":
+    if sub in {"ls", "list"}:
         return _cmd_approval_list(args)
     if sub == "remove":
         return _cmd_approval_remove(args)
@@ -309,7 +493,7 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
     p_approval_request.add_argument("--skill", default=None, help="Optional skill name for an agent approval")
     p_approval_request.add_argument("--json", action="store_true")
 
-    p_approval_list = approval_sub.add_parser("list", help="List approval rows")
+    p_approval_list = approval_sub.add_parser("ls", aliases=["list"], help="List approval rows")
     p_approval_list.add_argument("--task", default=None, help="Restrict to one task id")
     p_approval_list.add_argument(
         "--status",
@@ -317,13 +501,13 @@ def register_approval_subparser(subparsers: argparse._SubParsersAction) -> argpa
         choices=sorted(approvals_db.VALID_APPROVAL_STATUSES),
         help="Restrict to one approval status",
     )
-    p_approval_list.add_argument(
-        "--type",
-        dest="approver_type",
-        default=None,
-        choices=sorted(approvals_db.VALID_APPROVAL_TYPES),
-        help="Restrict to human or agent approvals",
-    )
+    active_scope = p_approval_list.add_mutually_exclusive_group()
+    active_scope.add_argument("--all", action="store_true", help="Include parent tasks in any status")
+    active_scope.add_argument("--active", action="store_true", help="Only include parent tasks in approval status")
+    p_approval_list.add_argument("--flat", action="store_true", help="Show one row per approval instead of grouping by task")
+    approver_type = p_approval_list.add_mutually_exclusive_group()
+    approver_type.add_argument("--human", action="store_true", help="Restrict to human approvals")
+    approver_type.add_argument("--agent", action="store_true", help="Restrict to agent approvals")
     p_approval_list.add_argument("--json", action="store_true")
 
     p_approval_remove = approval_sub.add_parser("remove", help="Remove one approval row")

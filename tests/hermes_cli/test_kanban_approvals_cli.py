@@ -38,22 +38,115 @@ def test_cli_approval_request_list_and_show(kanban_home):
             (7_050, agent_approval["id"]),
         )
 
-    board_rows = json.loads(run_slash("approval list --json"))
+    board_rows = json.loads(run_slash("approval list --flat --json"))
     task_rows = json.loads(run_slash(f"approval list --task {task_id} --json"))
-    approved_rows = json.loads(run_slash("approval list --status approved --json"))
-    human_rows = json.loads(run_slash("approval list --type human --json"))
+    approved_rows = json.loads(run_slash("approval list --flat --status approved --all --json"))
+    human_rows = json.loads(run_slash("approval list --flat --human --json"))
     shown = run_slash(f"show {task_id}")
     shown_json = json.loads(run_slash(f"show {task_id} --json"))
 
-    assert [row["id"] for row in board_rows] == [human_approval["id"], agent_approval["id"]]
-    assert [row["id"] for row in task_rows] == [human_approval["id"], agent_approval["id"]]
-    assert [row["id"] for row in approved_rows] == [agent_approval["id"]]
-    assert [row["id"] for row in human_rows] == [human_approval["id"]]
+    assert [row["approval_id"] for row in board_rows] == [human_approval["id"], agent_approval["id"]]
+    assert [row["approval_id"] for row in task_rows] == [human_approval["id"], agent_approval["id"]]
+    assert [row["approval_id"] for row in approved_rows] == [agent_approval["id"]]
+    assert [row["approval_id"] for row in human_rows] == [human_approval["id"]]
     assert "Approvals (2):" in shown
     assert "human" in shown
     assert "agent @reviewer skill=security-review" in shown
     assert [row["id"] for row in shown_json["approvals"]] == [human_approval["id"], agent_approval["id"]]
     assert shown_json["approval_runs"] == []
+
+
+
+def test_cli_approval_ls_groups_by_task_and_filters_parent_status(kanban_home):
+    active_task = json.loads(run_slash("create 'active approval target' --assignee worker --json"))
+    done_task = json.loads(run_slash("create 'done approval target' --assignee worker --json"))
+    archived_task = json.loads(run_slash("create 'archived approval target' --assignee worker --json"))
+
+    active_human = json.loads(run_slash(f"approval request {active_task['id']} --human --json"))
+    active_agent = json.loads(
+        run_slash(f"approval request {active_task['id']} --agent reviewer --skill security-review --json")
+    )
+    done_agent = json.loads(run_slash(f"approval request {done_task['id']} --agent reviewer --json"))
+    json.loads(run_slash(f"approval request {archived_task['id']} --human --json"))
+
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = 'approval', priority = 7, created_at = 100 WHERE id = ?",
+            (active_task["id"],),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'done', priority = 9, created_at = 50 WHERE id = ?",
+            (done_task["id"],),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', priority = 8, created_at = 75 WHERE id = ?",
+            (archived_task["id"],),
+        )
+
+    grouped_text = run_slash("approval ls")
+    grouped_json = json.loads(run_slash("approval ls --json"))
+    all_grouped_json = json.loads(run_slash("approval ls --all --json"))
+    active_grouped_json = json.loads(run_slash("approval ls --active --json"))
+    task_rows = json.loads(run_slash(f"approval ls --task {done_task['id']} --json"))
+    missing_task = run_slash("approval ls --task t_missing")
+
+    assert active_task["id"] in grouped_text
+    assert done_task["id"] not in grouped_text
+    assert archived_task["id"] not in grouped_text
+    assert f"{active_task['id'].ljust(12)}{'approval'.ljust(12)}{'agent @worker'.ljust(26)}active approval target" in grouped_text
+    assert f"  #{active_human['id']}" in grouped_text
+    assert f"agent @reviewer:security-review" in grouped_text
+
+    assert [group["task"]["id"] for group in grouped_json] == [active_task["id"]]
+    assert [row["id"] for row in grouped_json[0]["approvals"]] == [active_human["id"], active_agent["id"]]
+
+    assert [group["task"]["id"] for group in all_grouped_json] == [
+        done_task["id"],
+        archived_task["id"],
+        active_task["id"],
+    ]
+    assert [group["task"]["id"] for group in active_grouped_json] == [active_task["id"]]
+    assert [row["approval_id"] for row in task_rows] == [done_agent["id"]]
+    assert missing_task == "no such task: t_missing"
+
+
+
+def test_cli_approval_ls_flat_filters_and_aliases(kanban_home):
+    first_task = json.loads(run_slash("create 'first approval target' --assignee worker --json"))
+    second_task = json.loads(run_slash("create 'second approval target' --assignee worker --json"))
+
+    first_human = json.loads(run_slash(f"approval request {first_task['id']} --human --json"))
+    second_agent = json.loads(run_slash(f"approval request {second_task['id']} --agent reviewer --json"))
+    second_human = json.loads(run_slash(f"approval request {second_task['id']} --human --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (first_task["id"],))
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (second_task["id"],))
+        conn.execute(
+            "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
+            (7_050, second_agent["id"]),
+        )
+
+    flat_text = run_slash("approval ls --flat")
+    flat_json = json.loads(run_slash("approval ls --flat --all --json"))
+    human_rows = json.loads(run_slash("approval ls --flat --human --all --json"))
+    agent_rows = json.loads(run_slash("approval ls --flat --agent --all --json"))
+    approved_rows = json.loads(run_slash("approval ls --flat --status approved --all --json"))
+    task_rows = json.loads(run_slash(f"approval ls --task {second_task['id']} --json"))
+    conflict = run_slash("approval ls --all --active")
+
+    assert first_task["id"] in flat_text
+    assert second_task["id"] not in flat_text
+    assert f"#{first_human['id']}" in flat_text
+    assert f"{first_task['id'].ljust(12)}{'requested'.ljust(12)}human" in flat_text
+
+    assert [row["approval_id"] for row in flat_json] == [first_human["id"], second_agent["id"], second_human["id"]]
+    assert [row["approval_id"] for row in human_rows] == [first_human["id"], second_human["id"]]
+    assert [row["approval_id"] for row in agent_rows] == [second_agent["id"]]
+    assert [row["approval_id"] for row in approved_rows] == [second_agent["id"]]
+    assert [row["approval_id"] for row in task_rows] == [second_agent["id"], second_human["id"]]
+    assert task_rows[0]["task_id"] == second_task["id"]
+    assert conflict.startswith("⚠ /kanban usage error")
 
 
 
