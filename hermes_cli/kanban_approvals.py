@@ -66,12 +66,6 @@ def approval_to_dict(approval: approvals_db.Approval) -> dict[str, Any]:
     }
 
 
-def format_approval_line(approval: approvals_db.Approval, *, include_task_id: bool) -> str:
-    if include_task_id:
-        return _format_flat_approval_line(approval)
-    return _format_grouped_approval_line(approval)
-
-
 def format_approval_run_line(run: approvals_db.ApprovalRun) -> str:
     elapsed = (max(0, run.ended_at - run.started_at) if run.ended_at is not None else None)
     elapsed_text = f"{elapsed}s" if elapsed is not None else "active"
@@ -114,17 +108,23 @@ def _list_task_assignee(task: kb.Task) -> str:
     return f"agent @{task.assignee}"
 
 
-def _format_list_approval_target(approval: approvals_db.Approval) -> str:
-    if approval.approver_type == "human":
-        return "human"
-    target = f"agent @{approval.approver_profile}"
-    if approval.approver_skill:
-        target += f":{approval.approver_skill}"
+def _format_list_approval_assignee(approval: approvals_db.Approval) -> str:
+    target = approval.approver_type
+    if approval.approver_profile:
+        target += f" @{approval.approver_profile}"
+        if approval.approver_skill:
+            target += f":{approval.approver_skill}"
     return target
 
 
-def _format_list_approval_badges(approval: approvals_db.Approval) -> str:
+def _format_list_approval_badges(
+    approval: approvals_db.Approval,
+    *,
+    include_task_id: bool = False,
+) -> str:
     badges: list[str] = []
+    if include_task_id:
+        badges.append(f"[{approval.task_id}]")
     if approval.current_run_id is not None:
         badges.append(f"[run #{approval.current_run_id}]")
     if approval.worker_pid is not None:
@@ -200,7 +200,7 @@ def _group_approvals_by_task(
     tasks_by_id: dict[str, kb.Task],
 ) -> list[tuple[kb.Task, list[approvals_db.Approval]]]:
     grouped: dict[str, list[approvals_db.Approval]] = defaultdict(list)
-    for approval in sorted(approvals, key=lambda row: row.id):
+    for approval in approvals:
         grouped[approval.task_id].append(approval)
 
     tasks = [tasks_by_id[task_id] for task_id in grouped]
@@ -217,22 +217,16 @@ def _format_grouped_task_header(task: kb.Task) -> str:
     )
 
 
-def _format_flat_approval_line(approval: approvals_db.Approval) -> str:
+def format_approval_line(
+    approval: approvals_db.Approval,
+    *,
+    include_task_id: bool = False,
+) -> str:
     return (
-        f"#{approval.id}".ljust(8)
-        + f"{approval.task_id.ljust(12)}"
-        + f"{approval.status.ljust(12)}"
-        + f"{_format_list_approval_target(approval)}"
-        + f"{_format_list_approval_badges(approval)}"
-    )
-
-
-def _format_grouped_approval_line(approval: approvals_db.Approval) -> str:
-    return (
-        f"  #{approval.id}".ljust(12)
-        + f"{approval.status.ljust(12)}"
-        + f"{_format_list_approval_target(approval)}"
-        + f"{_format_list_approval_badges(approval)}"
+        f"  #{str(approval.id).ljust(6)}".ljust(12)
+        + f"{approval.status.ljust(11)} "
+        + f"{_format_list_approval_assignee(approval)}"
+        + f"{_format_list_approval_badges(approval, include_task_id=include_task_id)}"
     )
 
 
@@ -267,7 +261,9 @@ def _approval_run_identity(run: approvals_db.ApprovalRun) -> str:
     return f"@{run.profile or '-'}"
 
 
-def _format_approval_run_badges(run: approvals_db.ApprovalRun) -> str:
+def _format_approval_run_badges(
+    run: approvals_db.ApprovalRun,
+) -> str:
     badges: list[str] = []
     if run.worker_pid is not None:
         badges.append(f"[pid: {run.worker_pid}]")
@@ -276,33 +272,18 @@ def _format_approval_run_badges(run: approvals_db.ApprovalRun) -> str:
     return f" {' '.join(badges)}" if badges else ""
 
 
-def _format_approval_run_line(run: approvals_db.ApprovalRun) -> str:
+def _format_approval_run_line(
+    run: approvals_db.ApprovalRun,
+) -> str:
     elapsed = max(0, (run.ended_at or int(time.time())) - run.started_at)
     outcome = run.outcome or run.status or "active"
     return (
-        f"#{run.id}".ljust(8)
-        + f"{outcome.ljust(12)}"
-        + f"{f'{elapsed}s'.ljust(8)}"
+        f"  #{str(run.id).ljust(6)}".ljust(12)
+        + f"{outcome.ljust(11)} "
+        + f"{f'{elapsed}s'.ljust(7)} "
         + f"{_approval_run_identity(run)}"
         + f"{_format_approval_run_badges(run)}"
     )
-
-
-def _approval_run_to_cli_dict(
-    run: approvals_db.ApprovalRun,
-    *,
-    comment_body: str | None,
-) -> dict[str, Any]:
-    elapsed = max(0, (run.ended_at or int(time.time())) - run.started_at)
-    return {
-        **approval_run_to_dict(run),
-        "display_status": run.outcome or run.status or "active",
-        "elapsed_seconds": elapsed,
-        "assignee": run.profile,
-        "comment_body": comment_body,
-        "comment_preview": _truncate_single_line(comment_body, limit=2000) if comment_body else None,
-        "error_preview": _truncate_single_line(run.error, limit=2000) if run.error else None,
-    }
 
 
 def _cmd_approval_request(args: argparse.Namespace) -> int:
@@ -324,12 +305,14 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
     else:
         print(
             f"Requested approval #{approval.id} on {approval.task_id} "
-            f"({approval.status}, {_format_list_approval_target(approval)})"
+            f"({approval.status}, {_format_list_approval_assignee(approval)})"
         )
     return 0
 
 
 def _cmd_approval_list(args: argparse.Namespace) -> int:
+    task_id = getattr(args, "task_id", None)
+    task_scoped = task_id is not None
     approver_type = None
     if getattr(args, "human", False):
         approver_type = "human"
@@ -337,7 +320,6 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         approver_type = "agent"
 
     with kb.connect() as conn:
-        task_id = getattr(args, "task_id", None)
         task_filter = kb.get_task(conn, task_id) if task_id is not None else None
         if task_id is not None and task_filter is None:
             print(f"no such task: {task_id}", file=sys.stderr)
@@ -350,7 +332,7 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         )
         tasks_by_id = _load_approval_tasks(conn, approvals)
 
-    include_all = bool(getattr(args, "all", False)) or task_id is not None
+    include_all = bool(getattr(args, "all", False)) or task_scoped
     active_only = bool(getattr(args, "active", False))
     approvals = _filter_approvals_by_parent_task(
         approvals,
@@ -359,18 +341,11 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         active_only=active_only,
     )
 
-    task_scoped = task_id is not None
-    flat_text_view = bool(getattr(args, "flat", False))
-    flat_json_view = flat_text_view or task_scoped
-    if flat_text_view or flat_json_view:
-        approvals.sort(key=lambda row: row.id)
-
     if getattr(args, "json", False):
-        if flat_json_view:
-            payload: Any = [
+        if getattr(args, "flat", False) or task_scoped:
+            payload = [
                 _flat_approval_row_to_dict(approval, tasks_by_id[approval.task_id])
-                for approval in approvals
-                if approval.task_id in tasks_by_id
+                for approval in approvals if approval.task_id in tasks_by_id
             ]
         else:
             payload = [
@@ -384,17 +359,21 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         print("(no matching approvals)")
         return 0
 
-    if flat_text_view:
+    if task_scoped:
         for approval in approvals:
-            print(_format_flat_approval_line(approval))
+            print(format_approval_line(approval))
+        return 0
+
+    if getattr(args, "flat", False):
+        for approval in approvals:
+            print(format_approval_line(approval, include_task_id=True))
         return 0
 
     grouped = _group_approvals_by_task(approvals, tasks_by_id=tasks_by_id)
     for task, task_approvals in grouped:
-        if not task_scoped:
-            print(_format_grouped_task_header(task))
+        print(_format_grouped_task_header(task))
         for approval in task_approvals:
-            print(_format_grouped_approval_line(approval))
+            print(format_approval_line(approval))
     return 0
 
 
@@ -409,14 +388,11 @@ def _cmd_approval_runs(args: argparse.Namespace) -> int:
         comment_bodies = _load_task_comment_bodies(
             conn,
             task_id=approval.task_id,
-            comment_ids=[int(comment_id) for comment_id in comment_ids],
+            comment_ids=comment_ids,
         )
 
     if getattr(args, "json", False):
-        payload = [
-            _approval_run_to_cli_dict(run, comment_body=comment_bodies.get(run.comment_id, None))
-            for run in runs
-        ]
+        payload = [approval_run_to_dict(run) for run in runs]
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
 
