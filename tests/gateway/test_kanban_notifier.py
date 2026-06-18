@@ -373,7 +373,7 @@ def test_notifier_formats_awaiting_agent_approval(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [d["text"] for d in adapter.sent] == [
-        f"🔎 @worker Kanban {tid} awaiting agent approval (#{approval_1.id}, #{approval_2.id}) — Needs agent eyes\n"
+        f"⚖️ @worker Kanban {tid} awaiting agent approval (#{approval_1.id}, #{approval_2.id}) — Needs agent eyes\n" 
         "Worker queued both agent reviewers."
     ]
 

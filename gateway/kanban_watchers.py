@@ -347,7 +347,7 @@ class GatewayKanbanWatchersMixin:
                                     f"#{approval.id}" for approval in requested_agent_approvals
                                 )
                                 msg = (
-                                    f"🔎 {tag}Kanban {task_id} awaiting agent approval "
+                                    f"⚖️ {tag}Kanban {task_id} awaiting agent approval "
                                     f"({requested_agent_ids}) — {title}{handoff}"
                                 )
                             else:
