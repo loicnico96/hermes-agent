@@ -52,7 +52,7 @@ def test_cli_approval_request_list_and_show(kanban_home):
     assert [row["approval_id"] for row in human_rows] == [human_approval["id"]]
     assert "Approvals (2):" in shown
     assert "human" in shown
-    assert "agent @reviewer skill=security-review" in shown
+    assert "agent @reviewer:security-review" in shown
     assert [row["id"] for row in shown_json["approvals"]] == [human_approval["id"], agent_approval["id"]]
     assert shown_json["approval_runs"] == []
 
@@ -117,7 +117,7 @@ def test_cli_approval_ls_flat_filters_and_aliases(kanban_home):
     second_task = json.loads(run_slash("create 'second approval target' --assignee worker --json"))
 
     first_human = json.loads(run_slash(f"approval request {first_task['id']} --human --json"))
-    second_agent = json.loads(run_slash(f"approval request {second_task['id']} --agent reviewer --json"))
+    second_agent = json.loads(run_slash(f"approval request {second_task['id']} --agent reviewer --skill approver-skill --json"))
     second_human = json.loads(run_slash(f"approval request {second_task['id']} --human --json"))
 
     with kb.connect() as conn:
@@ -148,6 +148,49 @@ def test_cli_approval_ls_flat_filters_and_aliases(kanban_home):
     assert [row["approval_id"] for row in task_rows] == [second_agent["id"], second_human["id"]]
     assert task_rows[0]["task_id"] == second_task["id"]
     assert conflict.startswith("⚠ /kanban usage error")
+
+
+
+def test_cli_show_aligns_approval_rows_with_grouped_ls(kanban_home):
+    task = json.loads(run_slash("create 'show approval target' --assignee worker --json"))
+    approval_payload = json.loads(
+        run_slash(f"approval request {task['id']} --agent reviewer --skill approver-skill --json")
+    )
+
+    with kb.connect() as conn:
+        comment_id = kb.add_comment(conn, task["id"], "reviewer", "please revise the approval rationale")
+        run = approvals_db._create_task_approval_run_for_tests(
+            conn,
+            approval_id=approval_payload["id"],
+            profile="reviewer",
+            status="running",
+            started_at=120,
+            worker_pid=4242,
+        )
+        conn.execute(
+            """
+            UPDATE task_approvals
+               SET status = 'running',
+                   current_run_id = ?,
+                   worker_pid = ?,
+                   comment_id = ?
+             WHERE id = ?
+            """,
+            (run.id, 4242, comment_id, approval_payload["id"]),
+        )
+        approval = approvals_db.get_task_approval(conn, approval_payload["id"])
+        assert approval is not None
+        expected_line = approvals_cli.format_approval_line(approval, include_task_id=False)
+
+    show_text = run_slash(f"show {task['id']}")
+
+    assert "Approvals (1):" in show_text
+    assert expected_line in show_text
+    assert ":approver-skill" in show_text
+    assert "skill=approver-skill" not in show_text
+    assert f"[run #{run.id}]" in show_text
+    assert "[pid: 4242]" in show_text
+    assert f"[comment #{comment_id}]" in show_text
 
 
 
