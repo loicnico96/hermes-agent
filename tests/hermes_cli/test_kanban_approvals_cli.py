@@ -284,3 +284,59 @@ def test_cli_approval_approve_and_reject(kanban_home, monkeypatch):
     assert reopen_payload["aggregate_status"] == "done"
     assert reopen_show["task"]["status"] == "done"
     assert reopen_show["comments"][-1]["body"] == "re-opened and approved"
+
+
+
+def test_cli_approval_decisions_accept_task_id_and_create_missing_human_gate(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_PROFILE_NAME", "approver")
+
+    approve_task = json.loads(run_slash("create 'approve via task' --assignee worker --json"))
+    approve_task_id = approve_task["id"]
+    approve_gate = json.loads(run_slash(f"approval request {approve_task_id} --human --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (approve_task_id,))
+
+    approve_payload = json.loads(
+        run_slash(f"approval approve {approve_task_id} --comment 'approved by task' --json")
+    )
+    approve_show = json.loads(run_slash(f"show {approve_task_id} --json"))
+
+    assert approve_payload["approval"]["id"] == approve_gate["id"]
+    assert approve_payload["approval"]["status"] == "approved"
+    assert approve_payload["task_status"] == "done"
+    assert approve_payload["aggregate_status"] == "done"
+    assert approve_show["comments"][-1]["body"] == "approved by task"
+
+    reject_task = json.loads(run_slash("create 'reject via task' --assignee worker --json"))
+    reject_task_id = reject_task["id"]
+    reject_agent = json.loads(run_slash(f"approval request {reject_task_id} --agent reviewer --json"))
+
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'approval' WHERE id = ?", (reject_task_id,))
+        conn.execute(
+            "UPDATE task_approvals SET status = 'approved', updated_at = ? WHERE id = ?",
+            (7_300, reject_agent["id"]),
+        )
+
+    reject_payload = json.loads(
+        run_slash(f"approval reject {reject_task_id} --comment 'rejected by task' --json")
+    )
+    reject_show = json.loads(run_slash(f"show {reject_task_id} --json"))
+
+    assert reject_payload["approval"]["task_id"] == reject_task_id
+    assert reject_payload["approval"]["approver_type"] == "human"
+    assert reject_payload["approval"]["status"] == "requested"
+    assert reject_payload["task_status"] == "todo"
+    assert reject_show["task"]["status"] == "todo"
+    assert [row["approver_type"] for row in reject_show["approvals"]] == ["agent", "human"]
+    assert reject_show["comments"][-1]["body"] == "rejected by task"
+
+    not_ready_task = json.loads(run_slash("create 'not ready' --assignee worker --json"))
+    not_ready_output = run_slash(f"approval approve {not_ready_task['id']} --json")
+    unknown_task_output = run_slash("approval approve t_missing --json")
+    malformed_target_output = run_slash("approval approve nope --json")
+
+    assert not_ready_output == "kanban: parent task must be in approval status"
+    assert unknown_task_output == "kanban: unknown task t_missing"
+    assert malformed_target_output == "kanban: unknown approval target 'nope'"
