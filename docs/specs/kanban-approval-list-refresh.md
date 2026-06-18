@@ -18,7 +18,7 @@ In scope:
 - add `--flat` one-row-per-approval output
 - support `--json` in both grouped and flat modes
 - replace `--type` with `--agent` / `--human`
-- preserve `--task` and `--status`
+- support an optional positional `task_id` selector and preserve `--status`
 - define exact ordering, formatting, padding, and JSON shapes
 - update CLI/user-guide docs for the new surface
 
@@ -77,7 +77,7 @@ hermes kanban approval ls
 - `--active`
 - `--flat`
 - `--json`
-- `--task <task_id>`
+- `[task_id]` (optional positional)
 - `--status <approval_status>`
 - `--agent`
 - `--human`
@@ -121,19 +121,19 @@ With no flags:
 - grouped JSON is the default JSON shape
 - `--flat --json` returns flat JSON rows instead
 
-#### `--task <task_id>`
+#### positional `task_id`
 - restrict listing to one specific task id
 - implies `--flat`
 - includes that task even if its status is `done` or `archived`
 - still combines with `--status`, `--agent`, `--human`, and `--json`
 - must fail if the task does not exist
 
-`--task` does **not** require or imply `--all`.
+The positional task-id selector does **not** require or imply `--all`.
 The task-specific request bypasses the default done/archived exclusion by definition.
 
 #### `--status <approval_status>`
 - filter approval rows by approval-row status
-- works with grouped, flat, `--all`, `--active`, `--task`, `--agent`, `--human`, and `--json`
+- works with grouped, flat, `--all`, `--active`, positional `task_id`, `--agent`, `--human`, and `--json`
 - in grouped mode, tasks with zero remaining matching approval rows after filtering are omitted entirely
 
 #### `--agent`
@@ -338,7 +338,7 @@ Grouped JSON requirements:
 - approvals array order must match grouped text order (`approval.id ASC`)
 - groups must appear in grouped ordering (`priority DESC, created_at ASC`)
 
-### Flat JSON shape (`--flat --json`, and implied by `--task --json`)
+### Flat JSON shape (`--flat --json`, and implied by positional `task_id` + `--json`)
 Return a JSON array of flat joined rows:
 
 ```json
@@ -377,7 +377,7 @@ Required changes:
 - add parser-level mutually exclusive group for `--agent` / `--human`
 - add `--flat`
 - keep `--json`
-- keep `--task`
+- replace `--task` with the optional positional `task_id`
 - keep `--status`
 
 Suggested parser shape:

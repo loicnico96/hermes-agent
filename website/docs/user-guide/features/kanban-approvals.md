@@ -153,8 +153,11 @@ hermes kanban approval list
 # Flat one-row-per-approval view
 hermes kanban approval ls --flat
 
-# Inspect one task (implies `--flat` and includes done/archived parents)
-hermes kanban approval ls --task t_abc
+# Inspect one task (positional task id; implies `--flat` and includes done/archived parents)
+hermes kanban approval ls t_abc
+
+# Inspect run history for one approval row
+hermes kanban approval runs 42
 
 # Restrict by approver kind or approval status
 hermes kanban approval ls --human
@@ -167,9 +170,10 @@ hermes kanban approval ls --active
 ```
 
 - Default output is grouped by parent task.
-- `--task <task_id>` implies `--flat` and errors if the task does not exist.
+- Passing a task id positionally (for example `approval ls t_abc`) implies `--flat` and errors if the task does not exist.
+- `approval runs <approval_id>` shows the execution history for a single approval row.
 - `--all` and `--active` are mutually exclusive.
-- The approval ID is an integer auto-increment. It is required for follow-up commands such as `remove`, `reset`, and `reclaim`.
+- The approval ID is an integer auto-increment. It is required for follow-up commands such as `runs`, `remove`, `reset`, and `reclaim`.
 
 ### Completing human review
 
