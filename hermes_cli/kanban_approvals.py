@@ -359,12 +359,14 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         active_only=active_only,
     )
 
-    flat_view = bool(getattr(args, "flat", False) or task_id is not None)
-    if flat_view:
+    task_scoped = task_id is not None
+    flat_text_view = bool(getattr(args, "flat", False))
+    flat_json_view = flat_text_view or task_scoped
+    if flat_text_view or flat_json_view:
         approvals.sort(key=lambda row: row.id)
 
     if getattr(args, "json", False):
-        if flat_view:
+        if flat_json_view:
             payload: Any = [
                 _flat_approval_row_to_dict(approval, tasks_by_id[approval.task_id])
                 for approval in approvals
@@ -382,14 +384,15 @@ def _cmd_approval_list(args: argparse.Namespace) -> int:
         print("(no matching approvals)")
         return 0
 
-    if flat_view:
+    if flat_text_view:
         for approval in approvals:
             print(_format_flat_approval_line(approval))
         return 0
 
     grouped = _group_approvals_by_task(approvals, tasks_by_id=tasks_by_id)
     for task, task_approvals in grouped:
-        print(_format_grouped_task_header(task))
+        if not task_scoped:
+            print(_format_grouped_task_header(task))
         for approval in task_approvals:
             print(_format_grouped_approval_line(approval))
     return 0
