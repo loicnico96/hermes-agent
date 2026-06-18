@@ -66,27 +66,10 @@ def approval_to_dict(approval: approvals_db.Approval) -> dict[str, Any]:
     }
 
 
-def _format_approval_target(approval: approvals_db.Approval) -> str:
-    if approval.approver_type == "human":
-        return "human"
-
-    target = f"agent @{approval.approver_profile}"
-    if approval.approver_skill:
-        target += f" skill={approval.approver_skill}"
-    return target
-
-
-def _format_approval_line(approval: approvals_db.Approval, *, include_task_id: bool) -> str:
-    bits = [f"#{approval.id}", f"{approval.status:10s}", _format_approval_target(approval)]
-    if include_task_id:
-        bits.append(f"task={approval.task_id}")
-    if approval.comment_id is not None:
-        bits.append(f"comment=#{approval.comment_id}")
-    return "  " + "  ".join(bits)
-
-
 def format_approval_line(approval: approvals_db.Approval, *, include_task_id: bool) -> str:
-    return _format_approval_line(approval, include_task_id=include_task_id)
+    if include_task_id:
+        return _format_flat_approval_line(approval)
+    return _format_grouped_approval_line(approval)
 
 
 def format_approval_run_line(run: approvals_db.ApprovalRun) -> str:
@@ -151,11 +134,12 @@ def _format_list_approval_badges(approval: approvals_db.Approval) -> str:
     return f" {' '.join(badges)}" if badges else ""
 
 
-def _truncate_single_line(text: str, *, limit: int | None = 160) -> str:
+def _truncate_single_line(text: str, *, limit: int = 160) -> str:
     collapsed = " ".join((text or "").split())
-    if limit is None or len(collapsed) <= limit:
+    effective_limit = max(0, min(limit, 2000))
+    if len(collapsed) <= effective_limit:
         return collapsed
-    return collapsed[: max(0, limit - 1)].rstrip() + "…"
+    return collapsed[: max(0, effective_limit - 1)].rstrip() + "…"
 
 
 def _load_task_comment_bodies(
@@ -316,8 +300,8 @@ def _approval_run_to_cli_dict(
         "elapsed_seconds": elapsed,
         "assignee": run.profile,
         "comment_body": comment_body,
-        "comment_preview": _truncate_single_line(comment_body, limit=None) if comment_body else None,
-        "error_preview": _truncate_single_line(run.error, limit=None) if run.error else None,
+        "comment_preview": _truncate_single_line(comment_body, limit=2000) if comment_body else None,
+        "error_preview": _truncate_single_line(run.error, limit=2000) if run.error else None,
     }
 
 
@@ -340,7 +324,7 @@ def _cmd_approval_request(args: argparse.Namespace) -> int:
     else:
         print(
             f"Requested approval #{approval.id} on {approval.task_id} "
-            f"({approval.status}, {_format_approval_target(approval)})"
+            f"({approval.status}, {_format_list_approval_target(approval)})"
         )
     return 0
 
