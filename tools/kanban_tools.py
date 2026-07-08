@@ -62,21 +62,34 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _is_kanban_worker() -> bool:
+    return bool(os.environ.get("HERMES_KANBAN_TASK"))
+
+
+def _is_approval_worker() -> bool:
+    return bool(os.environ.get("HERMES_KANBAN_APPROVAL_ID"))
+
+
 def _check_kanban_mode() -> bool:
-    """Task-lifecycle tools are available when:
+    """Shared kanban context tools are available when:
 
     1. ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), OR
     2. The current profile has ``kanban`` in its toolsets config
        (orchestrator profiles like techlead that route work via Kanban).
-
-    Humans running ``hermes chat`` without the kanban toolset see zero
-    kanban tools. Workers spawned by the kanban dispatcher (gateway-
-    embedded by default) and orchestrator profiles with the kanban
-    toolset enabled see the Kanban lifecycle tool surface.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _is_kanban_worker():
         return True
     return _profile_has_kanban_toolset()
+
+
+def _check_kanban_task_worker_mode() -> bool:
+    """Task-worker/orchestrator tools are hidden from approval workers only."""
+    return _check_kanban_mode() and not _is_approval_worker()
+
+
+def _check_kanban_approval_worker_mode() -> bool:
+    """Approval-worker tools are visible only to approval subprocesses."""
+    return _is_kanban_worker() and _is_approval_worker()
 
 
 def _check_kanban_orchestrator_mode() -> bool:
@@ -324,11 +337,28 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _is_kanban_worker():
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
-            "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            "must use their task-scoped kanban tools instead."
+        )
+    return None
+
+
+def _require_not_approval_worker(tool_name: str) -> Optional[str]:
+    if _is_approval_worker():
+        return tool_error(
+            f"{tool_name} is not available to approval workers; use "
+            "kanban_show, kanban_heartbeat, and kanban_approval instead."
+        )
+    return None
+
+
+def _require_approval_worker(tool_name: str) -> Optional[str]:
+    if not _is_approval_worker():
+        return tool_error(
+            f"{tool_name} requires HERMES_KANBAN_APPROVAL_ID and an active "
+            "approval run."
         )
     return None
 
@@ -503,6 +533,9 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
+    worker_mode_err = _require_not_approval_worker("kanban_complete")
+    if worker_mode_err:
+        return worker_mode_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -665,8 +698,74 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _handle_approval(args: dict, **kw) -> str:
+    """Apply an approval-worker decision to the active approval row."""
+    from hermes_cli import kanban_approvals_db as approvals_db
+    approval_mode_err = _require_approval_worker("kanban_approval")
+    if approval_mode_err:
+        return approval_mode_err
+    decision = args.get("decision")
+    if not decision or not str(decision).strip():
+        return tool_error("decision is required")
+    comment = args.get("comment")
+    if comment is not None and not isinstance(comment, str):
+        return tool_error(f"comment must be a string, got {type(comment).__name__}")
+    raw_approval_id = os.environ.get("HERMES_KANBAN_APPROVAL_ID")
+    raw_run_id = os.environ.get("HERMES_KANBAN_APPROVAL_RUN_ID")
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not raw_approval_id:
+        return tool_error("kanban_approval requires HERMES_KANBAN_APPROVAL_ID")
+    if not raw_run_id:
+        return tool_error("kanban_approval requires HERMES_KANBAN_APPROVAL_RUN_ID")
+    if not task_id:
+        return tool_error("kanban_approval requires HERMES_KANBAN_TASK")
+    try:
+        approval_id = int(str(raw_approval_id).strip())
+        run_id = int(str(raw_run_id).strip())
+    except ValueError:
+        return tool_error("approval env vars must be integer ids")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            comment_id = None
+            if isinstance(comment, str) and comment.strip():
+                comment_id = kb.add_comment(
+                    conn,
+                    task_id,
+                    author=os.environ.get("HERMES_PROFILE") or "approver",
+                    body=comment.strip(),
+                )
+            aggregate_status = approvals_db.record_task_approval_decision(
+                conn,
+                approval_id=approval_id,
+                expected_run_id=run_id,
+                status=str(decision).strip().lower(),
+                comment_id=comment_id,
+            )
+            approval = approvals_db.get_task_approval(conn, approval_id)
+            return _ok(
+                task_id=task_id,
+                approval_id=approval_id,
+                approval_run_id=run_id,
+                approval_status=approval.status if approval is not None else None,
+                aggregate_status=aggregate_status,
+                comment_id=comment_id,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_approval: {e}")
+    except Exception as e:
+        logger.exception("kanban_approval failed")
+        return tool_error(f"kanban_approval: {e}")
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    worker_mode_err = _require_not_approval_worker("kanban_block")
+    if worker_mode_err:
+        return worker_mode_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -796,6 +895,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
+    worker_mode_err = _require_not_approval_worker("kanban_comment")
+    if worker_mode_err:
+        return worker_mode_err
     tid = args.get("task_id")
     if not tid:
         return tool_error(
@@ -1287,6 +1389,33 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+KANBAN_APPROVAL_SCHEMA = {
+    "name": "kanban_approval",
+    "description": (
+        "Approval-worker handoff tool. Submit exactly one approval decision "
+        "for the approval row bound in your env. Use ``decision`` with one of "
+        "approved, rejected, or escalated. ``comment`` is optional reviewer "
+        "context that will be posted to the task thread before the decision is "
+        "applied."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "decision": {
+                "type": "string",
+                "enum": ["approved", "rejected", "escalated"],
+                "description": "Approval outcome to apply to the active approval row.",
+            },
+            "comment": {
+                "type": "string",
+                "description": "Optional review comment to add to the task thread.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["decision"],
+    },
+}
+
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
@@ -1613,8 +1742,17 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_COMPLETE_SCHEMA,
     handler=_handle_complete,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_task_worker_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_approval",
+    toolset="kanban",
+    schema=KANBAN_APPROVAL_SCHEMA,
+    handler=_handle_approval,
+    check_fn=_check_kanban_approval_worker_mode,
+    emoji="✅",
 )
 
 registry.register(
@@ -1622,7 +1760,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_BLOCK_SCHEMA,
     handler=_handle_block,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_task_worker_mode,
     emoji="⏸",
 )
 
@@ -1640,7 +1778,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_COMMENT_SCHEMA,
     handler=_handle_comment,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_task_worker_mode,
     emoji="💬",
 )
 
@@ -1649,7 +1787,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_task_worker_mode,
     emoji="➕",
 )
 
@@ -1667,6 +1805,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_task_worker_mode,
     emoji="🔗",
 )

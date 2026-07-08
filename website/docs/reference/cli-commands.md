@@ -616,6 +616,10 @@ Board resolution order (highest precedence first): `--board <slug>` flag → `HE
 
 All actions are also available as a slash command in the gateway (`/kanban …`), with the same argument surface — including `boards` subcommands and the `--board` flag.
 
+Approval gates hang off the same command family via `hermes kanban approval ...` — for example `request`, `ls`/`list`, `runs`, `approve`, `reject`, `reset`, `reclaim`, and `remove`.
+
+`hermes kanban approval ls` groups approvals by task by default and hides parent tasks already in `done` or `archived`. Add `--flat` for one row per approval, `--all` to include every parent status, `--active` to keep only tasks currently in `approval`, pass a positional task id (`approval ls t_abc`) to inspect one task (implies `--flat`), and use `--human` / `--agent` instead of the older `--type` filter. `hermes kanban approval runs <approval_id>` shows the run history for one approval row. See [Kanban task approvals](/user-guide/features/kanban-approvals) for the approval lifecycle and CLI workflow.
+
 For the full design — comparison with Cline Kanban / Paperclip / NanoClaw / Gemini Enterprise, eight collaboration patterns, four user stories, concurrency correctness proof — see `docs/hermes-kanban-v1-spec.pdf` in the repository or the [Kanban user guide](/user-guide/features/kanban).
 
 ## `hermes project`

@@ -2242,6 +2242,11 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Overrides for model/provider/base_url/api_key/api_mode/reasoning_effort based on tier
+        # Valid tiers are: small/medium/large
+        # The tier is determined by the caller of `delegate_task`
+        # Non-configured tiers fallback to the top-level delegation config
+        "tiers": {},
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -2697,6 +2702,15 @@ DEFAULT_CONFIG = {
         # same task/profile (spawn_failed, timed_out, or crashed). Reassignment
         # resets the streak for the new profile.
         "failure_limit": 2,
+        # Respawn guard toggles. These defer re-spawn for specific "probably
+        # don't launch another worker yet" conditions without fully blocking
+        # the task. Shared-PR sequential lanes may want active_pr=false.
+        "respawn_guard": {
+            "active_pr": True,
+        },
+        # Separate live concurrency cap for approval workers. Intentionally
+        # isolated from the normal task-worker scheduler budget.
+        "max_approvers": 2,
         # Worker stdout/stderr logs rotate at spawn time. Defaults preserve
         # the historical 2 MiB + one-backup behavior; long-running workers can
         # raise these to keep more early failure evidence.
